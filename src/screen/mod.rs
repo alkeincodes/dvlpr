@@ -189,4 +189,28 @@ mod tests {
         assert_eq!(s.cell(0, 1).ch, 'c');
         assert_eq!(s.cursor(), (1, 1));
     }
+
+    #[test]
+    fn line_feed_scrolls_at_bottom() {
+        let mut s = Screen::new(3, 2);
+        s.feed(b"a\r\nb\r\nc");
+        // After three lines on a 2-row screen, first line scrolled off.
+        assert_eq!(row_text(&s, 0).trim_end(), "b");
+        assert_eq!(row_text(&s, 1).trim_end(), "c");
+        assert_eq!(s.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn backspace_stops_at_column_zero() {
+        let mut s = Screen::new(5, 2);
+        s.feed(b"\x08\x08");
+        assert_eq!(s.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn tab_advances_to_multiple_of_eight() {
+        let mut s = Screen::new(20, 2);
+        s.feed(b"a\t");
+        assert_eq!(s.cursor(), (8, 0));
+    }
 }
