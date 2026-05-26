@@ -25,7 +25,7 @@ pub enum PaneOutput {
 /// `PaneOutput::Exited` when the master EOFs, which is how the server learns the
 /// pane ended; this `Drop` is the teardown path when the pane is closed from above.
 struct ChildKiller {
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    child: Mutex<Box<dyn Child + Send>>,
 }
 
 impl Drop for ChildKiller {
@@ -37,6 +37,13 @@ impl Drop for ChildKiller {
     }
 }
 
+/// Owns one PTY-backed child process.
+///
+/// CAUTION: dropping a `PaneRuntime` runs `ChildKiller::Drop`, which calls the
+/// blocking `wait()` syscall. Do not drop a `PaneRuntime` on a hot tokio worker
+/// where a multi-second `SIGKILL` delivery would stall the runtime. In Phase 1 the
+/// only drop happens at daemon teardown, which is acceptable; an async-safe
+/// teardown (`spawn_blocking` / dedicated thread) is a later-phase concern.
 pub struct PaneRuntime {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -84,24 +91,22 @@ impl PaneRuntime {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Blocking reader thread -> async channel.
-        let reader_tx = tx.clone();
+        // No JoinHandle is kept: the thread exits when the master fd closes
+        // (read returns Ok(0)/Err) or when the receiver is dropped (send fails).
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if reader_tx
-                            .send(PaneOutput::Bytes(buf[..n].to_vec()))
-                            .is_err()
-                        {
+                        if tx.send(PaneOutput::Bytes(buf[..n].to_vec())).is_err() {
                             break;
                         }
                     }
                     Err(_) => break,
                 }
             }
-            let _ = reader_tx.send(PaneOutput::Exited);
+            let _ = tx.send(PaneOutput::Exited);
         });
 
         let child_killer = ChildKiller {
