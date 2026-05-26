@@ -36,6 +36,7 @@ pub enum ServerMsg {
 }
 
 use std::io;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     bincode::serde::encode_to_vec(value, bincode::config::standard())
@@ -46,6 +47,49 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(value)
+}
+
+/// Write a length-prefixed bincode frame: `u32` big-endian length + payload.
+pub async fn write_msg<W, T>(w: &mut W, value: &T) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    T: Serialize,
+{
+    let payload = encode(value)?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame exceeds MAX_FRAME_BYTES",
+        ));
+    }
+    w.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    w.write_all(&payload).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read one length-prefixed bincode frame. Returns `Ok(None)` on clean EOF.
+pub async fn read_msg<R, T>(r: &mut R) -> io::Result<Option<T>>
+where
+    R: AsyncReadExt + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let mut len_buf = [0u8; 4];
+    match r.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incoming frame exceeds MAX_FRAME_BYTES",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload).await?;
+    Ok(Some(decode(&payload)?))
 }
 
 #[cfg(test)]
@@ -75,5 +119,22 @@ mod tests {
         let bytes = encode(&msg).unwrap();
         let back: ServerMsg = decode(&bytes).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[tokio::test]
+    async fn write_then_read_msg_round_trips() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let sent = ClientMsg::Input(b"ls -la\n".to_vec());
+        write_msg(&mut a, &sent).await.unwrap();
+        let got: ClientMsg = read_msg(&mut b).await.unwrap().unwrap();
+        assert_eq!(sent, got);
+    }
+
+    #[tokio::test]
+    async fn read_msg_returns_none_on_clean_eof() {
+        let (a, mut b) = tokio::io::duplex(1024);
+        drop(a); // close the writer end
+        let got: Option<ClientMsg> = read_msg(&mut b).await.unwrap();
+        assert!(got.is_none());
     }
 }
