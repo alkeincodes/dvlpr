@@ -2,6 +2,7 @@
 name = "dvlpr"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 description = "lightweight agent-aware terminal multiplexer"
 
 [lib]
@@ -24,3 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+bindgen = "0.72"
