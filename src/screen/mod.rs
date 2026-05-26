@@ -60,6 +60,10 @@ impl Screen {
         (self.cx, self.cy)
     }
 
+    /// Returns the cell at `(x, y)`.
+    ///
+    /// # Panics
+    /// Panics if `x >= self.cols()` or `y >= self.rows()`.
     pub fn cell(&self, x: u16, y: u16) -> Cell {
         self.cells[self.idx(x, y)]
     }
@@ -170,8 +174,8 @@ impl Screen {
     fn dispatch_csi(&mut self, final_byte: u8) {
         match final_byte {
             b'A' => self.cy = self.cy.saturating_sub(self.param(0, 1)),
-            b'B' => self.cy = (self.cy + self.param(0, 1)).min(self.rows - 1),
-            b'C' => self.cx = (self.cx + self.param(0, 1)).min(self.cols - 1),
+            b'B' => self.cy = self.cy.saturating_add(self.param(0, 1)).min(self.rows - 1),
+            b'C' => self.cx = self.cx.saturating_add(self.param(0, 1)).min(self.cols - 1),
             b'D' => self.cx = self.cx.saturating_sub(self.param(0, 1)),
             b'H' | b'f' => {
                 let row = self.param(0, 1);
@@ -397,8 +401,18 @@ mod tests {
         assert_eq!(s.cols(), 3);
         assert_eq!(s.rows(), 2);
         assert_eq!(row_text(&s, 0), "hel");
-        let (cx, cy) = s.cursor();
-        assert!(cx < 3 && cy < 2);
+        // Cursor was at (4, 2) before resize; must clamp to the new bounds.
+        assert_eq!(s.cursor(), (2, 1));
+    }
+
+    #[test]
+    fn large_cursor_move_params_clamp_without_overflow() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"\x1b[2;2H"); // (1, 1)
+        // Huge params must saturate, not overflow u16 (would panic in debug).
+        s.feed(b"\x1b[65535B");
+        s.feed(b"\x1b[65535C");
+        assert_eq!(s.cursor(), (9, 4));
     }
 
     #[test]
