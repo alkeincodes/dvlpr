@@ -15,6 +15,24 @@ use crate::protocol::{
 const PREFIX: u8 = 0x02; // Ctrl-b
 const DETACH_KEY: u8 = b'd';
 
+/// Enables terminal raw mode and restores cooked mode on drop — including on a
+/// panic or early return, which a plain post-await `disable_raw_mode()` call
+/// would skip (leaving the user's shell wedged in raw mode).
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(RawModeGuard)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// Attach the current terminal to the daemon at `socket_path`.
 pub async fn attach(socket_path: &Path) -> io::Result<()> {
     let stream = UnixStream::connect(socket_path).await?;
@@ -44,10 +62,11 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
         }
     }
 
-    crossterm::terminal::enable_raw_mode()?;
+    // Guard restores cooked mode on every exit path, including a panic in run_loop.
+    let _raw = RawModeGuard::enable()?;
     let result = run_loop(read_half, write_half).await;
-    let _ = crossterm::terminal::disable_raw_mode();
-    // Restore a sane screen on the way out.
+    // Restore a sane screen on the normal way out (cosmetic; raw mode itself is
+    // restored by `_raw`'s Drop regardless).
     let mut out = tokio::io::stdout();
     let _ = out.write_all(b"\x1b[2J\x1b[H").await;
     let _ = out.flush().await;
@@ -58,6 +77,11 @@ async fn run_loop(
     read_half: tokio::net::unix::OwnedReadHalf,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
 ) -> io::Result<()> {
+    // Set up the fallible SIGWINCH handler BEFORE spawning the reader task, so an
+    // error here returns via `?` without leaking a running reader task (which would
+    // keep painting frames to stdout after the client has gone).
+    let mut winch = signal(SignalKind::window_change())?;
+
     // Dedicated frame-reader task: read_msg is NOT cancel-safe, so it must never
     // live inside a select! arm. It owns read_half and paints straight to stdout.
     let mut reader = tokio::spawn(async move {
@@ -74,7 +98,6 @@ async fn run_loop(
     });
 
     let mut stdin = tokio::io::stdin();
-    let mut winch = signal(SignalKind::window_change())?;
     let mut in_buf = [0u8; 4096];
     let mut prefix_armed = false;
 

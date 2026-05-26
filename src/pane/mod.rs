@@ -133,6 +133,10 @@ impl PaneRuntime {
 
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) {
+        // Clamp to at least 1x1: a 0-row/0-col TIOCSWINSZ makes ncurses/vim/less
+        // divide by the terminal size on SIGWINCH and crash.
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         let _ = self.master.resize(PtySize {
             rows,
             cols,

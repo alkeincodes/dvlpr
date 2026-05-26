@@ -151,6 +151,14 @@ impl Screen {
             b';' => {
                 self.params.push(self.cur_param.take().unwrap_or(0));
             }
+            0x20..=0x2f | 0x3a | 0x3c..=0x3f => {
+                // Intermediate bytes (0x20-0x2f) and private/parameter markers
+                // (`:` `<` `=` `>` `?`): consume and stay in the CSI sequence so the
+                // final byte still terminates it. We don't act on these, but we must
+                // NOT abort here — aborting would leak the remaining params + final
+                // byte into the ground state and print them as text (e.g. `\x1b[?25l`
+                // would print "25l").
+            }
             0x40..=0x7e => {
                 if let Some(v) = self.cur_param.take() {
                     self.params.push(v);
@@ -159,7 +167,7 @@ impl Screen {
                 self.state = ParseState::Ground;
             }
             _ => {
-                // Unsupported intermediate byte: abort the sequence.
+                // Genuinely invalid byte inside CSI (e.g. a C0 control): abort.
                 self.state = ParseState::Ground;
             }
         }
@@ -404,6 +412,17 @@ mod tests {
         assert_eq!(row_text(&s, 0), "hel");
         // Cursor was at (4, 2) before resize; must clamp to the new bounds.
         assert_eq!(s.cursor(), (2, 1));
+    }
+
+    #[test]
+    fn dec_private_mode_sequences_do_not_leak_as_text() {
+        let mut s = Screen::new(12, 2);
+        // Cursor hide, bracketed paste enable, then a real character.
+        s.feed(b"\x1b[?25l\x1b[?2004hX");
+        // Only 'X' is printed; the private-mode sequences are fully consumed.
+        assert_eq!(s.cell(0, 0).ch, 'X');
+        assert_eq!(s.cell(1, 0).ch, ' ');
+        assert_eq!(s.cursor(), (1, 0));
     }
 
     #[test]
