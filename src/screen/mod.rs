@@ -123,8 +123,7 @@ impl Screen {
     fn scroll_up(&mut self) {
         let cols = self.cols as usize;
         self.cells.drain(0..cols);
-        self.cells
-            .extend(std::iter::repeat(Cell::default()).take(cols));
+        self.cells.extend(std::iter::repeat_n(Cell::default(), cols));
     }
 
     fn escape_byte(&mut self, b: u8) {
