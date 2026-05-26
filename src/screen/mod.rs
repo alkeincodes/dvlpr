@@ -215,6 +215,44 @@ impl Screen {
             *cell = Cell::default();
         }
     }
+
+    /// Resize the grid, preserving the top-left overlapping region.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let mut next = vec![Cell::default(); cols as usize * rows as usize];
+        let copy_rows = rows.min(self.rows);
+        let copy_cols = cols.min(self.cols);
+        for y in 0..copy_rows {
+            for x in 0..copy_cols {
+                next[y as usize * cols as usize + x as usize] = self.cell(x, y);
+            }
+        }
+        self.cells = next;
+        self.cols = cols;
+        self.rows = rows;
+        self.cx = self.cx.min(cols - 1);
+        self.cy = self.cy.min(rows - 1);
+    }
+
+    /// Render a full repaint: clear, draw every row, then position the cursor.
+    /// Phase 1 always sends full frames; diffing arrives in Phase 2.
+    pub fn render_ansi(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.cells.len() + 32);
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        for y in 0..self.rows {
+            if y > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            for x in 0..self.cols {
+                let ch = self.cell(x, y).ch;
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        out.extend_from_slice(format!("\x1b[{};{}H", self.cy + 1, self.cx + 1).as_bytes());
+        out
+    }
 }
 
 #[cfg(test)]
@@ -349,5 +387,32 @@ mod tests {
         s.feed(b"\x1b[1;3H");
         s.feed(b"\x1b[2K");
         assert_eq!(row_text(&s, 0), "     ");
+    }
+
+    #[test]
+    fn resize_preserves_top_left_and_clamps_cursor() {
+        let mut s = Screen::new(5, 3);
+        s.feed(b"hello");
+        s.feed(b"\x1b[3;5H"); // cursor near bottom-right
+        s.resize(3, 2);
+        assert_eq!(s.cols(), 3);
+        assert_eq!(s.rows(), 2);
+        assert_eq!(row_text(&s, 0), "hel");
+        let (cx, cy) = s.cursor();
+        assert!(cx < 3 && cy < 2);
+    }
+
+    #[test]
+    fn render_ansi_repaints_full_screen_and_positions_cursor() {
+        let mut s = Screen::new(3, 2);
+        s.feed(b"ab\r\ncd");
+        let out = String::from_utf8(s.render_ansi()).unwrap();
+        // Starts with clear + home.
+        assert!(out.starts_with("\x1b[2J\x1b[H"));
+        // Contains the row contents separated by CRLF.
+        assert!(out.contains("ab "));
+        assert!(out.contains("cd "));
+        // Ends by positioning the cursor at its current location (row 2, col 3).
+        assert!(out.ends_with("\x1b[2;3H"));
     }
 }
