@@ -1,6 +1,9 @@
 //! Wire protocol: framed bincode messages over the Unix socket.
 
+use std::io;
+
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -35,17 +38,20 @@ pub enum ServerMsg {
     Closed { reason: String },
 }
 
-use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 pub fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     bincode::serde::encode_to_vec(value, bincode::config::standard())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-    let (value, _consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, bincode::config::standard())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if consumed != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes after decoded frame",
+        ));
+    }
     Ok(value)
 }
 
@@ -75,11 +81,12 @@ where
     T: serde::de::DeserializeOwned,
 {
     let mut len_buf = [0u8; 4];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    // Probe the first byte: 0 bytes => clean EOF at a frame boundary (Ok(None)).
+    // A short read AFTER the first byte is a truncated header => error, not EOF.
+    if r.read(&mut len_buf[..1]).await? == 0 {
+        return Ok(None);
     }
+    r.read_exact(&mut len_buf[1..]).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_BYTES {
         return Err(io::Error::new(
@@ -136,5 +143,26 @@ mod tests {
         drop(a); // close the writer end
         let got: Option<ClientMsg> = read_msg(&mut b).await.unwrap();
         assert!(got.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_msg_errors_on_truncated_header() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        // Send only 2 of the 4 header bytes, then close: a truncated frame,
+        // which must surface as an error, NOT a clean EOF.
+        a.write_all(&[0u8, 0u8]).await.unwrap();
+        drop(a);
+        let result: io::Result<Option<ClientMsg>> = read_msg(&mut b).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_msg_rejects_oversized_frame() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        // Header announces a length above MAX_FRAME_BYTES.
+        let len = (MAX_FRAME_BYTES as u32) + 1;
+        a.write_all(&len.to_be_bytes()).await.unwrap();
+        let err = read_msg::<_, ClientMsg>(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
