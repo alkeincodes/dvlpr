@@ -36,7 +36,12 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
         Some(ServerHello::Reject { reason }) => {
             return Err(io::Error::new(io::ErrorKind::ConnectionRefused, reason));
         }
-        None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed",
+            ))
+        }
     }
 
     crossterm::terminal::enable_raw_mode()?;
@@ -89,7 +94,13 @@ async fn run_loop(
             // runs to completion once this arm is selected, so its write_msg awaits
             // are not interrupted.)
             n = stdin.read(&mut in_buf) => {
-                let n = n?;
+                let n = match n {
+                    Ok(n) => n,
+                    Err(e) => {
+                        reader.abort();
+                        return Err(e);
+                    }
+                };
                 if n == 0 { break; }
                 match forward_input(&in_buf[..n], &mut prefix_armed, &mut write_half).await {
                     Ok(Some(InputAction::Detach)) => {
@@ -124,7 +135,11 @@ async fn forward_input(
             *prefix_armed = false;
             if b == DETACH_KEY {
                 if !passthrough.is_empty() {
-                    write_msg(write_half, &ClientMsg::Input(std::mem::take(&mut passthrough))).await?;
+                    write_msg(
+                        write_half,
+                        &ClientMsg::Input(std::mem::take(&mut passthrough)),
+                    )
+                    .await?;
                 }
                 return Ok(Some(InputAction::Detach));
             } else if b == PREFIX {

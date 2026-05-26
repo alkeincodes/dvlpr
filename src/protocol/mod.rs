@@ -34,8 +34,13 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
     /// A rendered frame. `full` is always true in Phase 1.
-    Frame { data: Vec<u8>, full: bool },
-    Closed { reason: String },
+    Frame {
+        data: Vec<u8>,
+        full: bool,
+    },
+    Closed {
+        reason: String,
+    },
 }
 
 pub fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
@@ -111,7 +116,10 @@ mod tests {
 
     #[test]
     fn client_msg_round_trips_through_bincode() {
-        let msg = ClientMsg::Resize { cols: 120, rows: 40 };
+        let msg = ClientMsg::Resize {
+            cols: 120,
+            rows: 40,
+        };
         let bytes = encode(&msg).unwrap();
         let back: ClientMsg = decode(&bytes).unwrap();
         assert_eq!(msg, back);

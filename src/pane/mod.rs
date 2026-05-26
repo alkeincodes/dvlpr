@@ -158,15 +158,17 @@ mod tests {
 
     #[tokio::test]
     async fn pane_runs_command_and_streams_output() {
-        let (pane, mut rx) =
-            PaneRuntime::spawn(&["sh".into(), "-c".into(), "printf READY".into()], ".", 80, 24)
-                .expect("spawn pane");
+        let (pane, mut rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "printf READY".into()],
+            ".",
+            80,
+            24,
+        )
+        .expect("spawn pane");
 
         let mut collected = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while let Ok(Some(out)) =
-            tokio::time::timeout_at(deadline, rx.recv()).await
-        {
+        while let Ok(Some(out)) = tokio::time::timeout_at(deadline, rx.recv()).await {
             match out {
                 PaneOutput::Bytes(b) => collected.extend_from_slice(&b),
                 PaneOutput::Exited => break,

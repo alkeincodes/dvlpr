@@ -127,7 +127,8 @@ impl Screen {
     fn scroll_up(&mut self) {
         let cols = self.cols as usize;
         self.cells.drain(0..cols);
-        self.cells.extend(std::iter::repeat_n(Cell::default(), cols));
+        self.cells
+            .extend(std::iter::repeat_n(Cell::default(), cols));
     }
 
     fn escape_byte(&mut self, b: u8) {
@@ -409,7 +410,7 @@ mod tests {
     fn large_cursor_move_params_clamp_without_overflow() {
         let mut s = Screen::new(10, 5);
         s.feed(b"\x1b[2;2H"); // (1, 1)
-        // Huge params must saturate, not overflow u16 (would panic in debug).
+                              // Huge params must saturate, not overflow u16 (would panic in debug).
         s.feed(b"\x1b[65535B");
         s.feed(b"\x1b[65535C");
         assert_eq!(s.cursor(), (9, 4));

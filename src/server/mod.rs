@@ -46,7 +46,10 @@ enum Event {
         rows: u16,
     },
     ClientInput(Vec<u8>),
-    ClientResize { cols: u16, rows: u16 },
+    ClientResize {
+        cols: u16,
+        rows: u16,
+    },
     ClientGone(ClientId),
     PaneBytes(Vec<u8>),
     PaneExited,

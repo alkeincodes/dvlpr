@@ -8,8 +8,7 @@ use dvlpr::server::{self, socket, ServerConfig};
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -28,14 +27,16 @@ async fn main() {
 
 /// Foreground daemon (the process spawned by `spawn_detached_server`).
 async fn run_server() -> std::io::Result<()> {
+    // `for_default_session` already ensures the runtime dir exists with 0700.
     let config = ServerConfig::for_default_session()?;
-    let dir = socket::runtime_dir();
-    socket::ensure_runtime_dir(&dir)?;
-    let lock_path = dir.join("daemon.lock");
+    let lock_path = socket::runtime_dir().join("daemon.lock");
     // Hold the lock for the daemon's lifetime.
     let _lock = match daemon::acquire_instance_lock(&lock_path) {
         Ok(lock) => lock,
-        Err(_) => return Ok(()), // another daemon already running; nothing to do.
+        // Another daemon already holds the lock: nothing to do, exit cleanly.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        // A real error (permissions, I/O) should surface, not be silently swallowed.
+        Err(e) => return Err(e),
     };
     server::run(config).await
 }
