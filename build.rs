@@ -70,6 +70,24 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ghostty-vt");
     }
 
+    // Generate FFI bindings from the emitted umbrella header.
+    let include_dir = vendor.join("zig-out/include");
+    let header = include_dir.join("ghostty/vt.h");
+    assert!(header.exists(), "expected emitted header at {header:?}");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let bindings = bindgen::Builder::default()
+        .header(header.to_string_lossy())
+        .clang_arg(format!("-I{}", include_dir.display()))
+        .allowlist_function("ghostty_.*")
+        .allowlist_type("Ghostty.*")
+        .allowlist_var("GHOSTTY_.*")
+        .layout_tests(false)
+        .generate()
+        .expect("bindgen failed to generate libghostty-vt bindings");
+    bindings
+        .write_to_file(out_dir.join("ghostty_bindings.rs"))
+        .expect("failed to write generated bindings");
+
     // Rebuild only when the vendored source (not the build outputs) changes.
     println!("cargo:rerun-if-changed=build.rs");
     for sub in ["src", "include", "pkg", "build.zig", "build.zig.zon", "VERSION"] {
