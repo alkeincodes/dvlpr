@@ -1,7 +1,7 @@
 //! Unix socket path resolution, directory setup, and stale/live detection.
 
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const SUN_PATH_MAX: usize = 100; // conservative; macOS sun_path is 104.
@@ -29,10 +29,19 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 /// Create the runtime directory with `0700` perms if needed.
+///
+/// The mode is applied at `mkdir(2)` time (not a create-then-chmod) so there is no
+/// window where the directory is world-readable on a shared system.
 pub fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    if dir.exists() {
+        // Already present: enforce owner-only perms on the existing directory.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        return Ok(());
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 /// Reject socket paths too long for `sockaddr_un.sun_path`.
@@ -91,5 +100,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.sock");
         assert!(!is_live(&path).await);
+    }
+
+    #[tokio::test]
+    async fn live_listener_is_detected_as_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert!(is_live(&path).await);
+    }
+
+    #[test]
+    fn ensure_runtime_dir_creates_owner_only_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("rt");
+        ensure_runtime_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }
