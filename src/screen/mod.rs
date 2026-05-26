@@ -137,12 +137,57 @@ impl Screen {
         }
     }
 
-    fn csi_byte(&mut self, _b: u8) {
-        // Fully implemented in Task 4/5; for now consume until a final byte.
-        if (0x40..=0x7e).contains(&_b) {
-            self.state = ParseState::Ground;
+    fn csi_byte(&mut self, b: u8) {
+        match b {
+            b'0'..=b'9' => {
+                let digit = (b - b'0') as u16;
+                let v = self.cur_param.unwrap_or(0);
+                self.cur_param = Some(v.saturating_mul(10).saturating_add(digit));
+            }
+            b';' => {
+                self.params.push(self.cur_param.take().unwrap_or(0));
+            }
+            0x40..=0x7e => {
+                if let Some(v) = self.cur_param.take() {
+                    self.params.push(v);
+                }
+                self.dispatch_csi(b);
+                self.state = ParseState::Ground;
+            }
+            _ => {
+                // Unsupported intermediate byte: abort the sequence.
+                self.state = ParseState::Ground;
+            }
         }
     }
+
+    fn param(&self, i: usize, default: u16) -> u16 {
+        match self.params.get(i) {
+            Some(0) | None => default,
+            Some(&v) => v,
+        }
+    }
+
+    fn dispatch_csi(&mut self, final_byte: u8) {
+        match final_byte {
+            b'A' => self.cy = self.cy.saturating_sub(self.param(0, 1)),
+            b'B' => self.cy = (self.cy + self.param(0, 1)).min(self.rows - 1),
+            b'C' => self.cx = (self.cx + self.param(0, 1)).min(self.cols - 1),
+            b'D' => self.cx = self.cx.saturating_sub(self.param(0, 1)),
+            b'H' | b'f' => {
+                let row = self.param(0, 1);
+                let col = self.param(1, 1);
+                self.cy = row.saturating_sub(1).min(self.rows - 1);
+                self.cx = col.saturating_sub(1).min(self.cols - 1);
+            }
+            b'J' => self.erase_display(),
+            b'K' => self.erase_line(),
+            _ => {} // ignore unsupported CSI commands in Phase 1
+        }
+    }
+
+    fn erase_display(&mut self) {}
+    fn erase_line(&mut self) {}
 }
 
 #[cfg(test)]
@@ -212,5 +257,34 @@ mod tests {
         let mut s = Screen::new(20, 2);
         s.feed(b"a\t");
         assert_eq!(s.cursor(), (8, 0));
+    }
+
+    #[test]
+    fn cursor_position_absolute_cup() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"\x1b[3;5H"); // row 3, col 5 (1-based)
+        assert_eq!(s.cursor(), (4, 2));
+    }
+
+    #[test]
+    fn cup_with_no_params_homes_cursor() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"abc");
+        s.feed(b"\x1b[H");
+        assert_eq!(s.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn cursor_relative_moves_clamp_to_bounds() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"\x1b[2;2H"); // (1,1)
+        s.feed(b"\x1b[1A"); // up 1 -> (1,0)
+        assert_eq!(s.cursor(), (1, 0));
+        s.feed(b"\x1b[10C"); // right 10, clamps to last col
+        assert_eq!(s.cursor(), (9, 0));
+        s.feed(b"\x1b[10B"); // down 10, clamps to last row
+        assert_eq!(s.cursor(), (9, 4));
+        s.feed(b"\x1b[100D"); // left 100, clamps to col 0
+        assert_eq!(s.cursor(), (0, 4));
     }
 }
