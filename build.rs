@@ -32,7 +32,9 @@ fn main() {
     let ver_out = Command::new(&zig)
         .arg("version")
         .output()
-        .unwrap_or_else(|e| panic!("failed to run `{zig} version` — set ZIG to a zig 0.15.2 binary: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("failed to run `{zig} version` — set ZIG to a zig 0.15.2 binary: {e}")
+        });
     let ver = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
     if ver != "0.15.2" {
         panic!(
@@ -90,11 +92,15 @@ fn main() {
 
     // Rebuild only when the vendored source (not the build outputs) changes.
     println!("cargo:rerun-if-changed=build.rs");
-    for sub in ["src", "include", "pkg", "build.zig", "build.zig.zon", "VERSION"] {
-        println!(
-            "cargo:rerun-if-changed={}",
-            vendor.join(sub).display()
-        );
+    for sub in [
+        "src",
+        "include",
+        "pkg",
+        "build.zig",
+        "build.zig.zon",
+        "VERSION",
+    ] {
+        println!("cargo:rerun-if-changed={}", vendor.join(sub).display());
     }
     println!("cargo:rerun-if-env-changed=ZIG");
     println!("cargo:rerun-if-env-changed=LIBGHOSTTY_VT_OPTIMIZE");
