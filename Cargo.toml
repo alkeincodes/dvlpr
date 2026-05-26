@@ -1,0 +1,26 @@
+[package]
+name = "dvlpr"
+version = "0.1.0"
+edition = "2021"
+description = "lightweight agent-aware terminal multiplexer"
+
+[lib]
+name = "dvlpr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dvlpr"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "net", "signal"] }
+portable-pty = "0.9"
+crossterm = "0.29"
+bincode = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
