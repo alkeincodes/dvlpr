@@ -186,8 +186,35 @@ impl Screen {
         }
     }
 
-    fn erase_display(&mut self) {}
-    fn erase_line(&mut self) {}
+    fn erase_display(&mut self) {
+        let mode = self.param(0, 0);
+        let cur = self.idx(self.cx, self.cy);
+        let total = self.cells.len();
+        match mode {
+            0 => self.clear_range(cur, total),
+            1 => self.clear_range(0, cur + 1),
+            _ => self.clear_range(0, total),
+        }
+    }
+
+    fn erase_line(&mut self) {
+        let mode = self.param(0, 0);
+        let row_start = self.idx(0, self.cy);
+        let row_end = row_start + self.cols as usize;
+        let cur = self.idx(self.cx, self.cy);
+        match mode {
+            0 => self.clear_range(cur, row_end),
+            1 => self.clear_range(row_start, cur + 1),
+            _ => self.clear_range(row_start, row_end),
+        }
+    }
+
+    fn clear_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.cells.len());
+        for cell in &mut self.cells[start..end] {
+            *cell = Cell::default();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +313,41 @@ mod tests {
         assert_eq!(s.cursor(), (9, 4));
         s.feed(b"\x1b[100D"); // left 100, clamps to col 0
         assert_eq!(s.cursor(), (0, 4));
+    }
+
+    #[test]
+    fn erase_display_all_clears_everything() {
+        let mut s = Screen::new(5, 2);
+        s.feed(b"abc\r\nde");
+        s.feed(b"\x1b[2J");
+        assert_eq!(row_text(&s, 0), "     ");
+        assert_eq!(row_text(&s, 1), "     ");
+    }
+
+    #[test]
+    fn erase_display_to_end_clears_from_cursor() {
+        let mut s = Screen::new(5, 2);
+        s.feed(b"abcde");
+        s.feed(b"\x1b[1;3H"); // cursor at col 3 (index 2)
+        s.feed(b"\x1b[0J"); // erase from cursor to end of display
+        assert_eq!(row_text(&s, 0), "ab   ");
+    }
+
+    #[test]
+    fn erase_line_to_end_clears_rest_of_row() {
+        let mut s = Screen::new(5, 2);
+        s.feed(b"abcde");
+        s.feed(b"\x1b[1;3H");
+        s.feed(b"\x1b[0K"); // erase from cursor to end of line
+        assert_eq!(row_text(&s, 0), "ab   ");
+    }
+
+    #[test]
+    fn erase_line_whole_clears_full_row() {
+        let mut s = Screen::new(5, 2);
+        s.feed(b"abcde");
+        s.feed(b"\x1b[1;3H");
+        s.feed(b"\x1b[2K");
+        assert_eq!(row_text(&s, 0), "     ");
     }
 }
