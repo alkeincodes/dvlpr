@@ -66,6 +66,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     }
     let listener = UnixListener::bind(&config.socket_path)?;
     socket::lock_down_socket(&config.socket_path)?;
+    tracing::info!(socket = %config.socket_path.display(), "dvlpr server listening");
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
 
@@ -146,6 +147,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         dirty = true;
                     }
                     Event::PaneExited => {
+                        tracing::info!("pane process exited; shutting down server");
                         for (_, tx) in clients.drain() {
                             let _ = tx.send(ServerMsg::Closed {
                                 reason: "pane process exited".to_string(),
@@ -177,9 +179,18 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
         // Handshake.
         let hello: ClientHello = match read_msg(&mut read_half).await {
             Ok(Some(h)) => h,
-            _ => return,
+            Ok(None) => return, // clean disconnect before handshake
+            Err(e) => {
+                tracing::warn!(error = %e, "client handshake read failed");
+                return;
+            }
         };
         if hello.protocol_version != PROTOCOL_VERSION {
+            tracing::warn!(
+                client = hello.protocol_version,
+                server = PROTOCOL_VERSION,
+                "rejecting client: protocol mismatch"
+            );
             let _ = write_msg(
                 &mut write_half,
                 &ServerHello::Reject {
