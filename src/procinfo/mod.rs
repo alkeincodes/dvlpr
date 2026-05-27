@@ -50,7 +50,7 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<Vec<String>> {
         return None;
     }
     let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if argc <= 0 {
+    if argc <= 0 || argc > 65_536 {
         return None;
     }
     let mut i = 4usize;
@@ -197,5 +197,18 @@ mod tests {
     fn parse_procargs2_rejects_short_buffer() {
         assert_eq!(parse_procargs2(&[1, 2]), None);
         assert_eq!(parse_procargs2(&0i32.to_ne_bytes()), None); // argc 0
+    }
+
+    #[test]
+    fn parse_procargs2_handles_argc_larger_than_present_args() {
+        // argc claims 5, but only 2 argv strings are present.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/bin/node\0"); // exec_path
+        buf.extend_from_slice(b"\0"); // padding
+        buf.extend_from_slice(b"node\0");
+        buf.extend_from_slice(b"app.js\0");
+        let argv = parse_procargs2(&buf).unwrap();
+        assert_eq!(argv, vec!["node".to_string(), "app.js".to_string()]);
     }
 }
