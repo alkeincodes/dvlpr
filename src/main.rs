@@ -14,7 +14,12 @@ async fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match parse_args(&args) {
+    let cmd = parse_args(&args);
+    if let Some(msg) = nested_block(&cmd, std::env::var("DVLPR").ok().as_deref()) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+    let result = match cmd {
         Cmd::Server { session } => run_server(&session).await,
         Cmd::Run { session } => run_or_attach(&session).await,
         Cmd::Attach { session } => attach_existing(&session).await,
@@ -104,6 +109,21 @@ fn parse_args(args: &[String]) -> Cmd {
                 Cmd::Usage(USAGE.into())
             }
         }
+    }
+}
+
+/// Returns an error message if `cmd` must not run inside an existing dvlpr
+/// session. `dvlpr_env` is the value of `$DVLPR` (`None` when not nested).
+/// Only the interactive create/attach commands are refused; `ls`/`kill`/`ssh`/
+/// `server` are safe to run from inside a session.
+fn nested_block(cmd: &Cmd, dvlpr_env: Option<&str>) -> Option<String> {
+    let parent = dvlpr_env?; // not nested -> always allow
+    match cmd {
+        Cmd::Run { .. } | Cmd::Attach { .. } => Some(format!(
+            "dvlpr: refusing to open a nested session (already inside '{parent}'); \
+             unset DVLPR to force"
+        )),
+        _ => None,
     }
 }
 
@@ -214,10 +234,44 @@ async fn list_sessions() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Cmd};
+    use super::{nested_block, parse_args, Cmd};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn nested_block_refuses_run_and_attach_only_when_env_set() {
+        let run = Cmd::Run {
+            session: "x".into(),
+        };
+        let attach = Cmd::Attach {
+            session: "x".into(),
+        };
+        let ls = Cmd::Ls;
+        let kill = Cmd::Kill {
+            session: "x".into(),
+        };
+        let server = Cmd::Server {
+            session: "x".into(),
+        };
+
+        // Not nested ($DVLPR unset): everything is allowed.
+        for c in [&run, &attach, &ls, &kill, &server] {
+            assert_eq!(nested_block(c, None), None);
+        }
+
+        // Nested: only Run and Attach are refused.
+        assert!(nested_block(&run, Some("parent")).is_some());
+        assert!(nested_block(&attach, Some("parent")).is_some());
+        assert_eq!(nested_block(&ls, Some("parent")), None);
+        assert_eq!(nested_block(&kill, Some("parent")), None);
+        assert_eq!(nested_block(&server, Some("parent")), None);
+
+        // The message names the parent session.
+        assert!(nested_block(&run, Some("parent"))
+            .unwrap()
+            .contains("parent"));
     }
 
     #[test]
