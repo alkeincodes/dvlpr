@@ -13,8 +13,12 @@ async fn client_handshakes_and_receives_a_frame_with_command_output() {
         command: vec!["sh".into(), "-c".into(), "printf READY; sleep 5".into()],
         cwd: ".".into(),
     };
-    tokio::spawn(async move {
-        let _ = run(config).await;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = rt.block_on(run(config));
     });
 
     // Wait for the socket to appear.

@@ -57,8 +57,12 @@ async fn pane_survives_detach_and_screen_is_restored_on_reattach() {
         command: vec!["sh".into(), "-c".into(), "printf MARKER; sleep 30".into()],
         cwd: ".".into(),
     };
-    tokio::spawn(async move {
-        let _ = run(config).await;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = rt.block_on(run(config));
     });
 
     for _ in 0..50 {

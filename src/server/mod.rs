@@ -8,11 +8,11 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use crate::ghostty::screen::GhosttyScreen;
 use crate::pane::{PaneOutput, PaneRuntime};
 use crate::protocol::{
     read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
-use crate::screen::Screen;
 
 /// How a daemon should start: where to listen and what to run in the pane.
 pub struct ServerConfig {
@@ -75,7 +75,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     // Spawn the pane at a default size; first client resizes it.
     let (pane, mut pane_rx) = PaneRuntime::spawn(&config.command, &config.cwd, 80, 24)?;
-    let mut screen = Screen::new(80, 24);
+    let mut screen = GhosttyScreen::new(80, 24);
 
     // Forward pane output into the event loop.
     {
@@ -129,6 +129,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         // Last connecting client drives the shared pane size (Phase 1).
                         screen.resize(cols, rows);
                         pane.resize(cols, rows);
+                        flush_pty_replies(&mut screen, &pane);
                         // Immediate full repaint for the newcomer.
                         let _ = frames.send(ServerMsg::Frame {
                             data: screen.render_ansi(),
@@ -142,11 +143,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     Event::ClientResize { cols, rows } => {
                         screen.resize(cols, rows);
                         pane.resize(cols, rows);
+                        flush_pty_replies(&mut screen, &pane);
                         dirty = true;
                     }
                     Event::ClientGone(id) => { clients.remove(&id); }
                     Event::PaneBytes(bytes) => {
                         screen.feed(&bytes);
+                        flush_pty_replies(&mut screen, &pane);
                         dirty = true;
                     }
                     Event::PaneExited => {
@@ -172,6 +175,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     let _ = std::fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+/// Flush any PTY-bound replies the terminal produced (DSR/DECRQM/size reports)
+/// back to the child program via the PTY input. Cheap no-op when empty.
+fn flush_pty_replies(screen: &mut GhosttyScreen, pane: &PaneRuntime) {
+    let replies = screen.take_pty_writes();
+    if !replies.is_empty() {
+        pane.write_input(&replies);
+    }
 }
 
 /// Per-client connection: handshake, then split read/write halves.
