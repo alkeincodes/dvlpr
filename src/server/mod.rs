@@ -3,11 +3,15 @@ pub mod socket;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
+use crate::compositor::{diff_rows, serialize_full, Grid};
 use crate::config::Config;
 use crate::input::{InputEvent, InputParser};
 use crate::layout::{PaneId, SplitPath};
@@ -44,11 +48,19 @@ impl ServerConfig {
 
 type ClientId = u64;
 
-/// Events funneled into the single ServerTask.
+/// Server-initiated control messages to a client's writer task. At most one is
+/// ever sent per client (then the writer exits), so an unbounded channel costs
+/// nothing and keeps `send` synchronous (usable from sync apply/teardown paths).
+enum Control {
+    Detach,
+    Closed(String),
+}
+
+/// Events funneled into the single central loop.
 enum Event {
     ClientConnected {
         id: ClientId,
-        frames: mpsc::UnboundedSender<ServerMsg>,
+        write_half: tokio::net::unix::OwnedWriteHalf,
         cols: u16,
         rows: u16,
     },
@@ -67,15 +79,16 @@ enum Event {
     },
 }
 
-/// Per-connected-client run-loop state: where to send frames, the input parser
-/// (prefix + mouse, with cross-chunk escape buffering), the divider being dragged
-/// (if any), and when a pending lone-ESC should be flushed to the focused pane.
+/// Per-connected-client central-loop state. The writer task (spawned by the
+/// central loop) owns the diff baseline; here we keep the handles to drive it:
+/// the control sender, the frame mailbox sender, and the writer's join handle
+/// (awaited only at full-server teardown for a deterministic `Closed` flush).
 struct ClientState {
-    frames: mpsc::UnboundedSender<ServerMsg>,
+    control: mpsc::UnboundedSender<Control>,
+    grid_tx: watch::Sender<Arc<Grid>>,
+    writer: JoinHandle<()>,
     parser: InputParser,
-    /// The divider being dragged, as `(window index at press, path)`. The window
-    /// is recorded so a drag started in one window is applied to THAT window's
-    /// tree even if input from any client switches the active window mid-drag.
+    /// The divider being dragged, as `(window index at press, path)`.
     drag: Option<(usize, SplitPath)>,
     escape_deadline: Option<Instant>,
 }
@@ -84,7 +97,10 @@ struct ClientState {
 /// before being treated as a standalone Escape key.
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// Run the daemon to completion (until the pane exits).
+/// Upper bound on how long teardown waits for all writers to flush `Closed`.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Run the daemon to completion (until the last pane exits).
 pub async fn run(config: ServerConfig) -> io::Result<()> {
     // Bind: remove a stale socket first, reject a live one.
     if config.socket_path.exists() {
@@ -122,52 +138,56 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         });
     }
 
-    // Central loop: owns the Session (windows/panes/compositor); renders on a coalesced tick.
+    // Central loop: owns the Session; composes once per dirty tick (and on connect)
+    // and publishes the latest Arc<Grid> to each client's watch mailbox. Per-client
+    // writer tasks diff against their own baseline and write at their own pace.
     //
-    // PHASE 1 MULTI-CLIENT POLICY (deliberate simplification — NOT the final model):
-    // Phase 1 targets a single attached client. Multiple clients are tolerated, but
-    // there is no foreground/observer distinction: input is accepted from any client
-    // and the most recent connect/resize drives the shared pane size (last-writer-
-    // wins). The SPEC's full single-active-writer model — one foreground writer drives
-    // geometry+input, observers get clipped/letterboxed frames, a second writer needs
-    // `--takeover`, and foreground is promoted on disconnect — is Phase 3 work
-    // (see "Out of scope"). It is intentionally NOT implemented here.
+    // PHASE A MULTI-CLIENT POLICY: a single shared grid for all clients; the most
+    // recent connect/resize drives the shared pane size (last-writer-wins). The
+    // single-active-writer model (per-client sizing, foreground/observer, clipping)
+    // is Phase B and intentionally NOT implemented here.
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
 
-    loop {
+    let reason: String = loop {
         tokio::select! {
             maybe_event = ev_rx.recv() => {
-                let Some(event) = maybe_event else { break };
+                let Some(event) = maybe_event else { break "server stopped".to_string() };
                 match event {
-                    Event::ClientConnected { id, frames, cols, rows } => {
+                    Event::ClientConnected { id, write_half, cols, rows } => {
                         session.resize(cols, rows);
-                        let _ = frames.send(ServerMsg::Frame {
-                            data: session.render(),
-                            full: true,
-                        });
+                        let grid = Arc::new(session.compose());
+                        // A new attach can change the shared size: refresh every
+                        // existing client with the freshly composed grid.
+                        for st in clients.values() {
+                            let _ = st.grid_tx.send(grid.clone());
+                        }
+                        // Seed the newcomer's own mailbox with the same grid, then
+                        // spawn its writer (which emits the first full frame).
+                        let (grid_tx, grid_rx) = watch::channel(grid.clone());
+                        let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
+                        let writer = spawn_writer(write_half, grid_rx, control_rx);
                         clients.insert(
                             id,
                             ClientState {
-                                frames,
+                                control: control_tx,
+                                grid_tx,
+                                writer,
                                 parser: InputParser::new(),
                                 drag: None,
                                 escape_deadline: None,
                             },
                         );
-                        dirty = true;
+                        dirty = false;
                     }
                     Event::ClientInput { id, bytes } => {
                         let events = match clients.get_mut(&id) {
                             Some(st) => {
                                 let now = Instant::now();
                                 let mut evs = Vec::new();
-                                // If this client's lone-ESC deadline already passed,
-                                // commit the standalone Escape BEFORE interpreting the
-                                // new bytes — otherwise a continuation that arrives
-                                // after the deadline but before the tick sweep would be
-                                // glued onto a sequence the user has abandoned.
+                                // Commit a standalone Escape whose deadline already
+                                // passed BEFORE interpreting the new bytes.
                                 if matches!(st.escape_deadline, Some(dl) if dl <= now) {
                                     evs.extend(st.parser.flush_escape_timeout());
                                 }
@@ -182,8 +202,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         };
                         apply_events(&mut session, &mut clients, &ev_tx, id, events, &mut dirty);
                         if session.is_empty() {
-                            shutdown(&mut clients, "pane process exited");
-                            break;
+                            break "pane process exited".to_string();
                         }
                     }
                     Event::ClientResize { cols, rows } => {
@@ -204,8 +223,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             }
                             if session.is_empty() {
                                 tracing::info!("last pane exited; shutting down server");
-                                shutdown(&mut clients, "pane process exited");
-                                break;
+                                break "pane process exited".to_string();
                             }
                             dirty = true;
                         }
@@ -238,26 +256,27 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     }
                 }
                 if dirty && !clients.is_empty() {
-                    let frame = ServerMsg::Frame { data: session.render(), full: true };
-                    clients.retain(|_, st| st.frames.send(frame.clone()).is_ok());
+                    let grid = Arc::new(session.compose());
+                    for st in clients.values() {
+                        let _ = st.grid_tx.send(grid.clone());
+                    }
                     dirty = false;
                 }
             }
         }
-    }
+    };
 
-    // Best-effort teardown flush: yield once so the per-client writer tasks get a
-    // poll to drain the final `Closed`/`Detach` message to the socket before this
-    // function returns and (on the current-thread test runtime) the runtime drops,
-    // cancelling those spawned tasks. This is reliable for the small control
-    // messages we send here — they complete synchronously while the socket buffer
-    // has room — but it is NOT a deterministic flush: a large `Frame` (up to
-    // MAX_FRAME_BYTES) still queued ahead of `Closed` on a backpressured client
-    // could pend and be lost. A deterministic fix would track the writer
-    // `JoinHandle`s and await them after dropping the `frame_tx` senders; deferred
-    // as it touches the per-client lifecycle and risks a teardown hang if any
-    // sender clone outlives the loop. See known-limitations notes.
-    tokio::task::yield_now().await;
+    // Deterministic teardown: enqueue `Closed` on every (unbounded) control channel,
+    // drop the watch senders (by dropping the client entries), then await the writer
+    // handles under one aggregate timeout so `Closed` is actually flushed. The biased
+    // writer select guarantees `Closed` is written before the watch-closed exit.
+    let writers = close_all(&mut clients, &reason);
+    let _ = timeout(TEARDOWN_TIMEOUT, async {
+        for w in writers {
+            let _ = w.await;
+        }
+    })
+    .await;
 
     for runtime in session.shutdown() {
         runtime.close();
@@ -266,9 +285,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Route decoded input events for client `id` into the session, performing the
-/// command side effects (attach forwarders for new panes, async-close removed
-/// runtimes, detach the issuing client).
+/// Route decoded input events for client `id` into the session, performing command
+/// side effects (attach forwarders for new panes, async-close removed runtimes,
+/// detach the issuing client).
 fn apply_events(
     session: &mut Session,
     clients: &mut HashMap<ClientId, ClientState>,
@@ -294,8 +313,11 @@ fn apply_events(
                     runtime.close();
                 }
                 if eff.detach {
+                    // Send Detach, then drop the entry: the biased writer writes
+                    // Detach before its watch sender closes, then exits. The handle
+                    // is detached (not awaited) — fine for a single mid-run detach.
                     if let Some(st) = clients.remove(&id) {
-                        let _ = st.frames.send(ServerMsg::Detach);
+                        let _ = st.control.send(Control::Detach);
                     }
                 }
             }
@@ -304,16 +326,79 @@ fn apply_events(
     }
 }
 
-/// Tell every client the session closed and drop them. The session's panes are
-/// already gone by the time this is called (last pane exited), so there is no
-/// runtime to drain here; `Session::shutdown` is the guardrail for any future
-/// path that ends the loop with live panes.
-fn shutdown(clients: &mut HashMap<ClientId, ClientState>, reason: &str) {
+/// Drain all clients, enqueueing `Closed` on each control channel and collecting
+/// their writer handles for the caller to await. Dropping each `ClientState` drops
+/// its watch sender; the biased writer still processes the queued `Closed` first.
+fn close_all(clients: &mut HashMap<ClientId, ClientState>, reason: &str) -> Vec<JoinHandle<()>> {
+    let mut writers = Vec::new();
     for (_, st) in clients.drain() {
-        let _ = st.frames.send(ServerMsg::Closed {
-            reason: reason.to_string(),
-        });
+        let _ = st.control.send(Control::Closed(reason.to_string()));
+        writers.push(st.writer);
     }
+    writers
+}
+
+/// Per-client writer task: emit the first full frame from the seeded grid, then on
+/// each grid update send a per-row diff (or a full frame on a dimension change).
+/// A biased `select!` polls the control channel first so `Detach`/`Closed` always
+/// win over a concurrently-closed watch channel.
+fn spawn_writer(
+    mut write_half: tokio::net::unix::OwnedWriteHalf,
+    mut grid_rx: watch::Receiver<Arc<Grid>>,
+    mut control: mpsc::UnboundedReceiver<Control>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        // First frame: a full repaint of the seeded (correctly-sized) grid.
+        let mut last: Arc<Grid> = grid_rx.borrow_and_update().clone();
+        if write_msg(
+            &mut write_half,
+            &ServerMsg::Frame {
+                data: serialize_full(last.as_ref()),
+                full: true,
+            },
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                ctrl = control.recv() => match ctrl {
+                    Some(Control::Detach) => {
+                        let _ = write_msg(&mut write_half, &ServerMsg::Detach).await;
+                        return;
+                    }
+                    Some(Control::Closed(reason)) => {
+                        let _ = write_msg(&mut write_half, &ServerMsg::Closed { reason }).await;
+                        return;
+                    }
+                    None => return,
+                },
+                changed = grid_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let next: Arc<Grid> = grid_rx.borrow_and_update().clone();
+                    let resized = next.dims() != last.dims();
+                    let data = if resized {
+                        serialize_full(next.as_ref())
+                    } else {
+                        diff_rows(last.as_ref(), next.as_ref())
+                    };
+                    if !data.is_empty()
+                        && write_msg(&mut write_half, &ServerMsg::Frame { data, full: resized })
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                    last = next;
+                }
+            }
+        }
+    })
 }
 
 /// Forward one pane's output into the event loop, tagged with its pane id. Ends
@@ -332,7 +417,8 @@ fn spawn_pane_forwarder(
     });
 }
 
-/// Per-client connection: handshake, then split read/write halves.
+/// Per-client connection: handshake, hand the write half to the central loop via
+/// `ClientConnected`, then run the reader loop forwarding client messages.
 fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<Event>) {
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.into_split();
@@ -376,12 +462,11 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
             return;
         }
 
-        // Register for outgoing frames.
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<ServerMsg>();
+        // Hand the write half to the central loop, which spawns the writer task.
         if ev_tx
             .send(Event::ClientConnected {
                 id,
-                frames: frame_tx,
+                write_half,
                 cols: hello.cols,
                 rows: hello.rows,
             })
@@ -389,15 +474,6 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
         {
             return;
         }
-
-        // Writer half: drain frames to the socket.
-        tokio::spawn(async move {
-            while let Some(msg) = frame_rx.recv().await {
-                if write_msg(&mut write_half, &msg).await.is_err() {
-                    break;
-                }
-            }
-        });
 
         // Reader half: forward client messages into the event loop.
         loop {
