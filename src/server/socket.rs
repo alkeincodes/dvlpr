@@ -23,6 +23,34 @@ pub fn socket_path_in(dir: &Path, session: &str) -> PathBuf {
     dir.join(format!("{session}.sock"))
 }
 
+/// Lock-file path for a named session inside `dir`.
+pub fn lock_path_in(dir: &Path, session: &str) -> PathBuf {
+    dir.join(format!("{session}.lock"))
+}
+
+/// Validate a session name: a friendly, unambiguous identifier (not merely
+/// filesystem-safe). Accepts non-empty `[A-Za-z0-9._-]+` that is not `.`/`..` and whose
+/// resulting `{name}.sock` path fits `sun_path`. Rejects everything else (so `ls` output
+/// stays single-line and shell-quoting-free) with `InvalidInput`.
+pub fn validate_session_name(name: &str) -> io::Result<()> {
+    let invalid = |msg: String| io::Error::new(io::ErrorKind::InvalidInput, msg);
+    if name.is_empty() {
+        return Err(invalid("session name must not be empty".to_string()));
+    }
+    if name == "." || name == ".." {
+        return Err(invalid(format!("invalid session name: {name:?}")));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(invalid(format!(
+            "session name {name:?} must match [A-Za-z0-9._-]+"
+        )));
+    }
+    check_sun_path_len(&socket_path_in(&runtime_dir(), name))
+}
+
 /// Default socket path for the default session.
 pub fn default_socket_path() -> PathBuf {
     socket_path_in(&runtime_dir(), "default")
@@ -117,5 +145,42 @@ mod tests {
         ensure_runtime_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn validate_session_name_accepts_friendly_names() {
+        for name in ["default", "work", "my-proj_2", "v1.2", "A"] {
+            assert!(
+                validate_session_name(name).is_ok(),
+                "should accept {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_session_name_rejects_unfriendly_names() {
+        for name in ["", "a/b", ".", "..", "a b", "a\nb", "a:b", "a*b", "a\0b"] {
+            let err = validate_session_name(name).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidInput,
+                "should reject {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_session_name_rejects_overlong_names() {
+        let long = "x".repeat(300);
+        assert_eq!(
+            validate_session_name(&long).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn lock_path_lives_under_the_runtime_dir() {
+        let dir = std::env::temp_dir().join("dvlpr-locktest");
+        assert_eq!(lock_path_in(&dir, "work"), dir.join("work.lock"));
     }
 }
