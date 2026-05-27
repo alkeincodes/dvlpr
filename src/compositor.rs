@@ -196,6 +196,60 @@ pub fn diff_rows(prev: &Grid, next: &Grid) -> Vec<u8> {
     out
 }
 
+/// Fit a source grid into a `cols x rows` viewport for one client. The transform is
+/// computed independently per axis: on an axis where the view is larger, center with
+/// blank margin (letterbox); on an axis where the view is smaller, take the top-left
+/// region (clip); equal axes copy 1:1. The cursor follows the same per-axis rule.
+/// `cols`/`rows` must be >= 1 — callers clamp client sizes at ingestion.
+pub fn fit(src: &Grid, cols: u16, rows: u16) -> Grid {
+    debug_assert!(cols >= 1 && rows >= 1, "fit requires nonzero dims");
+    if (cols, rows) == src.dims() {
+        return src.clone();
+    }
+
+    let offset = |view: u16, s: u16| -> u16 {
+        if view > s {
+            (view - s) / 2
+        } else {
+            0
+        }
+    };
+    let off_x = offset(cols, src.cols);
+    let off_y = offset(rows, src.rows);
+    let copy_w = cols.min(src.cols);
+    let copy_h = rows.min(src.rows);
+
+    let mut cells = vec![' '; cols as usize * rows as usize];
+    for j in 0..copy_h {
+        for i in 0..copy_w {
+            let src_idx = j as usize * src.cols as usize + i as usize;
+            let dst_idx = (off_y + j) as usize * cols as usize + (off_x + i) as usize;
+            cells[dst_idx] = src.cells[src_idx];
+        }
+    }
+
+    let map = |c: u16, view: u16, s: u16, off: u16| -> u16 {
+        if view > s {
+            (c + off).min(view - 1)
+        } else {
+            c.min(view - 1)
+        }
+    };
+    let cursor = (
+        map(src.cursor.0, cols, src.cols, off_x),
+        map(src.cursor.1, rows, src.rows, off_y),
+    );
+
+    let out = Grid {
+        cols,
+        rows,
+        cells,
+        cursor,
+    };
+    debug_assert_eq!(out.cells.len(), cols as usize * rows as usize);
+    out
+}
+
 /// Find a pane's cell source by id (linear scan — pane counts are small).
 fn lookup<'a>(panes: &'a [(PaneId, &'a dyn PaneCells)], id: PaneId) -> Option<&'a dyn PaneCells> {
     panes.iter().find(|(pid, _)| *pid == id).map(|(_, p)| *p)
@@ -591,5 +645,69 @@ mod tests {
         };
         let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
         assert_eq!(out, "\x1b[1;1HXY\x1b[1;1H");
+    }
+
+    fn grid(cols: u16, rows: u16, cells: &str, cursor: (u16, u16)) -> Grid {
+        let cells: Vec<char> = cells.chars().collect();
+        assert_eq!(
+            cells.len(),
+            cols as usize * rows as usize,
+            "test grid size mismatch"
+        );
+        Grid {
+            cols,
+            rows,
+            cells,
+            cursor,
+        }
+    }
+
+    #[test]
+    fn fit_identity_returns_equal_grid() {
+        let g = grid(3, 2, "abcdef", (1, 0));
+        let f = fit(&g, 3, 2);
+        assert_eq!((f.cols, f.rows), (3, 2));
+        assert_eq!(f.cells, g.cells);
+        assert_eq!(f.cursor, (1, 0));
+    }
+
+    #[test]
+    fn fit_letterbox_centers_and_pads_and_shifts_cursor() {
+        let g = grid(2, 1, "ab", (0, 0));
+        let f = fit(&g, 4, 3);
+        assert_eq!((f.cols, f.rows), (4, 3));
+        assert_eq!(f.cells.iter().collect::<String>(), "     ab     ");
+        assert_eq!(f.cursor, (1, 1));
+    }
+
+    #[test]
+    fn fit_clip_takes_top_left_and_clamps_cursor() {
+        let g = grid(4, 3, "abcdefghijkl", (3, 2));
+        let f = fit(&g, 2, 1);
+        assert_eq!((f.cols, f.rows), (2, 1));
+        assert_eq!(f.cells.iter().collect::<String>(), "ab");
+        assert_eq!(f.cursor, (1, 0));
+    }
+
+    #[test]
+    fn fit_mixed_axes_center_x_clip_y() {
+        let g = grid(2, 3, "abcdef", (0, 2));
+        let f = fit(&g, 4, 1);
+        assert_eq!((f.cols, f.rows), (4, 1));
+        assert_eq!(f.cells.iter().collect::<String>(), " ab ");
+        assert_eq!(f.cursor, (1, 0));
+    }
+
+    #[test]
+    fn fit_output_cell_count_always_matches_dims() {
+        let g = grid(5, 4, &"x".repeat(20), (2, 2));
+        for (c, r) in [(1, 1), (5, 4), (10, 8), (3, 9), (7, 2)] {
+            let f = fit(&g, c, r);
+            assert_eq!(f.cells.len(), c as usize * r as usize);
+            assert!(
+                f.cursor.0 < c && f.cursor.1 < r,
+                "cursor must stay in-range"
+            );
+        }
     }
 }
