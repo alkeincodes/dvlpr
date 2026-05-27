@@ -50,6 +50,15 @@ pub enum Side {
 /// Path from the tree root to a `Split` node (empty = the root split itself).
 pub type SplitPath = Vec<Side>;
 
+/// A divider line between a split's two children, plus the path to that split
+/// (so a drag on this divider knows which `ratio` to adjust).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Divider {
+    pub rect: Rect,
+    pub path: SplitPath,
+    pub dir: SplitDir,
+}
+
 /// The y of the 1-row tab bar (bottom of the viewport), or `None` when there is
 /// only one window (single-window sessions use the full viewport — no tab bar).
 pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
@@ -121,9 +130,76 @@ fn split_area(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect, Rect) {
     }
 }
 
+/// All divider lines in the tree, each tagged with the path to its split.
+pub fn dividers(node: &Node, area: Rect) -> Vec<Divider> {
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    collect_dividers(node, area, &mut path, &mut out);
+    out
+}
+
+fn collect_dividers(node: &Node, area: Rect, path: &mut SplitPath, out: &mut Vec<Divider>) {
+    if let Node::Split {
+        dir, ratio, first, second, ..
+    } = node
+    {
+        let (a, divider, b) = split_area(area, *dir, *ratio);
+        out.push(Divider { rect: divider, path: path.clone(), dir: *dir });
+        path.push(Side::First);
+        collect_dividers(first, a, path, out);
+        path.pop();
+        path.push(Side::Second);
+        collect_dividers(second, b, path, out);
+        path.pop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_leaf_has_no_dividers() {
+        assert_eq!(dividers(&Node::Leaf(1), Rect { x: 0, y: 0, w: 10, h: 5 }), vec![]);
+    }
+
+    #[test]
+    fn one_split_has_one_divider_with_empty_path() {
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let ds = dividers(&tree, Rect { x: 0, y: 0, w: 11, h: 4 });
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].rect, Rect { x: 5, y: 0, w: 1, h: 4 }); // vertical divider column
+        assert_eq!(ds[0].path, Vec::<Side>::new()); // root split
+        assert_eq!(ds[0].dir, SplitDir::Vertical);
+    }
+
+    #[test]
+    fn nested_splits_record_paths() {
+        // Outer vertical; its first child is a horizontal split.
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        let ds = dividers(&tree, Rect { x: 0, y: 0, w: 21, h: 5 });
+        // Outer divider (root, empty path) + inner horizontal divider (path [First]).
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].path, Vec::<Side>::new());
+        assert_eq!(ds[0].dir, SplitDir::Vertical);
+        assert_eq!(ds[1].path, vec![Side::First]);
+        assert_eq!(ds[1].dir, SplitDir::Horizontal);
+    }
 
     #[test]
     fn single_window_has_no_tab_row_and_full_content() {
