@@ -112,7 +112,7 @@ fn parse_args(args: &[String]) -> Cmd {
                 destination: dest.clone(),
                 session: None,
             },
-            [dest, session] if !dest.starts_with('-') => Cmd::Ssh {
+            [dest, session] if !dest.starts_with('-') && !session.starts_with('-') => Cmd::Ssh {
                 destination: dest.clone(),
                 session: Some(session.clone()),
             },
@@ -303,9 +303,13 @@ mod tests {
         let server = Cmd::Server {
             session: "x".into(),
         };
+        let ssh = Cmd::Ssh {
+            destination: "host".into(),
+            session: None,
+        };
 
         // Not nested ($DVLPR unset): everything is allowed.
-        for c in [&run, &attach, &ls, &kill, &server] {
+        for c in [&run, &attach, &ls, &kill, &server, &ssh] {
             assert_eq!(nested_block(c, None), None);
         }
 
@@ -318,6 +322,9 @@ mod tests {
 
         // The message names the parent session.
         assert!(nested_block(&run, Some("parent"))
+            .unwrap()
+            .contains("parent"));
+        assert!(nested_block(&attach, Some("parent"))
             .unwrap()
             .contains("parent"));
     }
@@ -431,9 +438,13 @@ mod tests {
                 session: Some("work".into())
             }
         );
-        // No destination, leading-dash destination, and extra args are usage errors.
+        // No destination, leading-dash destination, leading-dash session, and extra args are usage errors.
         assert!(matches!(parse_args(&v(&["ssh"])), Cmd::Usage(_)));
         assert!(matches!(parse_args(&v(&["ssh", "-X"])), Cmd::Usage(_)));
+        assert!(matches!(
+            parse_args(&v(&["ssh", "host", "-x"])),
+            Cmd::Usage(_)
+        ));
         assert!(matches!(
             parse_args(&v(&["ssh", "host", "work", "extra"])),
             Cmd::Usage(_)
