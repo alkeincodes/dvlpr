@@ -151,8 +151,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     //
     // Single-active-writer model: one interaction-driven `foreground` client (most
     // recently connected/typed) drives the session geometry via `session.resize`; its
-    // size is the composed grid's size. Other clients still receive that same grid here
-    // (per-client clip/letterbox fitting is wired into the writer in a later step).
+    // size is the composed grid's size. Each client's writer then fits that one grid to
+    // its own terminal (clip if smaller, letterbox if larger) before serializing.
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut foreground: Option<ClientId> = None;
