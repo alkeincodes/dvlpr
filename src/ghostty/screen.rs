@@ -88,6 +88,26 @@ impl GhosttyScreen {
             char::from_u32(cp).filter(|c| !c.is_control()).unwrap_or(' ')
         }
     }
+
+    pub fn cursor(&self) -> (u16, u16) {
+        let mut cx: u16 = 0;
+        let mut cy: u16 = 0;
+        // SAFETY: `term` is valid; out-pointers are valid `u16`s matching the
+        // documented output type for CURSOR_X / CURSOR_Y.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_X,
+                (&raw mut cx).cast(),
+            );
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_CURSOR_Y,
+                (&raw mut cy).cast(),
+            );
+        }
+        (cx.min(self.cols - 1), cy.min(self.rows - 1))
+    }
 }
 
 impl Drop for GhosttyScreen {
@@ -127,5 +147,22 @@ mod tests {
         let mut s = GhosttyScreen::new(5, 2);
         s.feed(b"x");
         assert_eq!(s.cell(99, 99), ' ');
+    }
+
+    #[test]
+    fn cursor_advances_with_input() {
+        let mut s = GhosttyScreen::new(10, 3);
+        s.feed(b"hi");
+        assert_eq!(s.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn cursor_moves_to_next_row_after_crlf() {
+        let mut s = GhosttyScreen::new(10, 3);
+        s.feed(b"ab\r\ncd");
+        assert_eq!(s.cell(0, 1), 'c');
+        assert_eq!(s.cell(1, 1), 'd');
+        let (_cx, cy) = s.cursor();
+        assert_eq!(cy, 1);
     }
 }
