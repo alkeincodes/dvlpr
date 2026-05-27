@@ -305,6 +305,26 @@ mod tests {
     }
 
     #[test]
+    fn resize_with_in_band_size_reports_enabled_produces_a_pty_write() {
+        let mut s = GhosttyScreen::new(80, 24);
+        // Enable in-band size reporting (DEC private mode 2048). With this on,
+        // libghostty-vt emits a size report through the write-pty callback on the
+        // NEXT resize. This is the load-bearing reason the server drains after resize.
+        s.feed(b"\x1b[?2048h");
+        let _ = s.take_pty_writes(); // ignore any reply the enable itself produced
+        s.resize(100, 30);
+        let report = s.take_pty_writes();
+        assert!(
+            !report.is_empty(),
+            "resize with mode 2048 enabled should emit a size report"
+        );
+        assert_eq!(
+            report[0], 0x1b,
+            "size report should start with ESC, got {report:?}"
+        );
+    }
+
+    #[test]
     fn resize_updates_dimensions_and_keeps_rendering() {
         let mut s = GhosttyScreen::new(10, 4);
         s.feed(b"hello");
