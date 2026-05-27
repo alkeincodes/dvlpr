@@ -125,10 +125,13 @@ async fn run_loop(
 
     let mut stdin = tokio::io::stdin();
     let mut in_buf = [0u8; 4096];
+    // Tracks whether the loop exited because the reader task already finished
+    // (so we must NOT await its JoinHandle again — that would double-poll).
+    let mut reader_finished = false;
 
     loop {
         tokio::select! {
-            _ = &mut reader => break,
+            _ = &mut reader => { reader_finished = true; break; }
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     if write_msg(&mut write_half, &ClientMsg::Resize { cols, rows }).await.is_err() {
@@ -139,7 +142,11 @@ async fn run_loop(
             n = stdin.read(&mut in_buf) => {
                 let n = match n {
                     Ok(n) => n,
-                    Err(e) => { reader.abort(); return Err(e); }
+                    Err(e) => {
+                        reader.abort();
+                        let _ = reader.await;
+                        return Err(e);
+                    }
                 };
                 if n == 0 { break; }
                 if write_msg(&mut write_half, &ClientMsg::Input(in_buf[..n].to_vec())).await.is_err() {
@@ -149,6 +156,9 @@ async fn run_loop(
         }
     }
 
-    reader.abort();
+    if !reader_finished {
+        reader.abort();
+        let _ = reader.await; // wait for cancellation so MouseGuard::drop's fd-1 write can't interleave
+    }
     Ok(())
 }

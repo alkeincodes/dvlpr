@@ -72,7 +72,7 @@ async fn pane_survives_detach_and_screen_is_restored_on_reattach() {
 
     // First attach: see MARKER, then detach by dropping the connection (the daemon
     // keeps the pane alive). Server-initiated `Ctrl-a d` detach is covered in
-    // tests/multi_pane.rs.
+    // tests/multi_pane.rs (added in a later task).
     let (mut r1, w1) = connect_and_handshake(&socket_path).await;
     assert!(read_frame_containing(&mut r1, "MARKER", 5).await);
     drop(r1);
