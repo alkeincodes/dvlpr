@@ -246,6 +246,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         }
     }
 
+    // Yield once to allow the per-client writer tasks to drain the `Closed`
+    // (or `Detach`) message from their channels to the socket before the
+    // current-thread runtime stops polling. Without this yield the runtime
+    // drops immediately after `block_on` returns and the spawned writer tasks
+    // are cancelled before they can flush.
+    tokio::task::yield_now().await;
+
     for runtime in session.shutdown() {
         runtime.close();
     }
