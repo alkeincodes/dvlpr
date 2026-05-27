@@ -333,6 +333,42 @@ pub fn set_ratio(node: &mut Node, path: &[Side], ratio: f32) -> bool {
     }
 }
 
+/// The area and direction of the split reached by following `path` from the root.
+/// Returns `None` if the path does not lead to a split. Used by divider-drag to
+/// map a pointer position back to a ratio within the dragged split.
+pub fn split_area_at(node: &Node, area: Rect, path: &[Side]) -> Option<(Rect, SplitDir)> {
+    let mut cur = node;
+    let mut cur_area = area;
+    for side in path {
+        match cur {
+            Node::Split {
+                dir,
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let (a, _divider, b) = split_area(cur_area, *dir, *ratio);
+                match side {
+                    Side::First => {
+                        cur = first;
+                        cur_area = a;
+                    }
+                    Side::Second => {
+                        cur = second;
+                        cur_area = b;
+                    }
+                }
+            }
+            Node::Leaf(_) => return None,
+        }
+    }
+    match cur {
+        Node::Split { dir, .. } => Some((cur_area, *dir)),
+        Node::Leaf(_) => None,
+    }
+}
+
 const TAB_NAME_MAX: usize = 12;
 
 /// Lay out window tabs left-to-right: each label is `[<idx><marker><name>]`
@@ -967,6 +1003,71 @@ mod tests {
         assert_eq!(rects[0].1.h, 0);
         assert_eq!(rects[1].1.h, 0);
         assert_eq!(rects[0].1.h + rects[1].1.h, area.h);
+    }
+
+    #[test]
+    fn split_area_at_root_returns_full_area_and_dir() {
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 6,
+        };
+        assert_eq!(
+            split_area_at(&tree, area, &[]),
+            Some((area, SplitDir::Vertical))
+        );
+    }
+
+    #[test]
+    fn split_area_at_nested_returns_child_area() {
+        // Outer V (w=21): left child is an H split occupying x 0..=9 (w 10).
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 21,
+            h: 5,
+        };
+        let (a, dir) = split_area_at(&tree, area, &[Side::First]).unwrap();
+        assert_eq!(dir, SplitDir::Horizontal);
+        assert_eq!(
+            a,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 5
+            }
+        );
+    }
+
+    #[test]
+    fn split_area_at_bad_path_is_none() {
+        let tree = Node::Leaf(1);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 5,
+        };
+        assert_eq!(split_area_at(&tree, area, &[Side::First]), None);
     }
 
     #[test]
