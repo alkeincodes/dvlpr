@@ -123,8 +123,8 @@ impl Compositor {
         }
     }
 
-    /// Convenience: a full-frame serialization of `compose`. Used by `Session::render`
-    /// (until Task 2) and the compositor unit tests.
+    /// Convenience: a full-frame serialization of `compose`. Used by the compositor
+    /// unit tests; `Session::render` delegates to `serialize_full` directly.
     pub fn render(
         &self,
         viewport: Rect,

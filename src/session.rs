@@ -156,12 +156,7 @@ impl Session {
 
     /// Compose the active window into a `Grid` (the diff/serialize source).
     pub fn compose(&self) -> crate::compositor::Grid {
-        let viewport = Rect {
-            x: 0,
-            y: 0,
-            w: self.cols,
-            h: self.rows,
-        };
+        let viewport = self.viewport();
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
         let refs: Vec<(PaneId, &dyn PaneCells)> = self
             .panes
