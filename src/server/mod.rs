@@ -8,8 +8,9 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::ghostty::screen::GhosttyScreen;
-use crate::pane::{PaneOutput, PaneRuntime};
+use crate::layout::PaneId;
+use crate::pane::PaneOutput;
+use crate::session::Session;
 use crate::protocol::{
     read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
@@ -51,8 +52,7 @@ enum Event {
         rows: u16,
     },
     ClientGone(ClientId),
-    PaneBytes(Vec<u8>),
-    PaneExited,
+    PaneOutput { pane_id: PaneId, output: PaneOutput },
 }
 
 /// Run the daemon to completion (until the pane exits).
@@ -73,25 +73,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
 
-    // Spawn the pane at a default size; first client resizes it.
-    let (pane, mut pane_rx) = PaneRuntime::spawn(&config.command, &config.cwd, 80, 24)?;
-    let mut screen = GhosttyScreen::new(80, 24);
-
-    // Forward pane output into the event loop.
-    {
-        let ev_tx = ev_tx.clone();
-        tokio::spawn(async move {
-            while let Some(out) = pane_rx.recv().await {
-                let event = match out {
-                    PaneOutput::Bytes(b) => Event::PaneBytes(b),
-                    PaneOutput::Exited => Event::PaneExited,
-                };
-                if ev_tx.send(event).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    // The session owns all windows/panes and the compositor; start with one pane.
+    let (mut session, first_pane, first_rx) =
+        Session::new(config.command.clone(), config.cwd.clone(), 80, 24)?;
+    spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
     // Accept connections.
     {
@@ -106,7 +91,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         });
     }
 
-    // Central loop: owns the Screen and the PTY writer; renders on a coalesced tick.
+    // Central loop: owns the Session (windows/panes/compositor); renders on a coalesced tick.
     //
     // PHASE 1 MULTI-CLIENT POLICY (deliberate simplification — NOT the final model):
     // Phase 1 targets a single attached client. Multiple clients are tolerated, but
@@ -126,46 +111,51 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 let Some(event) = maybe_event else { break };
                 match event {
                     Event::ClientConnected { id, frames, cols, rows } => {
-                        // Last connecting client drives the shared pane size (Phase 1).
-                        screen.resize(cols, rows);
-                        pane.resize(cols, rows);
-                        flush_pty_replies(&mut screen, &pane);
+                        // Last connecting client drives the shared viewport size (Phase 1).
+                        session.resize(cols, rows);
                         // Immediate full repaint for the newcomer.
                         let _ = frames.send(ServerMsg::Frame {
-                            data: screen.render_ansi(),
+                            data: session.render(),
                             full: true,
                         });
                         clients.insert(id, frames);
-                        // Resized geometry should repaint any other clients too.
-                        dirty = true;
+                        dirty = true; // resized geometry repaints other clients too
                     }
-                    Event::ClientInput(bytes) => pane.write_input(&bytes),
+                    Event::ClientInput(bytes) => session.input(&bytes),
                     Event::ClientResize { cols, rows } => {
-                        screen.resize(cols, rows);
-                        pane.resize(cols, rows);
-                        flush_pty_replies(&mut screen, &pane);
+                        session.resize(cols, rows);
                         dirty = true;
                     }
-                    Event::ClientGone(id) => { clients.remove(&id); }
-                    Event::PaneBytes(bytes) => {
-                        screen.feed(&bytes);
-                        flush_pty_replies(&mut screen, &pane);
-                        dirty = true;
+                    Event::ClientGone(id) => {
+                        clients.remove(&id);
                     }
-                    Event::PaneExited => {
-                        tracing::info!("pane process exited; shutting down server");
-                        for (_, tx) in clients.drain() {
-                            let _ = tx.send(ServerMsg::Closed {
-                                reason: "pane process exited".to_string(),
-                            });
+                    Event::PaneOutput { pane_id, output } => match output {
+                        PaneOutput::Bytes(bytes) => {
+                            session.feed(pane_id, &bytes);
+                            dirty = true;
                         }
-                        break;
-                    }
+                        PaneOutput::Exited => {
+                            // Tear the exited pane's runtime down off the run loop.
+                            for runtime in session.pane_exited(pane_id) {
+                                runtime.close();
+                            }
+                            if session.is_empty() {
+                                tracing::info!("last pane exited; shutting down server");
+                                for (_, tx) in clients.drain() {
+                                    let _ = tx.send(ServerMsg::Closed {
+                                        reason: "pane process exited".to_string(),
+                                    });
+                                }
+                                break;
+                            }
+                            dirty = true;
+                        }
+                    },
                 }
             }
             _ = tick.tick() => {
                 if dirty && !clients.is_empty() {
-                    let frame = ServerMsg::Frame { data: screen.render_ansi(), full: true };
+                    let frame = ServerMsg::Frame { data: session.render(), full: true };
                     clients.retain(|_, tx| tx.send(frame.clone()).is_ok());
                     dirty = false;
                 }
@@ -177,13 +167,20 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Flush any PTY-bound replies the terminal produced (DSR/DECRQM/size reports)
-/// back to the child program via the PTY input. Cheap no-op when empty.
-fn flush_pty_replies(screen: &mut GhosttyScreen, pane: &PaneRuntime) {
-    let replies = screen.take_pty_writes();
-    if !replies.is_empty() {
-        pane.write_input(&replies);
-    }
+/// Forward one pane's output into the event loop, tagged with its pane id. Ends
+/// when the pane's output channel closes (the pane is gone).
+fn spawn_pane_forwarder(
+    pane_id: PaneId,
+    mut rx: mpsc::UnboundedReceiver<PaneOutput>,
+    ev_tx: mpsc::UnboundedSender<Event>,
+) {
+    tokio::spawn(async move {
+        while let Some(output) = rx.recv().await {
+            if ev_tx.send(Event::PaneOutput { pane_id, output }).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// Per-client connection: handshake, then split read/write halves.
