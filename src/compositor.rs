@@ -59,6 +59,48 @@ fn blit_pane(buf: &mut [char], cols: u16, rect: Rect, pane: &dyn PaneCells) {
     }
 }
 
+/// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
+/// focused pane). Junctions where dividers cross are simple last-write-wins
+/// overwrites (proper `┼` junctions are deferred polish).
+fn draw_divider(buf: &mut [char], cols: u16, d: &layout::Divider, heavy: bool) {
+    let glyph = match (d.dir, heavy) {
+        (SplitDir::Vertical, false) => '│',
+        (SplitDir::Vertical, true) => '┃',
+        (SplitDir::Horizontal, false) => '─',
+        (SplitDir::Horizontal, true) => '━',
+    };
+    for y in d.rect.y..d.rect.y + d.rect.h {
+        for x in d.rect.x..d.rect.x + d.rect.w {
+            let idx = y as usize * cols as usize + x as usize;
+            if idx < buf.len() {
+                buf[idx] = glyph;
+            }
+        }
+    }
+}
+
+/// True if divider `d` lies on an edge of the `focused` rect (so it should be
+/// drawn heavy). Adjacency = the divider's line is immediately beside the rect
+/// along the split axis AND the perpendicular ranges overlap.
+fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
+    match d.dir {
+        SplitDir::Vertical => {
+            let dx = d.rect.x;
+            let col_adjacent = dx == focused.x + focused.w || dx + 1 == focused.x;
+            let rows_overlap =
+                d.rect.y < focused.y + focused.h && focused.y < d.rect.y + d.rect.h;
+            col_adjacent && rows_overlap
+        }
+        SplitDir::Horizontal => {
+            let dy = d.rect.y;
+            let row_adjacent = dy == focused.y + focused.h || dy + 1 == focused.y;
+            let cols_overlap =
+                d.rect.x < focused.x + focused.w && focused.x < d.rect.x + d.rect.w;
+            row_adjacent && cols_overlap
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +162,41 @@ mod tests {
         assert_eq!(buf[at(2, 1)], 'c');
         assert_eq!(buf[at(2, 2)], 'd');
         assert_eq!(buf[at(0, 0)], ' '); // untouched cell stays blank
+    }
+
+    use crate::layout::Divider;
+
+    #[test]
+    fn draw_divider_fills_with_light_or_heavy_glyph() {
+        let cols: u16 = 5;
+        let mut buf = vec![' '; 5 * 2];
+        // Vertical divider, 1 wide x 2 tall, at x=2.
+        let d = Divider {
+            rect: Rect { x: 2, y: 0, w: 1, h: 2 },
+            path: vec![],
+            dir: SplitDir::Vertical,
+        };
+        let at = |r: usize, c: usize| r * cols as usize + c;
+        draw_divider(&mut buf, cols, &d, false);
+        assert_eq!(buf[at(0, 2)], '│');
+        assert_eq!(buf[at(1, 2)], '│');
+        draw_divider(&mut buf, cols, &d, true);
+        assert_eq!(buf[at(0, 2)], '┃'); // heavy
+    }
+
+    #[test]
+    fn divider_touches_detects_adjacency() {
+        // Two panes side by side in a width-11 area: left x0..=4, divider x5, right x6..=10.
+        let div = Divider {
+            rect: Rect { x: 5, y: 0, w: 1, h: 4 },
+            path: vec![],
+            dir: SplitDir::Vertical,
+        };
+        let left = Rect { x: 0, y: 0, w: 5, h: 4 };
+        let right = Rect { x: 6, y: 0, w: 5, h: 4 };
+        assert!(divider_touches(&div, left)); // divider is on left pane's right edge
+        assert!(divider_touches(&div, right)); // divider is on right pane's left edge
+        let elsewhere = Rect { x: 0, y: 10, w: 5, h: 4 };
+        assert!(!divider_touches(&div, elsewhere)); // no row overlap
     }
 }
