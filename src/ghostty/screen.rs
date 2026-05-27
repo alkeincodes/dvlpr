@@ -1,6 +1,6 @@
-//! Safe wrapper over libghostty-vt: owns one Terminal handle and exposes a
-//! Screen-like API that mirrors the Phase 1 hand-written `screen::Screen`,
-//! so the server (Phase 2c) can swap to it as a drop-in.
+//! Safe wrapper over libghostty-vt: owns one Terminal handle and exposes the
+//! `new`/`feed`/`resize`/`render_ansi` surface the daemon renders panes with,
+//! plus `cursor`/`cell` for tests and `take_pty_writes` for query replies.
 //!
 //! Single-owner and `!Send`/`!Sync` (holds a raw pointer). All `unsafe` FFI is
 //! confined here; the public API is fully safe.
