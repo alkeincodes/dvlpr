@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -32,7 +32,8 @@ pub enum ClientMsg {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// A rendered frame. `full` is always true in this phase.
+    /// A rendered frame. `full` is true for a complete repaint (first paint,
+    /// resize, resync); false for an incremental per-row diff.
     Frame {
         data: Vec<u8>,
         full: bool,
@@ -110,8 +111,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_two() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+    fn protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]
