@@ -135,6 +135,12 @@ impl PaneRuntime {
         }
     }
 
+    /// The pid of the PTY's foreground process group (`tcgetpgrp` on the master),
+    /// or `None` when unavailable. This is what tmux reads for automatic-rename.
+    pub fn foreground_pid(&self) -> Option<i32> {
+        self.master.process_group_leader()
+    }
+
     /// Resize the PTY.
     pub fn resize(&self, cols: u16, rows: u16) {
         // Clamp to at least 1x1: a 0-row/0-col TIOCSWINSZ makes ncurses/vim/less
@@ -192,6 +198,15 @@ mod tests {
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("READY"), "got: {text:?}");
         drop(pane);
+    }
+
+    #[tokio::test]
+    async fn foreground_pid_is_some_for_a_live_pane() {
+        let (pane, _rx) =
+            PaneRuntime::spawn(&["sh".into(), "-c".into(), "sleep 30".into()], ".", 80, 24)
+                .expect("spawn pane");
+        // The PTY has a foreground process group as soon as the child is running.
+        assert!(pane.foreground_pid().is_some());
     }
 
     #[tokio::test]
