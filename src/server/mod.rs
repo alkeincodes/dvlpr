@@ -176,6 +176,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut foreground: Option<ClientId> = None;
     let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
+    let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
 
     let reason: String = loop {
         tokio::select! {
@@ -185,6 +186,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     Event::ClientConnected { id, write_half, cols, rows } => {
                         let (cols, rows) = (cols.max(1), rows.max(1));
                         session.resize(cols, rows);
+                        // Make the very first frame show real process names.
+                        session.refresh_window_names(crate::procinfo::process_name);
                         let grid = Arc::new(session.compose());
                         for st in clients.values() {
                             let _ = st.grid_tx.send(grid.clone());
@@ -309,6 +312,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     dirty = false;
                 }
             }
+            _ = autoname_tick.tick() => {
+                if session.refresh_window_names(crate::procinfo::process_name) {
+                    dirty = true;
+                }
+            }
         }
     };
 
@@ -431,6 +439,9 @@ fn apply_events(
                 if let Some(st) = clients.get_mut(&id) {
                     session.handle_mouse(m, &mut st.drag);
                 }
+                if session.refresh_window_names(crate::procinfo::process_name) {
+                    *dirty = true;
+                }
             }
             InputEvent::Command(cmd) => {
                 let eff = session.apply_command(cmd);
@@ -457,6 +468,9 @@ fn apply_events(
                             }
                         });
                     }
+                }
+                if session.refresh_window_names(crate::procinfo::process_name) {
+                    *dirty = true;
                 }
             }
         }
