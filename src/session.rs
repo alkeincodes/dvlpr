@@ -154,8 +154,8 @@ impl Session {
         }
     }
 
-    /// Render the active window into a full-viewport ANSI frame.
-    pub fn render(&mut self) -> Vec<u8> {
+    /// Compose the active window into a `Grid` (the diff/serialize source).
+    pub fn compose(&self) -> crate::compositor::Grid {
         let viewport = Rect {
             x: 0,
             y: 0,
@@ -169,7 +169,7 @@ impl Session {
             .map(|(id, p)| (*id, &p.screen as &dyn PaneCells))
             .collect();
         let win = &self.windows[self.active_window];
-        self.compositor.render(
+        self.compositor.compose(
             viewport,
             &win.root,
             &names,
@@ -177,6 +177,11 @@ impl Session {
             win.focused,
             &refs,
         )
+    }
+
+    /// Render the active window into a full-viewport ANSI frame.
+    pub fn render(&self) -> Vec<u8> {
+        crate::compositor::serialize_full(&self.compose())
     }
 
     /// Write user input to the focused pane of the active window.
@@ -825,6 +830,16 @@ mod tests {
         for rt in session.shutdown() {
             rt.close();
         }
+    }
+
+    #[tokio::test]
+    async fn compose_returns_grid_matching_viewport_dims() {
+        let (session, _id, _rx) = Session::new(vec!["cat".into()], ".".into(), 30, 8).unwrap();
+        let grid = session.compose();
+        assert_eq!(grid.dims(), (30, 8));
+        assert_eq!(grid.cells.len(), 30 * 8);
+        // render() must still produce a full frame (clear+home prefix).
+        assert!(session.render().starts_with(b"\x1b[2J\x1b[H"));
     }
 
     #[tokio::test]
