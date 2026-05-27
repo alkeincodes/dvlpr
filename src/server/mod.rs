@@ -147,10 +147,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // and publishes the latest Arc<Grid> to each client's watch mailbox. Per-client
     // writer tasks diff against their own baseline and write at their own pace.
     //
-    // PHASE A MULTI-CLIENT POLICY: a single shared grid for all clients; the most
-    // recent connect/resize drives the shared pane size (last-writer-wins). The
-    // single-active-writer model (per-client sizing, foreground/observer, clipping)
-    // is Phase B and intentionally NOT implemented here.
+    // Single-active-writer model: one interaction-driven `foreground` client (most
+    // recently connected/typed) drives the session geometry via `session.resize`; its
+    // size is the composed grid's size. Other clients still receive that same grid here
+    // (per-client clip/letterbox fitting is wired into the writer in a later step).
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut foreground: Option<ClientId> = None;
@@ -413,6 +413,8 @@ fn apply_events(
                     runtime.close();
                 }
                 if eff.detach {
+                    // NB: if this detaches the issuing client, later events in this same
+                    // vector that look up the client (e.g. Mouse) become no-ops — acceptable.
                     // Funnel through remove_client so the foreground is re-promoted if
                     // the detaching client was driving. Then bound the writer flush in a
                     // self-reaping task (the biased writer writes Detach before exiting).
