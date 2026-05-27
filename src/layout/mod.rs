@@ -428,6 +428,14 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Resolve a 0-based x within the tab row to the window index whose `TabRegion`
+/// contains it, or `None` if the click landed in the gap/prefix.
+pub fn tab_hit(tabs: &[TabRegion], x: u16) -> Option<usize> {
+    tabs.iter()
+        .find(|t| x >= t.x_start && x <= t.x_end)
+        .map(|t| t.window)
+}
+
 /// Hit-test a 1-based SGR mouse coordinate against the active window's geometry.
 /// Tab row is checked first, then dividers (a click exactly on a divider means
 /// "resize"), then panes. Returns `Hit::None` for clicks outside everything.
@@ -448,12 +456,10 @@ pub fn hit_test(
 
     if let Some(ty) = tab_row(viewport, window_count) {
         if y == ty {
-            for t in tabs {
-                if x >= t.x_start && x <= t.x_end {
-                    return Hit::Tab(t.window);
-                }
-            }
-            return Hit::None;
+            return match tab_hit(tabs, x) {
+                Some(w) => Hit::Tab(w),
+                None => Hit::None,
+            };
         }
     }
 

@@ -147,6 +147,7 @@ impl Session {
         let content = layout::content_area(self.viewport(), self.windows.len());
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
+            // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
             if wi == self.active_window && win.zoomed {
                 targets.push((win.focused, content));
             } else {
@@ -527,12 +528,10 @@ impl Session {
             let (x, y) = (col - 1, row - 1);
             if let Some(ty) = layout::tab_row(self.viewport(), self.windows.len()) {
                 if y == ty {
-                    for t in &tabs {
-                        if x >= t.x_start && x <= t.x_end {
-                            return layout::Hit::Tab(t.window);
-                        }
-                    }
-                    return layout::Hit::None;
+                    return match layout::tab_hit(&tabs, x) {
+                        Some(w) => layout::Hit::Tab(w),
+                        None => layout::Hit::None,
+                    };
                 }
             }
             let content = layout::content_area(self.viewport(), self.windows.len());
@@ -554,6 +553,23 @@ impl Session {
     #[cfg(test)]
     pub fn hit_for_test(&self, col: u16, row: u16) -> layout::Hit {
         self.hit(col, row)
+    }
+
+    #[cfg(test)]
+    pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
+        let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
+        let zoomed = self
+            .windows
+            .get(self.active_window)
+            .map(|w| w.zoomed)
+            .unwrap_or(false);
+        layout::tab_layout(
+            &self.session_name,
+            &names,
+            self.active_window,
+            zoomed,
+            self.cols,
+        )
     }
 
     /// Refresh every window's name from its focused pane's foreground process.
@@ -1022,7 +1038,7 @@ mod tests {
         session.apply_command(Command::ToggleZoom);
         assert_eq!(session.active_pane_rects().len(), 1);
         session.apply_command(Command::NewWindow); // creates + switches to window 2
-        session.apply_command(Command::SelectWindow(1)); // back to window 1
+        session.apply_command(Command::SelectWindow(1)); // SelectWindow is 1-based; (1) -> index 0 (window 1)
                                                          // Window 1 was auto-unzoomed when we switched away.
         assert!(session.active_pane_rects().len() >= 2);
     }
@@ -1037,6 +1053,33 @@ mod tests {
         // must resolve to the focused pane, not the hidden sibling or a divider.
         let hit = session.hit_for_test(35, 5);
         assert_eq!(hit, crate::layout::Hit::Pane(session.focused_pane()));
+    }
+
+    #[tokio::test]
+    async fn hit_while_zoomed_still_switches_windows_via_tab_click() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::NewWindow); // 2 windows -> tab bar has tabs
+        session.apply_command(Command::SplitVertical); // window 2 now has 2 panes
+        session.apply_command(Command::ToggleZoom); // zoom window 2
+                                                    // Find a tab region's x and click it on the tab row (1-based coords).
+        let tabs = session.tab_regions_for_test();
+        assert!(tabs.len() >= 2, "expected at least two tab regions");
+        let target = &tabs[0]; // window index 0's tab
+                               // viewport height 12 -> bar is the last row (0-based y=11), 1-based = 12
+        let tab_row_1based = layout::tab_row(
+            layout::Rect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 12,
+            },
+            session.window_count(),
+        )
+        .map(|y| y + 1)
+        .unwrap_or(12);
+        let hit = session.hit_for_test(target.x_start + 1, tab_row_1based);
+        assert_eq!(hit, crate::layout::Hit::Tab(target.window));
     }
 
     #[tokio::test]
