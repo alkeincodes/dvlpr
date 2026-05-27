@@ -201,8 +201,13 @@ async fn list_sessions() -> std::io::Result<()> {
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, info) in rows {
-        let attached = if info.clients > 0 { "(attached)" } else { "" };
-        println!("{name}   {} window(s)   {attached}", info.windows);
+        // Fold the spacing into the marker so an unattached row has no trailing space.
+        let attached = if info.clients > 0 {
+            "   (attached)"
+        } else {
+            ""
+        };
+        println!("{name}   {} window(s){attached}", info.windows);
     }
     Ok(())
 }
