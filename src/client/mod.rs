@@ -55,6 +55,35 @@ impl Drop for MouseGuard {
     }
 }
 
+/// Switches the terminal to its alternate screen buffer on construction and back to the
+/// primary screen (restoring the user's prior content + scrollback) on drop. This is the
+/// standard mechanism full-screen apps (vim, tmux, less) use to claim the whole screen;
+/// terminals that overlay their own chrome on the primary screen (e.g. Warp's block UI /
+/// input bar) hand the app a dedicated full-screen surface once it enters the alt screen,
+/// so the server-painted frames are no longer clobbered. Writes synchronously to stdout
+/// (teardown must not depend on the async runtime still running). Entered BEFORE the raw
+/// and mouse guards so its restore runs LAST on teardown.
+struct AltScreenGuard;
+
+impl AltScreenGuard {
+    fn enter() -> io::Result<Self> {
+        let mut out = io::stdout();
+        // Enter the alt screen, then clear it so the first server frame paints onto a
+        // blank surface even before it arrives.
+        out.write_all(b"\x1b[?1049h\x1b[2J\x1b[H")?;
+        out.flush()?;
+        Ok(AltScreenGuard)
+    }
+}
+
+impl Drop for AltScreenGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[?1049l");
+        let _ = out.flush();
+    }
+}
+
 /// Attach the current terminal to the daemon at `socket_path`.
 pub async fn attach(socket_path: &Path) -> io::Result<()> {
     let stream = UnixStream::connect(socket_path).await?;
@@ -84,16 +113,14 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
         }
     }
 
-    // Guards restore cooked mode AND disable mouse tracking on every exit path.
+    // Guards restore terminal state on every exit path (including panic/early return).
+    // Declared outermost-first so Drop runs in reverse: mouse off, raw off, then leave
+    // the alt screen LAST — which restores the user's original screen + scrollback, so no
+    // manual clear is needed here.
+    let _alt = AltScreenGuard::enter()?;
     let _raw = RawModeGuard::enable()?;
     let _mouse = MouseGuard::enable()?;
-    let result = run_loop(read_half, write_half).await;
-    if result.is_ok() {
-        let mut out = tokio::io::stdout();
-        let _ = out.write_all(b"\x1b[2J\x1b[H").await;
-        let _ = out.flush().await;
-    }
-    result
+    run_loop(read_half, write_half).await
 }
 
 async fn run_loop(
