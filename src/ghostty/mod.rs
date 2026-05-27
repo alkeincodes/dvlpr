@@ -3,6 +3,8 @@
 //! Phase 2a exposes the raw bindgen-generated symbols only (build plumbing).
 //! A safe wrapper (`GhosttyScreen`) lands in Phase 2b.
 
+pub mod screen;
+
 #[allow(
     non_upper_case_globals,
     non_camel_case_types,
