@@ -14,7 +14,8 @@ use tokio::sync::mpsc;
 use crate::compositor::{Compositor, PaneCells};
 use crate::config::Command;
 use crate::ghostty::screen::GhosttyScreen;
-use crate::layout::{self, Node, PaneId, Rect, SplitDir};
+use crate::input::{MouseEvent, MouseKind};
+use crate::layout::{self, Node, PaneId, Rect, SplitDir, SplitPath};
 use crate::pane::{PaneOutput, PaneRuntime};
 
 struct Pane {
@@ -389,12 +390,117 @@ impl Session {
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
+
+    /// The (pane id, rect) list for the active window's panes (content area).
+    pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
+        let content = layout::content_area(self.viewport(), self.windows.len());
+        match self.windows.get(self.active_window) {
+            Some(win) => layout::pane_rects(&win.root, content),
+            None => Vec::new(),
+        }
+    }
+
+    /// The focused pane id of every window, in order (for tests/inspection).
+    pub fn window_focused_ids(&self) -> Vec<PaneId> {
+        self.windows.iter().map(|w| w.focused).collect()
+    }
+
+    /// Focus a pane by id if it belongs to the active window.
+    fn focus(&mut self, pane_id: PaneId) {
+        if let Some(win) = self.windows.get_mut(self.active_window) {
+            if layout::all_panes(&win.root).contains(&pane_id) {
+                win.focused = pane_id;
+            }
+        }
+    }
+
+    /// Apply a mouse event: press hit-tests (focus pane / switch tab / begin
+    /// divider drag), drag adjusts the dragged divider, release ends the drag.
+    /// `drag` is the issuing client's per-connection drag state, recorded as
+    /// `(window index at press, path)` so a drag is applied to the window it
+    /// started in even if the active window changes mid-drag.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, drag: &mut Option<(usize, SplitPath)>) {
+        match ev.kind {
+            MouseKind::Press => {
+                let hit = self.hit(ev.col, ev.row);
+                match hit {
+                    layout::Hit::Pane(id) => {
+                        self.focus(id);
+                        *drag = None;
+                    }
+                    layout::Hit::Tab(idx) => {
+                        if idx < self.windows.len() {
+                            self.active_window = idx;
+                        }
+                        *drag = None;
+                    }
+                    layout::Hit::Divider(path) => *drag = Some((self.active_window, path)),
+                    layout::Hit::None => *drag = None,
+                }
+            }
+            MouseKind::Drag => {
+                if let Some((wi, path)) = drag.clone() {
+                    self.resize_divider(wi, &path, ev.col, ev.row);
+                }
+            }
+            MouseKind::Release => *drag = None,
+        }
+    }
+
+    /// Hit-test a 1-based pointer against the active window's geometry.
+    fn hit(&self, col: u16, row: u16) -> layout::Hit {
+        let Some(win) = self.windows.get(self.active_window) else {
+            return layout::Hit::None;
+        };
+        let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
+        let tabs = layout::tab_layout(&names, self.active_window, self.cols);
+        layout::hit_test(
+            &win.root,
+            self.viewport(),
+            self.windows.len(),
+            &tabs,
+            col,
+            row,
+        )
+    }
+
+    /// Recompute the dragged split's ratio from the pointer position and relayout.
+    /// Operates on the explicit `window` the drag started in (not necessarily the
+    /// active one). If that window is gone or the path no longer leads to a split,
+    /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
+    fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
+        let content = layout::content_area(self.viewport(), self.windows.len());
+        let Some(win) = self.windows.get_mut(window) else {
+            return;
+        };
+        let Some((area, dir)) = layout::split_area_at(&win.root, content, path) else {
+            return;
+        };
+        // Pointer to 0-based; ratio is the fraction of the available (non-divider)
+        // axis that falls to the first child.
+        let x = col.saturating_sub(1);
+        let y = row.saturating_sub(1);
+        let ratio = match dir {
+            SplitDir::Vertical => {
+                let avail = area.w.saturating_sub(1).max(1) as f32;
+                (x.saturating_sub(area.x) as f32) / avail
+            }
+            SplitDir::Horizontal => {
+                let avail = area.h.saturating_sub(1).max(1) as f32;
+                (y.saturating_sub(area.y) as f32) / avail
+            }
+        };
+        layout::set_ratio(&mut win.root, path, ratio); // clamps to [0.05, 0.95]
+        self.relayout_all();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Command;
+    use crate::input::{MouseEvent, MouseKind};
+    use crate::layout::SplitPath;
     use std::time::Duration;
 
     #[tokio::test]
@@ -621,6 +727,151 @@ mod tests {
             focused,
             "focus must stay put when a non-focused pane closes"
         );
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn click_focuses_the_pane_under_the_pointer() {
+        let (mut session, first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            41,
+            12,
+        )
+        .expect("session");
+        // Vertical split: left = first (focused after split is the NEW right pane).
+        session.apply_command(Command::SplitVertical);
+        let focused_after_split = session.focused_pane();
+        assert_ne!(focused_after_split, first);
+
+        // Click column 1 (left pane = the original `first`). 1-based coords.
+        let mut drag: Option<(usize, SplitPath)> = None;
+        session.handle_mouse(
+            MouseEvent {
+                button: 0,
+                col: 1,
+                row: 1,
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        assert_eq!(
+            session.focused_pane(),
+            first,
+            "clicking the left pane focuses it"
+        );
+        assert!(drag.is_none());
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn drag_on_a_divider_changes_the_split_ratio() {
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            41,
+            12,
+        )
+        .expect("session");
+        session.apply_command(Command::SplitVertical);
+        // The root divider sits at the middle column. Press on it, then drag left.
+        let mut drag: Option<(usize, SplitPath)> = None;
+        // avail = 41 - 1 = 40; ratio 0.5 => first_w 20 => divider at x 20 => col 21.
+        session.handle_mouse(
+            MouseEvent {
+                button: 0,
+                col: 21,
+                row: 3,
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        // Active window is 0, root divider path is empty.
+        assert_eq!(
+            drag,
+            Some((0, vec![])),
+            "press on the root divider records a drag"
+        );
+        // Drag to column 11 (x 10): first pane should shrink to ~10 cells.
+        session.handle_mouse(
+            MouseEvent {
+                button: 0,
+                col: 11,
+                row: 3,
+                kind: MouseKind::Drag,
+            },
+            &mut drag,
+        );
+        let left_w = session.active_pane_rects()[0].1.w;
+        assert!(
+            left_w < 20,
+            "left pane shrank after dragging the divider left (was 20, now {left_w})"
+        );
+        // Release clears the drag.
+        session.handle_mouse(
+            MouseEvent {
+                button: 0,
+                col: 11,
+                row: 3,
+                kind: MouseKind::Release,
+            },
+            &mut drag,
+        );
+        assert!(drag.is_none());
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_exit_adjusts_active_window_for_index_after_before_and_at() {
+        // Build 3 windows (indices 0,1,2). Exercise window collapse for an index
+        // AFTER the active one (no shift), BEFORE it (shift down), and AT it (clamp).
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            12,
+        )
+        .expect("session");
+        session.apply_command(Command::NewWindow); // window 1
+        session.apply_command(Command::NewWindow); // window 2 (active)
+        assert_eq!(session.window_count(), 3);
+        assert_eq!(session.active_window_index(), 2);
+
+        // Collect each window's single pane id: [w0, w1, w2].
+        let ids = session.window_focused_ids();
+        assert_eq!(ids.len(), 3);
+
+        // Make window 1 active so we can remove a window AFTER it.
+        session.apply_command(Command::SelectWindow(2)); // 1-based => index 1
+        assert_eq!(session.active_window_index(), 1);
+
+        // (1) Close window 2's pane (index AFTER active 1): active stays 1.
+        for rt in session.pane_exited(ids[2]) {
+            rt.close();
+        }
+        assert_eq!(session.window_count(), 2);
+        assert_eq!(session.active_window_index(), 1);
+
+        // (2) Close window 0's pane (index BEFORE active 1): active shifts 1 -> 0.
+        for rt in session.pane_exited(ids[0]) {
+            rt.close();
+        }
+        assert_eq!(session.window_count(), 1);
+        assert_eq!(session.active_window_index(), 0);
+
+        // (3) Close the last remaining (AT active): session empties.
+        let active_id = session.focused_pane();
+        for rt in session.pane_exited(active_id) {
+            rt.close();
+        }
+        assert!(session.is_empty());
+
         for rt in session.shutdown() {
             rt.close();
         }
