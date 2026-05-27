@@ -50,9 +50,162 @@ pub enum Side {
 /// Path from the tree root to a `Split` node (empty = the root split itself).
 pub type SplitPath = Vec<Side>;
 
+/// Compute the rect for every leaf pane within `area`, in left-to-right /
+/// top-to-bottom tree order.
+pub fn pane_rects(node: &Node, area: Rect) -> Vec<(PaneId, Rect)> {
+    let mut out = Vec::new();
+    collect_rects(node, area, &mut out);
+    out
+}
+
+fn collect_rects(node: &Node, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
+    match node {
+        Node::Leaf(id) => out.push((*id, area)),
+        Node::Split {
+            dir, ratio, first, second, ..
+        } => {
+            let (a, _divider, b) = split_area(area, *dir, *ratio);
+            collect_rects(first, a, out);
+            collect_rects(second, b, out);
+        }
+    }
+}
+
+/// Split `area` into (first, divider, second). Deterministic rounding: the first
+/// child gets `floor(ratio * available)`, the second gets the remainder, and a
+/// divider sits between them — so the three sum EXACTLY to `area` for ANY size.
+/// The divider takes 1 cell along the split axis only when the area has room for
+/// it (>= 1 cell); for a degenerate 0-sized axis the divider is 0 cells, so the
+/// exact-sum invariant still holds (0 + 0 + 0 == 0) and nothing overflows.
+fn split_area(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect, Rect) {
+    match dir {
+        SplitDir::Horizontal => {
+            let divider_h: u16 = if area.h >= 1 { 1 } else { 0 };
+            let avail = area.h - divider_h;
+            let first_h = ((ratio * avail as f32).floor() as i64).clamp(0, avail as i64) as u16;
+            let second_h = avail - first_h;
+            let first = Rect { x: area.x, y: area.y, w: area.w, h: first_h };
+            let divider = Rect { x: area.x, y: area.y + first_h, w: area.w, h: divider_h };
+            let second = Rect { x: area.x, y: area.y + first_h + divider_h, w: area.w, h: second_h };
+            (first, divider, second)
+        }
+        SplitDir::Vertical => {
+            let divider_w: u16 = if area.w >= 1 { 1 } else { 0 };
+            let avail = area.w - divider_w;
+            let first_w = ((ratio * avail as f32).floor() as i64).clamp(0, avail as i64) as u16;
+            let second_w = avail - first_w;
+            let first = Rect { x: area.x, y: area.y, w: first_w, h: area.h };
+            let divider = Rect { x: area.x + first_w, y: area.y, w: divider_w, h: area.h };
+            let second = Rect { x: area.x + first_w + divider_w, y: area.y, w: second_w, h: area.h };
+            (first, divider, second)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_leaf_fills_the_area() {
+        let tree = Node::Leaf(7);
+        let area = Rect { x: 0, y: 0, w: 80, h: 24 };
+        assert_eq!(pane_rects(&tree, area), vec![(7, area)]);
+    }
+
+    #[test]
+    fn horizontal_split_stacks_top_bottom_with_divider() {
+        // Horizontal split: first pane on top, 1-row divider, second below.
+        let tree = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect { x: 0, y: 0, w: 10, h: 5 };
+        // avail = 5 - 1 = 4; first_h = floor(0.5*4)=2; second_h = 2.
+        let rects = pane_rects(&tree, area);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 10, h: 2 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 3, w: 10, h: 2 })); // y = 0 + 2 + 1 divider
+    }
+
+    #[test]
+    fn vertical_split_places_side_by_side_with_divider() {
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect { x: 0, y: 0, w: 11, h: 4 };
+        // avail = 11 - 1 = 10; first_w = 5; second_w = 5.
+        let rects = pane_rects(&tree, area);
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 5, h: 4 }));
+        assert_eq!(rects[1], (2, Rect { x: 6, y: 0, w: 5, h: 4 })); // x = 0 + 5 + 1 divider
+    }
+
+    #[test]
+    fn nested_split_geometry() {
+        // Vertical split: left is a horizontal split (1 over 2), right is leaf 3.
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        let area = Rect { x: 0, y: 0, w: 21, h: 5 };
+        let rects = pane_rects(&tree, area);
+        // Outer V: avail_w=20, first_w=10 (x 0..10), divider x=10, second x=11 w=10.
+        // Left H: area {0,0,10,5}: avail_h=4, first_h=2, second y=3 h=2.
+        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 10, h: 2 }));
+        assert_eq!(rects[1], (2, Rect { x: 0, y: 3, w: 10, h: 2 }));
+        assert_eq!(rects[2], (3, Rect { x: 11, y: 0, w: 10, h: 5 }));
+    }
+
+    #[test]
+    fn exact_sum_invariant_holds() {
+        // Children + 1-cell divider must sum exactly to the parent on odd sizes.
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.3,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect { x: 4, y: 2, w: 13, h: 7 };
+        let rects = pane_rects(&tree, area);
+        let (_, a) = rects[0];
+        let (_, b) = rects[1];
+        // a.w + 1 (divider) + b.w == area.w, and both start/heights line up.
+        assert_eq!(a.w + 1 + b.w, area.w);
+        assert_eq!(a.x, area.x);
+        assert_eq!(b.x, a.x + a.w + 1);
+        assert_eq!(a.h, area.h);
+        assert_eq!(b.h, area.h);
+    }
+
+    #[test]
+    fn degenerate_zero_axis_does_not_overflow() {
+        // A split whose split-axis dimension is 0 (e.g. content height 0 when a
+        // 1-row viewport reserves its only row for the tab bar) must NOT produce a
+        // 1-cell divider that overflows the parent — the divider degrades to 0.
+        let tree = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let area = Rect { x: 0, y: 0, w: 10, h: 0 };
+        let rects = pane_rects(&tree, area);
+        // Both panes are zero-height; their heights sum to exactly 0 (no overflow).
+        assert_eq!(rects[0].1.h, 0);
+        assert_eq!(rects[1].1.h, 0);
+        assert_eq!(rects[0].1.h + rects[1].1.h, area.h);
+    }
 
     #[test]
     fn rect_contains_checks_bounds() {
