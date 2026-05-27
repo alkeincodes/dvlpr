@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::compositor::{diff_rows, serialize_full, Grid};
+use crate::compositor::{diff_rows, fit, serialize_full, Grid};
 use crate::config::Config;
 use crate::input::{InputEvent, InputParser};
 use crate::layout::{PaneId, SplitPath};
@@ -48,12 +48,14 @@ impl ServerConfig {
 
 type ClientId = u64;
 
-/// Server-initiated control messages to a client's writer task. At most one is
-/// ever sent per client (then the writer exits), so an unbounded channel costs
-/// nothing and keeps `send` synchronous (usable from sync apply/teardown paths).
+/// Server-initiated control messages to a client's writer task. `Resize` is sent
+/// whenever the client's terminal size changes (so the writer re-fits its view and
+/// repaints); `Detach`/`Closed` are terminal (the writer exits after writing them).
+/// The unbounded channel keeps `send` synchronous for the sync resize/teardown paths.
 enum Control {
     Detach,
     Closed(String),
+    Resize(u16, u16),
 }
 
 /// Events funneled into the single central loop.
@@ -171,7 +173,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         }
                         let (grid_tx, grid_rx) = watch::channel(grid.clone());
                         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
-                        let writer = spawn_writer(id, write_half, grid_rx, control_rx, ev_tx.clone());
+                        let writer = spawn_writer(id, cols, rows, write_half, grid_rx, control_rx, ev_tx.clone());
                         clients.insert(
                             id,
                             ClientState {
@@ -220,6 +222,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         let (cols, rows) = (cols.max(1), rows.max(1));
                         if let Some(st) = clients.get_mut(&id) {
                             st.size = (cols, rows);
+                            let _ = st.control.send(Control::Resize(cols, rows));
                         }
                         // Only the foreground client's size drives the session geometry.
                         if foreground == Some(id) {
@@ -454,25 +457,27 @@ fn close_all(clients: &mut HashMap<ClientId, ClientState>, reason: &str) -> Vec<
 /// win over a concurrently-closed watch channel.
 fn spawn_writer(
     id: ClientId,
+    cols: u16,
+    rows: u16,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     mut grid_rx: watch::Receiver<Arc<Grid>>,
     mut control: mpsc::UnboundedReceiver<Control>,
     ev_tx: mpsc::UnboundedSender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last: Arc<Grid> = grid_rx.borrow_and_update().clone();
+        let mut view = (cols.max(1), rows.max(1));
+        let mut last_src: Arc<Grid> = grid_rx.borrow_and_update().clone();
+        let mut last_fitted = fit(last_src.as_ref(), view.0, view.1);
         if write_msg(
             &mut write_half,
             &ServerMsg::Frame {
-                data: serialize_full(last.as_ref()),
+                data: serialize_full(&last_fitted),
                 full: true,
             },
         )
         .await
         .is_err()
         {
-            // Proactive prune: tell the loop this client is gone (the reader may be
-            // stalled). remove_client de-dups against the reader's own ClientGone.
             let _ = ev_tx.send(Event::ClientGone(id));
             return;
         }
@@ -488,18 +493,41 @@ fn spawn_writer(
                         let _ = write_msg(&mut write_half, &ServerMsg::Closed { reason }).await;
                         return;
                     }
+                    Some(Control::Resize(c, r)) => {
+                        // Re-fit the CURRENT source grid to the new view and repaint now,
+                        // without waiting for the next publish (a non-foreground resize
+                        // does not mark the session dirty).
+                        view = (c.max(1), r.max(1));
+                        last_fitted = fit(last_src.as_ref(), view.0, view.1);
+                        if write_msg(
+                            &mut write_half,
+                            &ServerMsg::Frame {
+                                data: serialize_full(&last_fitted),
+                                full: true,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            let _ = ev_tx.send(Event::ClientGone(id));
+                            return;
+                        }
+                    }
                     None => return,
                 },
                 changed = grid_rx.changed() => {
                     if changed.is_err() {
                         return;
                     }
-                    let next: Arc<Grid> = grid_rx.borrow_and_update().clone();
-                    let resized = next.dims() != last.dims();
+                    let next_src: Arc<Grid> = grid_rx.borrow_and_update().clone();
+                    // A source-dims change shifts every client's margins/clip region, so
+                    // force a full frame; otherwise diff the fitted grids.
+                    let resized = next_src.dims() != last_src.dims();
+                    let fitted = fit(next_src.as_ref(), view.0, view.1);
                     let data = if resized {
-                        serialize_full(next.as_ref())
+                        serialize_full(&fitted)
                     } else {
-                        diff_rows(last.as_ref(), next.as_ref())
+                        diff_rows(&last_fitted, &fitted)
                     };
                     if !data.is_empty()
                         && write_msg(&mut write_half, &ServerMsg::Frame { data, full: resized })
@@ -509,7 +537,8 @@ fn spawn_writer(
                         let _ = ev_tx.send(Event::ClientGone(id));
                         return;
                     }
-                    last = next;
+                    last_src = next_src;
+                    last_fitted = fitted;
                 }
             }
         }
