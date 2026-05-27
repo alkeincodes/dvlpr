@@ -79,13 +79,18 @@ impl Session {
             command,
             cwd,
         };
-        // One window => no tab bar => the pane fills the whole viewport.
-        let (id, rx) = session.spawn_pane(Rect {
-            x: 0,
-            y: 0,
-            w: cols,
-            h: rows,
-        })?;
+        // The status bar is always present, so the pane fills the content area
+        // (viewport minus the bar row), not the whole viewport.
+        let content = layout::content_area(
+            Rect {
+                x: 0,
+                y: 0,
+                w: cols,
+                h: rows,
+            },
+            1,
+        );
+        let (id, rx) = session.spawn_pane(content)?;
         session.windows.push(Window {
             name: "0".to_string(),
             root: Node::Leaf(id),

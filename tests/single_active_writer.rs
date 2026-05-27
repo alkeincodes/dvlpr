@@ -159,8 +159,10 @@ async fn bigger_observer_receives_letterboxed_fitted_frame() {
         rows[0].trim().is_empty(),
         "a bigger observer must have a blank letterbox top margin"
     );
+    // The pane PTY height is the content area (viewport rows - 1 for the status bar).
+    // Foreground B is 60x18, so the pane PTY is 60x17: stty size reports "17 60".
     let seen =
-        String::from_utf8_lossy(&f).contains("18 60") || until_text(&mut ra, 5, "18 60").await;
+        String::from_utf8_lossy(&f).contains("17 60") || until_text(&mut ra, 5, "17 60").await;
     assert!(
         seen,
         "a bigger observer must mirror the foreground's content, not paint blank"
@@ -192,8 +194,10 @@ async fn smaller_observer_receives_clipped_fitted_frame() {
         rows.iter().all(|r| r.chars().count() == 40),
         "each row must be the observer's 40 cols"
     );
+    // The pane PTY height is the content area (viewport rows - 1 for the status bar).
+    // Foreground B is 100x30, so the pane PTY is 100x29: stty size reports "29 100".
     let seen =
-        String::from_utf8_lossy(&f).contains("30 100") || until_text(&mut ra, 5, "30 100").await;
+        String::from_utf8_lossy(&f).contains("29 100") || until_text(&mut ra, 5, "29 100").await;
     assert!(
         seen,
         "a clipped observer must mirror the foreground's top-left content, not paint blank"
@@ -208,8 +212,9 @@ async fn observer_resize_repaints_fitted_to_new_view() {
     wait_for_socket(&sock).await;
     let (mut ra, mut wa) = handshake(&sock, 100, 30).await;
     let (_rb, _wb) = handshake(&sock, 60, 18).await;
+    // Pane PTY height = viewport rows - 1 (status bar). B=60x18 → pane is 60x17.
     assert!(
-        until_text(&mut ra, 5, "18 60").await,
+        until_text(&mut ra, 5, "17 60").await,
         "B is foreground; A is an observer"
     );
 
@@ -235,8 +240,9 @@ async fn first_client_drives_session_geometry() {
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, _w) = handshake(&sock, 100, 30).await;
+    // Pane PTY height = viewport rows - 1 (status bar). Client is 100x30 → pane is 100x29.
     assert!(
-        until_text(&mut r, 5, "30 100").await,
+        until_text(&mut r, 5, "29 100").await,
         "session geometry should track the (only) client's size"
     );
 }
@@ -248,11 +254,13 @@ async fn smaller_client_connecting_shrinks_geometry() {
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
-    assert!(until_text(&mut ra, 5, "30 100").await, "A drives 100x30");
+    // Pane PTY height = viewport rows - 1 (status bar). 100x30 → pane is 100x29.
+    assert!(until_text(&mut ra, 5, "29 100").await, "A drives 100x30");
 
     let (_rb, _wb) = handshake(&sock, 60, 18).await;
+    // B=60x18 → pane is 60x17.
     assert!(
-        until_text(&mut ra, 5, "18 60").await,
+        until_text(&mut ra, 5, "17 60").await,
         "a newly-connected smaller client becomes foreground and shrinks geometry"
     );
 }
@@ -265,15 +273,17 @@ async fn foreground_disconnect_promotes_survivor() {
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
     let (rb, wb) = handshake(&sock, 60, 18).await;
+    // B=60x18 → pane is 60x17.
     assert!(
-        until_text(&mut ra, 5, "18 60").await,
+        until_text(&mut ra, 5, "17 60").await,
         "B (60x18) is foreground"
     );
 
     drop(rb);
     drop(wb);
+    // A=100x30 → pane is 100x29.
     assert!(
-        until_text(&mut ra, 5, "30 100").await,
+        until_text(&mut ra, 5, "29 100").await,
         "foreground disconnect must promote the surviving client and resize to its size"
     );
 }
@@ -286,16 +296,18 @@ async fn foreground_detach_repromotes_survivor() {
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
     let (_rb, mut wb) = handshake(&sock, 60, 18).await;
+    // B=60x18 → pane is 60x17.
     assert!(
-        until_text(&mut ra, 5, "18 60").await,
+        until_text(&mut ra, 5, "17 60").await,
         "B (60x18) is foreground"
     );
 
     write_msg(&mut wb, &ClientMsg::Input(b"\x01d".to_vec()))
         .await
         .unwrap();
+    // A=100x30 → pane is 100x29.
     assert!(
-        until_text(&mut ra, 5, "30 100").await,
+        until_text(&mut ra, 5, "29 100").await,
         "foreground Detach must re-promote the survivor (geometry must not go stale)"
     );
 }
@@ -308,16 +320,18 @@ async fn esc_timeout_input_promotes_sender() {
     wait_for_socket(&sock).await;
     let (mut ra, mut wa) = handshake(&sock, 100, 30).await;
     let (_rb, _wb) = handshake(&sock, 60, 18).await;
+    // B=60x18 → pane is 60x17.
     assert!(
-        until_text(&mut ra, 5, "18 60").await,
+        until_text(&mut ra, 5, "17 60").await,
         "B (60x18) is foreground"
     );
 
     write_msg(&mut wa, &ClientMsg::Input(b"\x1b".to_vec()))
         .await
         .unwrap();
+    // A=100x30 → pane is 100x29.
     assert!(
-        until_text(&mut ra, 5, "30 100").await,
+        until_text(&mut ra, 5, "29 100").await,
         "an ESC committed on the tick-time timeout must promote its sender to foreground"
     );
 }
@@ -329,15 +343,18 @@ async fn dropping_a_client_keeps_the_session_responsive() {
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
-    assert!(until_text(&mut ra, 5, "30 100").await, "A drives 100x30");
+    // Pane PTY height = viewport rows - 1 (status bar). 100x30 → pane is 100x29.
+    assert!(until_text(&mut ra, 5, "29 100").await, "A drives 100x30");
 
     let (rb, wb) = handshake(&sock, 60, 18).await;
-    assert!(until_text(&mut ra, 5, "18 60").await, "B is foreground");
+    // B=60x18 → pane is 60x17.
+    assert!(until_text(&mut ra, 5, "17 60").await, "B is foreground");
     drop(rb);
     drop(wb);
 
+    // A=100x30 → pane is 100x29.
     assert!(
-        until_text(&mut ra, 5, "30 100").await,
+        until_text(&mut ra, 5, "29 100").await,
         "after a client drops, the surviving client keeps receiving frames"
     );
 }

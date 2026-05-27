@@ -82,17 +82,18 @@ pub enum Hit {
     None,
 }
 
-/// The y of the 1-row tab bar (bottom of the viewport), or `None` when there is
-/// only one window (single-window sessions use the full viewport — no tab bar).
-pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
-    if window_count > 1 && viewport.h > 0 {
+/// The y of the 1-row status/tab bar (bottom of the viewport), or `None` only
+/// when the viewport has no rows. The bar is always present (single-window too),
+/// so `window_count` no longer affects visibility.
+pub fn tab_row(viewport: Rect, _window_count: usize) -> Option<u16> {
+    if viewport.h > 0 {
         Some(viewport.y + viewport.h - 1)
     } else {
         None
     }
 }
 
-/// The content rect (viewport minus the tab-bar row when there is more than one window).
+/// The content rect (viewport minus the always-present bar row).
 pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
     if tab_row(viewport, window_count).is_some() {
         Rect {
@@ -479,7 +480,7 @@ mod tests {
             w: 11,
             h: 4,
         };
-        // Single window => no tab row, content = full viewport.
+        // Single window => bar at y=3, content area is h=3.
         // Left pane is x 0..=4 (w 5); divider at x 5; right pane x 6..=10.
         // SGR coords are 1-based: col 1 => x 0 (left pane).
         assert_eq!(hit_test(&tree, vp, 1, &[], 1, 1), Hit::Pane(1));
@@ -766,12 +767,33 @@ mod tests {
     }
 
     #[test]
-    fn single_window_has_no_tab_row_and_full_content() {
+    fn single_window_still_reserves_bottom_row_for_the_bar() {
         let vp = Rect {
             x: 0,
             y: 0,
             w: 80,
             h: 24,
+        };
+        // The status bar is always present now, even with one window.
+        assert_eq!(tab_row(vp, 1), Some(23));
+        assert_eq!(
+            content_area(vp, 1),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 23,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_height_viewport_has_no_bar() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 0,
         };
         assert_eq!(tab_row(vp, 1), None);
         assert_eq!(content_area(vp, 1), vp);

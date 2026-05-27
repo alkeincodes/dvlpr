@@ -474,7 +474,9 @@ mod tests {
 
     #[test]
     fn render_single_pane_matches_full_frame_format() {
-        // One window, one pane filling a 3x2 viewport. No tab bar, no dividers.
+        // One window, one pane in a 3x2 viewport. The bottom row is the always-on
+        // status bar, so the content area is 3x1. Row 0 gets "ab ", row 1 gets
+        // the bar label "[0*w0]" truncated to 3 cols → "[0*".
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(3, 2, &["ab", "cd"], (1, 0));
         let c = Compositor::new();
@@ -486,14 +488,16 @@ mod tests {
         };
         let out = c.render(vp, &tree, &["w0".to_string()], 0, 1, &[(1, &pane)]);
         let s = String::from_utf8(out).unwrap();
-        // Clear+home prefix, the two rows joined by CRLF, then the cursor at the
-        // focused pane's cursor (1,0) -> global (1,0) -> CUP "\x1b[1;2H".
-        assert_eq!(s, "\x1b[2J\x1b[Hab \r\ncd \x1b[1;2H");
+        // Content area is h=1; pane row 0 ("ab ") fills it.
+        // Bar row (y=1) shows "[0*w0]" clipped to 3 cols → "[0*".
+        // Cursor: pane rect {x:0,y:0,w:3,h:1}, pane cursor (1,0) -> global (1,0) -> "\x1b[1;2H".
+        assert_eq!(s, "\x1b[2J\x1b[Hab \r\n[0*\x1b[1;2H");
     }
 
     #[test]
     fn render_two_panes_shows_divider_between_them() {
         // Vertical split of a width-7 viewport: left pane (1), right pane (2).
+        // h=2: content area is h=1 (bar always occupies the bottom row).
         let tree = Node::Split {
             dir: SplitDir::Vertical,
             ratio: 0.5,
@@ -507,7 +511,7 @@ mod tests {
             x: 0,
             y: 0,
             w: 7,
-            h: 1,
+            h: 2,
         };
         // window 1 focused -> divider on its right edge is heavy.
         let out = c.render(
@@ -519,12 +523,12 @@ mod tests {
             &[(1, &left), (2, &right)],
         );
         let s = String::from_utf8(out).unwrap();
-        // avail=6, first_w=3 (x0..2), divider x3, right x4..6.
+        // content h=1: avail=6, first_w=3 (x0..2), divider x3, right x4..6.
         assert!(s.contains("LLL┃RRR")); // heavy divider because pane 1 is focused
     }
 
     #[test]
-    fn render_includes_tab_bar_only_when_multiple_windows() {
+    fn render_includes_tab_bar_for_both_single_and_multiple_windows() {
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(20, 1, &["hello"], (0, 0));
         let c = Compositor::new();
@@ -541,10 +545,10 @@ mod tests {
         assert!(s.contains("[0:one]"));
         assert!(s.contains("[1*two]")); // active window 1 marked with '*'
 
-        // With a single window, no tab bar is drawn (no labels in the frame).
+        // With a single window, the status bar is still drawn (always-on).
         let single = c.render(vp, &tree, &["one".to_string()], 0, 1, &[(1, &pane)]);
         let s2 = String::from_utf8(single).unwrap();
-        assert!(!s2.contains("[0:one]") && !s2.contains("[0*one]"));
+        assert!(s2.contains("[0*one]"));
     }
 
     #[test]
@@ -600,6 +604,7 @@ mod tests {
     #[test]
     fn render_places_cursor_at_focused_pane_in_global_coords() {
         // Two stacked panes; focus the bottom one; its cursor maps to global rows.
+        // h=4: content area is h=3 (bar always occupies bottom row).
         let tree = Node::Split {
             dir: SplitDir::Horizontal,
             ratio: 0.5,
@@ -613,9 +618,9 @@ mod tests {
             x: 0,
             y: 0,
             w: 4,
-            h: 3,
+            h: 4,
         };
-        // h=3: avail=2, first_h=1 (y0), divider y1, second y2. Focus pane 2 (bottom).
+        // content h=3: avail=2, first_h=1 (y0), divider y1, second y2. Focus pane 2 (bottom).
         let out = c.render(
             vp,
             &tree,
