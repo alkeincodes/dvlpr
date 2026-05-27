@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -17,7 +17,8 @@ use crate::input::{InputEvent, InputParser};
 use crate::layout::{PaneId, SplitPath};
 use crate::pane::PaneOutput;
 use crate::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, StatusInfo,
+    PROTOCOL_VERSION,
 };
 use crate::session::Session;
 
@@ -80,6 +81,10 @@ enum Event {
         pane_id: PaneId,
         output: PaneOutput,
     },
+    /// A management client asked for session status (answered without attaching).
+    StatusRequest(oneshot::Sender<StatusInfo>),
+    /// A management client (or `kill`) asked the daemon to shut down.
+    Shutdown,
 }
 
 /// Per-connected-client central-loop state. The writer task (spawned by the
@@ -249,6 +254,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             dirty = true;
                         }
                     },
+                    Event::StatusRequest(reply) => {
+                        let _ = reply.send(StatusInfo {
+                            windows: session.window_count() as u32,
+                            clients: clients.len() as u32,
+                        });
+                    }
+                    Event::Shutdown => break "killed".to_string(),
                 }
             }
             _ = tick.tick() => {
@@ -567,70 +579,91 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
     tokio::spawn(async move {
         let (mut read_half, mut write_half) = stream.into_split();
 
-        // Handshake.
+        // Handshake: read the intent-carrying hello.
         let hello: ClientHello = match read_msg(&mut read_half).await {
             Ok(Some(h)) => h,
             Ok(None) => return, // clean disconnect before handshake
             Err(e) => {
+                // A pre-v4 client's hello will not even decode into the new shape; close.
                 tracing::warn!(error = %e, "client handshake read failed");
                 return;
             }
         };
+
+        // Version guard. For Attach we reply Reject (a decodable v4 hello with the wrong
+        // version); for management intents we just close without acting.
         if hello.protocol_version != PROTOCOL_VERSION {
             tracing::warn!(
                 client = hello.protocol_version,
                 server = PROTOCOL_VERSION,
                 "rejecting client: protocol mismatch"
             );
-            let _ = write_msg(
-                &mut write_half,
-                &ServerHello::Reject {
-                    reason: format!(
-                        "protocol mismatch: server {PROTOCOL_VERSION}, client {}",
-                        hello.protocol_version
-                    ),
-                },
-            )
-            .await;
-            return;
-        }
-        if write_msg(
-            &mut write_half,
-            &ServerHello::Ok {
-                protocol_version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .is_err()
-        {
+            if matches!(hello.intent, Intent::Attach { .. }) {
+                let _ = write_msg(
+                    &mut write_half,
+                    &ServerHello::Reject {
+                        reason: format!(
+                            "protocol mismatch: server {PROTOCOL_VERSION}, client {}",
+                            hello.protocol_version
+                        ),
+                    },
+                )
+                .await;
+            }
             return;
         }
 
-        // Hand the write half to the central loop, which spawns the writer task.
-        if ev_tx
-            .send(Event::ClientConnected {
-                id,
-                write_half,
-                cols: hello.cols,
-                rows: hello.rows,
-            })
-            .is_err()
-        {
-            return;
-        }
-
-        // Reader half: forward client messages into the event loop.
-        loop {
-            match read_msg::<_, ClientMsg>(&mut read_half).await {
-                Ok(Some(ClientMsg::Input(bytes))) => {
-                    let _ = ev_tx.send(Event::ClientInput { id, bytes });
+        match hello.intent {
+            Intent::Status => {
+                let (tx, rx) = oneshot::channel();
+                if ev_tx.send(Event::StatusRequest(tx)).is_err() {
+                    return;
                 }
-                Ok(Some(ClientMsg::Resize { cols, rows })) => {
-                    let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
+                if let Ok(info) = rx.await {
+                    let _ = write_msg(&mut write_half, &info).await;
                 }
-                Ok(None) | Err(_) => break,
+            }
+            Intent::Kill => {
+                let _ = ev_tx.send(Event::Shutdown);
+            }
+            Intent::Attach { cols, rows } => {
+                if write_msg(
+                    &mut write_half,
+                    &ServerHello::Ok {
+                        protocol_version: PROTOCOL_VERSION,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                // Hand the write half to the central loop, which spawns the writer task.
+                if ev_tx
+                    .send(Event::ClientConnected {
+                        id,
+                        write_half,
+                        cols,
+                        rows,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // Reader half: forward client messages into the event loop.
+                loop {
+                    match read_msg::<_, ClientMsg>(&mut read_half).await {
+                        Ok(Some(ClientMsg::Input(bytes))) => {
+                            let _ = ev_tx.send(Event::ClientInput { id, bytes });
+                        }
+                        Ok(Some(ClientMsg::Resize { cols, rows })) => {
+                            let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                let _ = ev_tx.send(Event::ClientGone(id));
             }
         }
-        let _ = ev_tx.send(Event::ClientGone(id));
     });
 }

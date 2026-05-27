@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use dvlpr::protocol::{read_msg, write_msg, ClientHello, ServerHello, ServerMsg, PROTOCOL_VERSION};
+use dvlpr::protocol::{
+    read_msg, write_msg, ClientHello, Intent, ServerHello, ServerMsg, PROTOCOL_VERSION,
+};
 use dvlpr::server::{run, ServerConfig};
 
 #[tokio::test]
@@ -37,8 +39,7 @@ async fn client_handshakes_and_receives_a_frame_with_command_output() {
         &mut w,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            cols: 40,
-            rows: 10,
+            intent: Intent::Attach { cols: 40, rows: 10 },
         },
     )
     .await

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use dvlpr::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
 use dvlpr::server::{run, ServerConfig};
 
@@ -43,8 +43,7 @@ async fn handshake(path: &std::path::Path, cols: u16, rows: u16) -> (Reader, Wri
         &mut w,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            cols,
-            rows,
+            intent: Intent::Attach { cols, rows },
         },
     )
     .await

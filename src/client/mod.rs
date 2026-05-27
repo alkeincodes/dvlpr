@@ -12,7 +12,7 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
 
 /// Enables raw mode on construction, restores cooked mode on drop (including on a
@@ -94,8 +94,7 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
         &mut write_half,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            cols,
-            rows,
+            intent: Intent::Attach { cols, rows },
         },
     )
     .await?;

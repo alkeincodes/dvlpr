@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -14,8 +14,25 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientHello {
     pub protocol_version: u32,
-    pub cols: u16,
-    pub rows: u16,
+    pub intent: Intent,
+}
+
+/// What a freshly-connected client wants from the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Intent {
+    /// Interactive attach (the normal flow); carries the client's terminal size.
+    Attach { cols: u16, rows: u16 },
+    /// One-shot query: the server replies with `StatusInfo` and closes. No attach.
+    Status,
+    /// Ask the daemon to shut down. The server tears down and exits.
+    Kill,
+}
+
+/// Reply to an `Intent::Status` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusInfo {
+    pub windows: u32,
+    pub clients: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,8 +128,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn protocol_version_is_four() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn client_hello_round_trips_through_bincode() {
+        let msg = ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Attach {
+                cols: 100,
+                rows: 30,
+            },
+        };
+        let bytes = encode(&msg).unwrap();
+        let back: ClientHello = decode(&bytes).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn status_info_round_trips_through_bincode() {
+        let msg = StatusInfo {
+            windows: 3,
+            clients: 1,
+        };
+        let bytes = encode(&msg).unwrap();
+        let back: StatusInfo = decode(&bytes).unwrap();
+        assert_eq!(msg, back);
     }
 
     #[test]
