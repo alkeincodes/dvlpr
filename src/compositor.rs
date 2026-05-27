@@ -97,7 +97,7 @@ impl Compositor {
             draw_divider(&mut buf, cols, &d, heavy);
         }
 
-        // Tab bar (only when >1 window).
+        // Status/tab bar (always present when the viewport has rows).
         if let Some(ty) = layout::tab_row(viewport, window_count) {
             let regions = layout::tab_layout(tab_names, active_window, cols);
             draw_tabs(&mut buf, cols, ty, &regions);

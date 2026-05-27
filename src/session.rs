@@ -532,7 +532,7 @@ mod tests {
             }
         }
         assert!(found, "expected a rendered frame containing READY");
-        // One window => no tab bar => same full-frame shape as before.
+        // The status bar is always present; the frame still starts with clear+home.
         assert!(session.render().starts_with(b"\x1b[2J\x1b[H"));
         // Tear the pane down off-loop rather than dropping a live runtime inline.
         // The test module can see Session's private fields, so this works without
