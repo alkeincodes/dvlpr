@@ -65,11 +65,14 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
     // Guard restores cooked mode on every exit path, including a panic in run_loop.
     let _raw = RawModeGuard::enable()?;
     let result = run_loop(read_half, write_half).await;
-    // Restore a sane screen on the normal way out (cosmetic; raw mode itself is
-    // restored by `_raw`'s Drop regardless).
-    let mut out = tokio::io::stdout();
-    let _ = out.write_all(b"\x1b[2J\x1b[H").await;
-    let _ = out.flush().await;
+    // On a clean exit, clear the screen so the user gets a tidy terminal back
+    // (cosmetic; raw mode itself is restored by `_raw`'s Drop on every path). Skip
+    // it on error so we don't wipe the screen right before main prints the error.
+    if result.is_ok() {
+        let mut out = tokio::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[H").await;
+        let _ = out.flush().await;
+    }
     result
 }
 

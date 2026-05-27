@@ -30,6 +30,10 @@ pub struct Screen {
     state: ParseState,
     params: Vec<u16>,
     cur_param: Option<u16>,
+    /// Set when the current CSI sequence carries a private/intermediate marker
+    /// (e.g. `?` in `ESC[?25l`); such sequences are not ones this minimal model
+    /// acts on, so the final byte must NOT be dispatched.
+    csi_ignore: bool,
 }
 
 impl Screen {
@@ -45,6 +49,7 @@ impl Screen {
             state: ParseState::Ground,
             params: Vec::new(),
             cur_param: None,
+            csi_ignore: false,
         }
     }
 
@@ -135,6 +140,7 @@ impl Screen {
         if b == b'[' {
             self.params.clear();
             self.cur_param = None;
+            self.csi_ignore = false;
             self.state = ParseState::Csi;
         } else {
             self.state = ParseState::Ground;
@@ -154,16 +160,21 @@ impl Screen {
             0x20..=0x2f | 0x3a | 0x3c..=0x3f => {
                 // Intermediate bytes (0x20-0x2f) and private/parameter markers
                 // (`:` `<` `=` `>` `?`): consume and stay in the CSI sequence so the
-                // final byte still terminates it. We don't act on these, but we must
-                // NOT abort here — aborting would leak the remaining params + final
-                // byte into the ground state and print them as text (e.g. `\x1b[?25l`
-                // would print "25l").
+                // final byte still terminates it (NOT abort — aborting would leak the
+                // remaining params + final byte into ground state and print them as
+                // text, e.g. `\x1b[?25l` would print "25l"). Mark the sequence to be
+                // ignored: this minimal model does not act on private/intermediate
+                // sequences, so the final byte must not be dispatched (e.g. `\x1b[?2J`
+                // must NOT erase the screen the way bare `\x1b[2J` does).
+                self.csi_ignore = true;
             }
             0x40..=0x7e => {
                 if let Some(v) = self.cur_param.take() {
                     self.params.push(v);
                 }
-                self.dispatch_csi(b);
+                if !self.csi_ignore {
+                    self.dispatch_csi(b);
+                }
                 self.state = ParseState::Ground;
             }
             _ => {
@@ -423,6 +434,23 @@ mod tests {
         assert_eq!(s.cell(0, 0).ch, 'X');
         assert_eq!(s.cell(1, 0).ch, ' ');
         assert_eq!(s.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn private_marker_sequence_is_not_dispatched() {
+        // `\x1b[?2J` is a DEC private sequence; it must NOT erase the screen the
+        // way bare `\x1b[2J` does (the private marker means "ignore, don't act").
+        let mut s = Screen::new(5, 2);
+        s.feed(b"abcde");
+        s.feed(b"\x1b[?2J"); // private erase-display: must be a no-op here
+        assert_eq!(
+            row_text(&s, 0),
+            "abcde",
+            "private ?2J must not clear the screen"
+        );
+        // Bare (non-private) erase still works.
+        s.feed(b"\x1b[2J");
+        assert_eq!(row_text(&s, 0), "     ");
     }
 
     #[test]
