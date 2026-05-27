@@ -69,6 +69,7 @@ enum Event {
         bytes: Vec<u8>,
     },
     ClientResize {
+        id: ClientId,
         cols: u16,
         rows: u16,
     },
@@ -91,6 +92,10 @@ struct ClientState {
     /// The divider being dragged, as `(window index at press, path)`.
     drag: Option<(usize, SplitPath)>,
     escape_deadline: Option<Instant>,
+    /// Monotonic activity stamp; the client with the highest stamp is the foreground.
+    last_activity: u64,
+    /// This client's last-known terminal size (cols, rows), clamped to >= 1 per axis.
+    size: (u16, u16),
 }
 
 /// Classic ESCDELAY: how long a lone trailing ESC waits for a continuation byte
@@ -148,6 +153,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // is Phase B and intentionally NOT implemented here.
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
+    let mut foreground: Option<ClientId> = None;
+    let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
 
     let reason: String = loop {
@@ -156,18 +163,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 let Some(event) = maybe_event else { break "server stopped".to_string() };
                 match event {
                     Event::ClientConnected { id, write_half, cols, rows } => {
+                        let (cols, rows) = (cols.max(1), rows.max(1));
                         session.resize(cols, rows);
                         let grid = Arc::new(session.compose());
-                        // A new attach can change the shared size: refresh every
-                        // existing client with the freshly composed grid.
                         for st in clients.values() {
                             let _ = st.grid_tx.send(grid.clone());
                         }
-                        // Seed the newcomer's own mailbox with the same grid, then
-                        // spawn its writer (which emits the first full frame).
                         let (grid_tx, grid_rx) = watch::channel(grid.clone());
                         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
-                        let writer = spawn_writer(write_half, grid_rx, control_rx);
+                        let writer = spawn_writer(id, write_half, grid_rx, control_rx, ev_tx.clone());
                         clients.insert(
                             id,
                             ClientState {
@@ -177,8 +181,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                                 parser: InputParser::new(),
                                 drag: None,
                                 escape_deadline: None,
+                                last_activity: 0,
+                                size: (cols, rows),
                             },
                         );
+                        // The newcomer is the freshest activity: it becomes foreground.
+                        promote(&mut clients, &mut foreground, &mut activity_seq, id);
                         dirty = false;
                     }
                     Event::ClientInput { id, bytes } => {
@@ -200,17 +208,27 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             }
                             None => Vec::new(),
                         };
-                        apply_events(&mut session, &mut clients, &ev_tx, id, events, &mut dirty);
+                        commit_input(
+                            &mut session, &mut clients, &mut foreground, &mut activity_seq,
+                            &ev_tx, &mut dirty, id, events,
+                        );
                         if session.is_empty() {
                             break "pane process exited".to_string();
                         }
                     }
-                    Event::ClientResize { cols, rows } => {
-                        session.resize(cols, rows);
-                        dirty = true;
+                    Event::ClientResize { id, cols, rows } => {
+                        let (cols, rows) = (cols.max(1), rows.max(1));
+                        if let Some(st) = clients.get_mut(&id) {
+                            st.size = (cols, rows);
+                        }
+                        // Only the foreground client's size drives the session geometry.
+                        if foreground == Some(id) {
+                            session.resize(cols, rows);
+                            dirty = true;
+                        }
                     }
                     Event::ClientGone(id) => {
-                        clients.remove(&id);
+                        remove_client(&mut clients, &mut foreground, &mut session, &mut dirty, id);
                     }
                     Event::PaneOutput { pane_id, output } => match output {
                         PaneOutput::Bytes(bytes) => {
@@ -248,12 +266,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         }
                         None => Vec::new(),
                     };
-                    for ev in events {
-                        if let InputEvent::Pane(b) = ev {
-                            session.input(&b);
-                            dirty = true;
-                        }
-                    }
+                    // Same promote-then-route path as live keystrokes, so an ESC committed
+                    // on timeout promotes the sender to foreground before reaching the pane.
+                    commit_input(
+                        &mut session, &mut clients, &mut foreground, &mut activity_seq,
+                        &ev_tx, &mut dirty, id, events,
+                    );
                 }
                 if dirty && !clients.is_empty() {
                     let grid = Arc::new(session.compose());
@@ -285,12 +303,94 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Promote `id` to foreground: bump its activity stamp and point `foreground` at it.
+/// No-op (returns false) if `id` is not a connected client. Returns whether the
+/// foreground id actually changed.
+fn promote(
+    clients: &mut HashMap<ClientId, ClientState>,
+    foreground: &mut Option<ClientId>,
+    activity_seq: &mut u64,
+    id: ClientId,
+) -> bool {
+    let Some(st) = clients.get_mut(&id) else {
+        return false;
+    };
+    *activity_seq += 1;
+    st.last_activity = *activity_seq;
+    let changed = *foreground != Some(id);
+    *foreground = Some(id);
+    changed
+}
+
+/// Pick the remaining client with the highest activity stamp as the new foreground and
+/// resize the session to its size. With no clients left, clears `foreground` and leaves
+/// the geometry as-is (the daemon persists headless until the next connect resizes it).
+fn promote_latest_remaining(
+    clients: &HashMap<ClientId, ClientState>,
+    foreground: &mut Option<ClientId>,
+    session: &mut Session,
+    dirty: &mut bool,
+) {
+    let next = clients
+        .iter()
+        .max_by_key(|(_, st)| st.last_activity)
+        .map(|(id, _)| *id);
+    *foreground = next;
+    if let Some(st) = next.and_then(|id| clients.get(&id)) {
+        session.resize(st.size.0, st.size.1);
+        *dirty = true;
+    }
+}
+
+/// Remove a client from the map. If it was the foreground, re-promote the
+/// most-recently-active survivor (and resize). Returns the removed `ClientState` (so the
+/// caller can flush its writer), or `None` if `id` was already gone.
+fn remove_client(
+    clients: &mut HashMap<ClientId, ClientState>,
+    foreground: &mut Option<ClientId>,
+    session: &mut Session,
+    dirty: &mut bool,
+    id: ClientId,
+) -> Option<ClientState> {
+    let was_foreground = *foreground == Some(id);
+    let removed = clients.remove(&id);
+    if removed.is_some() && was_foreground {
+        *foreground = None;
+        promote_latest_remaining(clients, foreground, session, dirty);
+    }
+    removed
+}
+
+/// Commit decoded input events for client `id`: promote the sender if the parse yielded
+/// any events (interaction), resizing the session when the foreground changes, then route
+/// the events into the session. Used by BOTH `ClientInput` and the tick-time ESC flush.
+#[allow(clippy::too_many_arguments)]
+fn commit_input(
+    session: &mut Session,
+    clients: &mut HashMap<ClientId, ClientState>,
+    foreground: &mut Option<ClientId>,
+    activity_seq: &mut u64,
+    ev_tx: &mpsc::UnboundedSender<Event>,
+    dirty: &mut bool,
+    id: ClientId,
+    events: Vec<InputEvent>,
+) {
+    if !events.is_empty() && promote(clients, foreground, activity_seq, id) {
+        if let Some(st) = clients.get(&id) {
+            session.resize(st.size.0, st.size.1);
+        }
+        *dirty = true;
+    }
+    apply_events(session, clients, foreground, ev_tx, id, events, dirty);
+}
+
 /// Route decoded input events for client `id` into the session, performing command
 /// side effects (attach forwarders for new panes, async-close removed runtimes,
 /// detach the issuing client).
 fn apply_events(
     session: &mut Session,
     clients: &mut HashMap<ClientId, ClientState>,
+    foreground: &mut Option<ClientId>,
     ev_tx: &mpsc::UnboundedSender<Event>,
     id: ClientId,
     events: Vec<InputEvent>,
@@ -313,11 +413,19 @@ fn apply_events(
                     runtime.close();
                 }
                 if eff.detach {
-                    // Send Detach, then drop the entry: the biased writer writes
-                    // Detach before its watch sender closes, then exits. The handle
-                    // is detached (not awaited) — fine for a single mid-run detach.
-                    if let Some(st) = clients.remove(&id) {
+                    // Funnel through remove_client so the foreground is re-promoted if
+                    // the detaching client was driving. Then bound the writer flush in a
+                    // self-reaping task (the biased writer writes Detach before exiting).
+                    if let Some(st) = remove_client(clients, foreground, session, dirty, id) {
                         let _ = st.control.send(Control::Detach);
+                        let mut writer = st.writer;
+                        tokio::spawn(async move {
+                            // Dropping a JoinHandle does NOT cancel the task, so a writer
+                            // wedged in write_msg could outlive the timeout. Abort it.
+                            if timeout(TEARDOWN_TIMEOUT, &mut writer).await.is_err() {
+                                writer.abort();
+                            }
+                        });
                     }
                 }
             }
@@ -343,12 +451,13 @@ fn close_all(clients: &mut HashMap<ClientId, ClientState>, reason: &str) -> Vec<
 /// A biased `select!` polls the control channel first so `Detach`/`Closed` always
 /// win over a concurrently-closed watch channel.
 fn spawn_writer(
+    id: ClientId,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
     mut grid_rx: watch::Receiver<Arc<Grid>>,
     mut control: mpsc::UnboundedReceiver<Control>,
+    ev_tx: mpsc::UnboundedSender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // First frame: a full repaint of the seeded (correctly-sized) grid.
         let mut last: Arc<Grid> = grid_rx.borrow_and_update().clone();
         if write_msg(
             &mut write_half,
@@ -360,6 +469,9 @@ fn spawn_writer(
         .await
         .is_err()
         {
+            // Proactive prune: tell the loop this client is gone (the reader may be
+            // stalled). remove_client de-dups against the reader's own ClientGone.
+            let _ = ev_tx.send(Event::ClientGone(id));
             return;
         }
         loop {
@@ -392,6 +504,7 @@ fn spawn_writer(
                             .await
                             .is_err()
                     {
+                        let _ = ev_tx.send(Event::ClientGone(id));
                         return;
                     }
                     last = next;
@@ -482,7 +595,7 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     let _ = ev_tx.send(Event::ClientInput { id, bytes });
                 }
                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
-                    let _ = ev_tx.send(Event::ClientResize { cols, rows });
+                    let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
                 }
                 Ok(None) | Err(_) => break,
             }
