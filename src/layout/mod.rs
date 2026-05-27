@@ -50,6 +50,25 @@ pub enum Side {
 /// Path from the tree root to a `Split` node (empty = the root split itself).
 pub type SplitPath = Vec<Side>;
 
+/// The y of the 1-row tab bar (bottom of the viewport), or `None` when there is
+/// only one window (single-window sessions use the full viewport — no tab bar).
+pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
+    if window_count > 1 && viewport.h > 0 {
+        Some(viewport.y + viewport.h - 1)
+    } else {
+        None
+    }
+}
+
+/// The content rect (viewport minus the tab-bar row when there is more than one window).
+pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
+    if tab_row(viewport, window_count).is_some() {
+        Rect { h: viewport.h - 1, ..viewport }
+    } else {
+        viewport
+    }
+}
+
 /// Compute the rect for every leaf pane within `area`, in left-to-right /
 /// top-to-bottom tree order.
 pub fn pane_rects(node: &Node, area: Rect) -> Vec<(PaneId, Rect)> {
@@ -105,6 +124,20 @@ fn split_area(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_window_has_no_tab_row_and_full_content() {
+        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        assert_eq!(tab_row(vp, 1), None);
+        assert_eq!(content_area(vp, 1), vp);
+    }
+
+    #[test]
+    fn multi_window_reserves_bottom_row_for_tabs() {
+        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        assert_eq!(tab_row(vp, 3), Some(23)); // bottom row
+        assert_eq!(content_area(vp, 3), Rect { x: 0, y: 0, w: 80, h: 23 });
+    }
 
     #[test]
     fn single_leaf_fills_the_area() {
