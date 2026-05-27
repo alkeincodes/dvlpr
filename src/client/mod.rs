@@ -12,7 +12,8 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, StatusInfo,
+    PROTOCOL_VERSION,
 };
 
 /// Enables raw mode on construction, restores cooked mode on drop (including on a
@@ -120,6 +121,37 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
     let _raw = RawModeGuard::enable()?;
     let _mouse = MouseGuard::enable()?;
     run_loop(read_half, write_half).await
+}
+
+/// Connect to a session socket, ask for its status, return it. Does not attach.
+pub async fn query_status(socket_path: &Path) -> io::Result<StatusInfo> {
+    let stream = UnixStream::connect(socket_path).await?;
+    let (mut read_half, mut write_half) = stream.into_split();
+    write_msg(
+        &mut write_half,
+        &ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Status,
+        },
+    )
+    .await?;
+    read_msg::<_, StatusInfo>(&mut read_half)
+        .await?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no status reply"))
+}
+
+/// Connect to a session socket and ask the daemon to shut down (best-effort).
+pub async fn send_kill(socket_path: &Path) -> io::Result<()> {
+    let stream = UnixStream::connect(socket_path).await?;
+    let (_read_half, mut write_half) = stream.into_split();
+    write_msg(
+        &mut write_half,
+        &ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Kill,
+        },
+    )
+    .await
 }
 
 async fn run_loop(
