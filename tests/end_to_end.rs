@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use dvlpr::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
-};
+use dvlpr::protocol::{read_msg, write_msg, ClientHello, ServerHello, ServerMsg, PROTOCOL_VERSION};
 use dvlpr::server::{run, ServerConfig};
 
 async fn connect_and_handshake(
@@ -72,10 +70,11 @@ async fn pane_survives_detach_and_screen_is_restored_on_reattach() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // First attach: see MARKER, then detach.
-    let (mut r1, mut w1) = connect_and_handshake(&socket_path).await;
+    // First attach: see MARKER, then detach by dropping the connection (the daemon
+    // keeps the pane alive). Server-initiated `Ctrl-a d` detach is covered in
+    // tests/multi_pane.rs.
+    let (mut r1, w1) = connect_and_handshake(&socket_path).await;
     assert!(read_frame_containing(&mut r1, "MARKER", 5).await);
-    write_msg(&mut w1, &ClientMsg::Detach).await.unwrap();
     drop(r1);
     drop(w1);
 

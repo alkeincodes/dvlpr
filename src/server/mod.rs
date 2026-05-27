@@ -262,7 +262,7 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
                     let _ = ev_tx.send(Event::ClientResize { cols, rows });
                 }
-                Ok(Some(ClientMsg::Detach)) | Ok(None) | Err(_) => break,
+                Ok(None) | Err(_) => break,
             }
         }
         let _ = ev_tx.send(Event::ClientGone(id));

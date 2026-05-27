@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -28,16 +28,17 @@ pub enum ServerHello {
 pub enum ClientMsg {
     Input(Vec<u8>),
     Resize { cols: u16, rows: u16 },
-    Detach,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    /// A rendered frame. `full` is always true in Phase 1.
+    /// A rendered frame. `full` is always true in this phase.
     Frame {
         data: Vec<u8>,
         full: bool,
     },
+    /// The server detached this client (server-initiated); the client exits.
+    Detach,
     Closed {
         reason: String,
     },
@@ -109,9 +110,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_one() {
-        // Freeze the version so a wire change is a conscious, reviewed edit.
-        assert_eq!(PROTOCOL_VERSION, 1);
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]

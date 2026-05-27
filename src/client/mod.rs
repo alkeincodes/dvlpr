@@ -1,7 +1,10 @@
-//! Thin client: raw-mode terminal, forward stdin bytes + SIGWINCH resizes,
-//! paint server frames to stdout. Detach with the prefix `Ctrl-b d`.
+//! Thin client: raw-mode terminal with SGR mouse tracking, forward stdin bytes +
+//! SIGWINCH resizes, paint server frames to stdout. Prefix/mouse interpretation
+//! lives entirely on the server now; the client forwards raw bytes and exits when
+//! the server sends `Detach` or `Closed`.
 
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,12 +15,8 @@ use crate::protocol::{
     read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
 
-const PREFIX: u8 = 0x02; // Ctrl-b
-const DETACH_KEY: u8 = b'd';
-
-/// Enables terminal raw mode and restores cooked mode on drop — including on a
-/// panic or early return, which a plain post-await `disable_raw_mode()` call
-/// would skip (leaving the user's shell wedged in raw mode).
+/// Enables raw mode on construction, restores cooked mode on drop (including on a
+/// panic or early return).
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -30,6 +29,29 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Enables SGR mouse tracking (button-event tracking `1002` + SGR coords `1006`)
+/// on construction and disables it on drop, so the user's terminal never stays in
+/// mouse-reporting mode after the client exits. Writes synchronously to stdout
+/// (teardown must not depend on the async runtime still running).
+struct MouseGuard;
+
+impl MouseGuard {
+    fn enable() -> io::Result<Self> {
+        let mut out = io::stdout();
+        out.write_all(b"\x1b[?1002;1006h")?;
+        out.flush()?;
+        Ok(MouseGuard)
+    }
+}
+
+impl Drop for MouseGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[?1002;1006l");
+        let _ = out.flush();
     }
 }
 
@@ -62,12 +84,10 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
         }
     }
 
-    // Guard restores cooked mode on every exit path, including a panic in run_loop.
+    // Guards restore cooked mode AND disable mouse tracking on every exit path.
     let _raw = RawModeGuard::enable()?;
+    let _mouse = MouseGuard::enable()?;
     let result = run_loop(read_half, write_half).await;
-    // On a clean exit, clear the screen so the user gets a tidy terminal back
-    // (cosmetic; raw mode itself is restored by `_raw`'s Drop on every path). Skip
-    // it on error so we don't wipe the screen right before main prints the error.
     if result.is_ok() {
         let mut out = tokio::io::stdout();
         let _ = out.write_all(b"\x1b[2J\x1b[H").await;
@@ -80,35 +100,35 @@ async fn run_loop(
     read_half: tokio::net::unix::OwnedReadHalf,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
 ) -> io::Result<()> {
-    // Set up the fallible SIGWINCH handler BEFORE spawning the reader task, so an
-    // error here returns via `?` without leaking a running reader task (which would
-    // keep painting frames to stdout after the client has gone).
     let mut winch = signal(SignalKind::window_change())?;
 
-    // Dedicated frame-reader task: read_msg is NOT cancel-safe, so it must never
-    // live inside a select! arm. It owns read_half and paints straight to stdout.
+    // Frame-reader task: paints frames, exits on Detach/Closed/EOF. read_msg is
+    // not cancel-safe so it must own read_half outside any select! arm.
     let mut reader = tokio::spawn(async move {
         let mut read_half = read_half;
         let mut stdout = tokio::io::stdout();
-        while let Ok(Some(ServerMsg::Frame { data, .. })) =
-            read_msg::<_, ServerMsg>(&mut read_half).await
-        {
-            if stdout.write_all(&data).await.is_err() {
-                break;
+        loop {
+            match read_msg::<_, ServerMsg>(&mut read_half).await {
+                Ok(Some(ServerMsg::Frame { data, .. })) => {
+                    if stdout.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush().await;
+                }
+                Ok(Some(ServerMsg::Detach)) | Ok(Some(ServerMsg::Closed { .. })) | Ok(None) => {
+                    break
+                }
+                Err(_) => break,
             }
-            let _ = stdout.flush().await;
         }
     });
 
     let mut stdin = tokio::io::stdin();
     let mut in_buf = [0u8; 4096];
-    let mut prefix_armed = false;
 
     loop {
         tokio::select! {
-            // The server closed (reader task finished): exit.
             _ = &mut reader => break,
-            // Terminal resize. (signal recv is cancel-safe)
             _ = winch.recv() => {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     if write_msg(&mut write_half, &ClientMsg::Resize { cols, rows }).await.is_err() {
@@ -116,25 +136,14 @@ async fn run_loop(
                     }
                 }
             }
-            // Keyboard -> input. (stdin.read is cancel-safe; the handler body below
-            // runs to completion once this arm is selected, so its write_msg awaits
-            // are not interrupted.)
             n = stdin.read(&mut in_buf) => {
                 let n = match n {
                     Ok(n) => n,
-                    Err(e) => {
-                        reader.abort();
-                        return Err(e);
-                    }
+                    Err(e) => { reader.abort(); return Err(e); }
                 };
                 if n == 0 { break; }
-                match forward_input(&in_buf[..n], &mut prefix_armed, &mut write_half).await {
-                    Ok(Some(InputAction::Detach)) => {
-                        let _ = write_msg(&mut write_half, &ClientMsg::Detach).await;
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
+                if write_msg(&mut write_half, &ClientMsg::Input(in_buf[..n].to_vec())).await.is_err() {
+                    break;
                 }
             }
         }
@@ -142,48 +151,4 @@ async fn run_loop(
 
     reader.abort();
     Ok(())
-}
-
-#[derive(PartialEq, Eq)]
-enum InputAction {
-    Detach,
-}
-
-/// Scan input for the `Ctrl-b d` detach sequence; forward everything else.
-async fn forward_input(
-    bytes: &[u8],
-    prefix_armed: &mut bool,
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
-) -> io::Result<Option<InputAction>> {
-    let mut passthrough: Vec<u8> = Vec::with_capacity(bytes.len());
-    for &b in bytes {
-        if *prefix_armed {
-            *prefix_armed = false;
-            if b == DETACH_KEY {
-                if !passthrough.is_empty() {
-                    write_msg(
-                        write_half,
-                        &ClientMsg::Input(std::mem::take(&mut passthrough)),
-                    )
-                    .await?;
-                }
-                return Ok(Some(InputAction::Detach));
-            } else if b == PREFIX {
-                // Ctrl-b Ctrl-b sends a literal Ctrl-b.
-                passthrough.push(PREFIX);
-            } else {
-                // Not a recognized command: send the prefix, then this byte.
-                passthrough.push(PREFIX);
-                passthrough.push(b);
-            }
-        } else if b == PREFIX {
-            *prefix_armed = true;
-        } else {
-            passthrough.push(b);
-        }
-    }
-    if !passthrough.is_empty() {
-        write_msg(write_half, &ClientMsg::Input(passthrough)).await?;
-    }
-    Ok(None)
 }
