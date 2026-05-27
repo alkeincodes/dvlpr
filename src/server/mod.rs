@@ -3,12 +3,14 @@ pub mod socket;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-use crate::layout::PaneId;
+use crate::config::Config;
+use crate::input::{InputEvent, InputParser};
+use crate::layout::{PaneId, SplitPath};
 use crate::pane::PaneOutput;
 use crate::protocol::{
     read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
@@ -20,6 +22,9 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub command: Vec<String>,
     pub cwd: String,
+    /// Keymap to use. `None` => load from `~/.config/dvlpr/config.toml` (production
+    /// default). Tests pass `Some(Config::default())` for deterministic bindings.
+    pub keymap: Option<Config>,
 }
 
 impl ServerConfig {
@@ -32,6 +37,7 @@ impl ServerConfig {
             socket_path,
             command: Vec::new(), // empty => default shell
             cwd: std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+            keymap: None,
         })
     }
 }
@@ -46,7 +52,10 @@ enum Event {
         cols: u16,
         rows: u16,
     },
-    ClientInput(Vec<u8>),
+    ClientInput {
+        id: ClientId,
+        bytes: Vec<u8>,
+    },
     ClientResize {
         cols: u16,
         rows: u16,
@@ -57,6 +66,23 @@ enum Event {
         output: PaneOutput,
     },
 }
+
+/// Per-connected-client run-loop state: where to send frames, the input parser
+/// (prefix + mouse, with cross-chunk escape buffering), the divider being dragged
+/// (if any), and when a pending lone-ESC should be flushed to the focused pane.
+struct ClientState {
+    frames: mpsc::UnboundedSender<ServerMsg>,
+    parser: InputParser,
+    /// The divider being dragged, as `(window index at press, path)`. The window
+    /// is recorded so a drag started in one window is applied to THAT window's
+    /// tree even if input from any client switches the active window mid-drag.
+    drag: Option<(usize, SplitPath)>,
+    escape_deadline: Option<Instant>,
+}
+
+/// Classic ESCDELAY: how long a lone trailing ESC waits for a continuation byte
+/// before being treated as a standalone Escape key.
+const ESCAPE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Run the daemon to completion (until the pane exits).
 pub async fn run(config: ServerConfig) -> io::Result<()> {
@@ -81,6 +107,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         Session::new(config.command.clone(), config.cwd.clone(), 80, 24)?;
     spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
+    let keymap = config.keymap.unwrap_or_else(Config::load);
+
     // Accept connections.
     {
         let ev_tx = ev_tx.clone();
@@ -104,7 +132,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // geometry+input, observers get clipped/letterboxed frames, a second writer needs
     // `--takeover`, and foreground is promoted on disconnect — is Phase 3 work
     // (see "Out of scope"). It is intentionally NOT implemented here.
-    let mut clients: HashMap<ClientId, mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
+    let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
 
@@ -114,17 +142,50 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 let Some(event) = maybe_event else { break };
                 match event {
                     Event::ClientConnected { id, frames, cols, rows } => {
-                        // Last connecting client drives the shared viewport size (Phase 1).
                         session.resize(cols, rows);
-                        // Immediate full repaint for the newcomer.
                         let _ = frames.send(ServerMsg::Frame {
                             data: session.render(),
                             full: true,
                         });
-                        clients.insert(id, frames);
-                        dirty = true; // resized geometry repaints other clients too
+                        clients.insert(
+                            id,
+                            ClientState {
+                                frames,
+                                parser: InputParser::new(),
+                                drag: None,
+                                escape_deadline: None,
+                            },
+                        );
+                        dirty = true;
                     }
-                    Event::ClientInput(bytes) => session.input(&bytes),
+                    Event::ClientInput { id, bytes } => {
+                        let events = match clients.get_mut(&id) {
+                            Some(st) => {
+                                let now = Instant::now();
+                                let mut evs = Vec::new();
+                                // If this client's lone-ESC deadline already passed,
+                                // commit the standalone Escape BEFORE interpreting the
+                                // new bytes — otherwise a continuation that arrives
+                                // after the deadline but before the tick sweep would be
+                                // glued onto a sequence the user has abandoned.
+                                if matches!(st.escape_deadline, Some(dl) if dl <= now) {
+                                    evs.extend(st.parser.flush_escape_timeout());
+                                }
+                                evs.extend(st.parser.feed(&keymap, &bytes));
+                                st.escape_deadline = st
+                                    .parser
+                                    .pending_escape()
+                                    .then(|| Instant::now() + ESCAPE_TIMEOUT);
+                                evs
+                            }
+                            None => Vec::new(),
+                        };
+                        apply_events(&mut session, &mut clients, &ev_tx, id, events, &mut dirty);
+                        if session.is_empty() {
+                            shutdown(&mut clients, "pane process exited");
+                            break;
+                        }
+                    }
                     Event::ClientResize { cols, rows } => {
                         session.resize(cols, rows);
                         dirty = true;
@@ -138,17 +199,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             dirty = true;
                         }
                         PaneOutput::Exited => {
-                            // Tear the exited pane's runtime down off the run loop.
                             for runtime in session.pane_exited(pane_id) {
                                 runtime.close();
                             }
                             if session.is_empty() {
                                 tracing::info!("last pane exited; shutting down server");
-                                for (_, tx) in clients.drain() {
-                                    let _ = tx.send(ServerMsg::Closed {
-                                        reason: "pane process exited".to_string(),
-                                    });
-                                }
+                                shutdown(&mut clients, "pane process exited");
                                 break;
                             }
                             dirty = true;
@@ -157,17 +213,94 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 }
             }
             _ = tick.tick() => {
+                // Flush any client whose lone-ESC timer has elapsed.
+                let now = Instant::now();
+                let expired: Vec<ClientId> = clients
+                    .iter()
+                    .filter_map(|(id, st)| match st.escape_deadline {
+                        Some(dl) if dl <= now => Some(*id),
+                        _ => None,
+                    })
+                    .collect();
+                for id in expired {
+                    let events = match clients.get_mut(&id) {
+                        Some(st) => {
+                            st.escape_deadline = None;
+                            st.parser.flush_escape_timeout()
+                        }
+                        None => Vec::new(),
+                    };
+                    for ev in events {
+                        if let InputEvent::Pane(b) = ev {
+                            session.input(&b);
+                            dirty = true;
+                        }
+                    }
+                }
                 if dirty && !clients.is_empty() {
                     let frame = ServerMsg::Frame { data: session.render(), full: true };
-                    clients.retain(|_, tx| tx.send(frame.clone()).is_ok());
+                    clients.retain(|_, st| st.frames.send(frame.clone()).is_ok());
                     dirty = false;
                 }
             }
         }
     }
 
+    for runtime in session.shutdown() {
+        runtime.close();
+    }
     let _ = std::fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+/// Route decoded input events for client `id` into the session, performing the
+/// command side effects (attach forwarders for new panes, async-close removed
+/// runtimes, detach the issuing client).
+fn apply_events(
+    session: &mut Session,
+    clients: &mut HashMap<ClientId, ClientState>,
+    ev_tx: &mpsc::UnboundedSender<Event>,
+    id: ClientId,
+    events: Vec<InputEvent>,
+    dirty: &mut bool,
+) {
+    for ev in events {
+        match ev {
+            InputEvent::Pane(bytes) => session.input(&bytes),
+            InputEvent::Mouse(m) => {
+                if let Some(st) = clients.get_mut(&id) {
+                    session.handle_mouse(m, &mut st.drag);
+                }
+            }
+            InputEvent::Command(cmd) => {
+                let eff = session.apply_command(cmd);
+                for (pane_id, rx) in eff.spawned {
+                    spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+                }
+                for runtime in eff.closed {
+                    runtime.close();
+                }
+                if eff.detach {
+                    if let Some(st) = clients.remove(&id) {
+                        let _ = st.frames.send(ServerMsg::Detach);
+                    }
+                }
+            }
+        }
+        *dirty = true;
+    }
+}
+
+/// Tell every client the session closed and drop them. The session's panes are
+/// already gone by the time this is called (last pane exited), so there is no
+/// runtime to drain here; `Session::shutdown` is the guardrail for any future
+/// path that ends the loop with live panes.
+fn shutdown(clients: &mut HashMap<ClientId, ClientState>, reason: &str) {
+    for (_, st) in clients.drain() {
+        let _ = st.frames.send(ServerMsg::Closed {
+            reason: reason.to_string(),
+        });
+    }
 }
 
 /// Forward one pane's output into the event loop, tagged with its pane id. Ends
@@ -257,7 +390,7 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
         loop {
             match read_msg::<_, ClientMsg>(&mut read_half).await {
                 Ok(Some(ClientMsg::Input(bytes))) => {
-                    let _ = ev_tx.send(Event::ClientInput(bytes));
+                    let _ = ev_tx.send(Event::ClientInput { id, bytes });
                 }
                 Ok(Some(ClientMsg::Resize { cols, rows })) => {
                     let _ = ev_tx.send(Event::ClientResize { cols, rows });
