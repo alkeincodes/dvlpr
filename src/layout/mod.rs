@@ -191,9 +191,108 @@ pub fn all_panes(node: &Node) -> Vec<PaneId> {
     out
 }
 
+/// Remove `target` from the tree, collapsing its parent split into the surviving
+/// sibling. Returns the new tree, or `None` if `target` was the only pane (the
+/// caller then closes the window). Pane ids are unique, so `target` appears once.
+pub fn close_pane(node: Node, target: PaneId) -> Option<Node> {
+    match node {
+        Node::Leaf(id) => {
+            if id == target {
+                None
+            } else {
+                Some(Node::Leaf(id))
+            }
+        }
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            // If a direct child is the target leaf, collapse to the other child.
+            if matches!(*first, Node::Leaf(id) if id == target) {
+                return Some(*second);
+            }
+            if matches!(*second, Node::Leaf(id) if id == target) {
+                return Some(*first);
+            }
+            // Otherwise recurse; exactly one side contains the target and changes.
+            match (close_pane(*first, target), close_pane(*second, target)) {
+                (Some(f), Some(s)) => Some(Node::Split {
+                    dir,
+                    ratio,
+                    first: Box::new(f),
+                    second: Box::new(s),
+                }),
+                (Some(f), None) => Some(f),
+                (None, Some(s)) => Some(s),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// The leftmost/topmost leaf — used to pick a new focus after a close.
+pub fn first_leaf(node: &Node) -> PaneId {
+    match node {
+        Node::Leaf(id) => *id,
+        Node::Split { first, .. } => first_leaf(first),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_the_only_pane_returns_none() {
+        assert_eq!(close_pane(Node::Leaf(1), 1), None);
+    }
+
+    #[test]
+    fn closing_a_pane_collapses_its_parent_into_the_sibling() {
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        assert_eq!(close_pane(tree, 1), Some(Node::Leaf(2)));
+    }
+
+    #[test]
+    fn closing_a_nested_pane_keeps_the_rest_of_the_tree() {
+        // V( H(1,2), 3 ); close 2  =>  V( 1, 3 )
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        let result = close_pane(tree, 2).unwrap();
+        assert_eq!(all_panes(&result), vec![1, 3]);
+    }
+
+    #[test]
+    fn first_leaf_returns_leftmost_topmost_pane() {
+        let tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(7)),
+                second: Box::new(Node::Leaf(8)),
+            }),
+            second: Box::new(Node::Leaf(9)),
+        };
+        assert_eq!(first_leaf(&tree), 7);
+    }
 
     #[test]
     fn split_replaces_focused_leaf_with_a_split() {
