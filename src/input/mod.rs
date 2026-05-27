@@ -262,7 +262,9 @@ fn resolve_key(config: &Config, key: Key, out: &mut Vec<InputEvent>) {
         return;
     }
     if let Key::Char(b) = key {
-        if (b'1'..=b'9').contains(&b) {
+        if b == b'0' {
+            out.push(InputEvent::Command(crate::config::Command::ToggleZoom));
+        } else if (b'1'..=b'9').contains(&b) {
             out.push(InputEvent::Command(crate::config::Command::SelectWindow(
                 (b - b'0') as usize,
             )));
@@ -341,6 +343,13 @@ mod tests {
             parse_all(&[0x01, b'2']),
             vec![InputEvent::Command(Command::SelectWindow(2))]
         );
+    }
+
+    #[test]
+    fn prefix_then_zero_toggles_zoom() {
+        let mut out = Vec::new();
+        resolve_key(&Config::default(), Key::Char(b'0'), &mut out);
+        assert_eq!(out, vec![InputEvent::Command(Command::ToggleZoom)]);
     }
 
     #[test]

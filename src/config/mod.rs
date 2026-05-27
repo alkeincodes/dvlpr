@@ -18,6 +18,7 @@ pub enum Command {
     NextWindow,
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
+    ToggleZoom,          // C-a 0: fullscreen the focused pane (toggle)
     Detach,
 }
 

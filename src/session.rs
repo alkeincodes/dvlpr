@@ -253,6 +253,7 @@ impl Session {
                     }
                 }
             }
+            Command::ToggleZoom => {} // implemented in the zoom task
             Command::Detach => eff.detach = true,
         }
         eff
