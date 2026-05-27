@@ -101,6 +101,23 @@ fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
     }
 }
 
+/// Draw each tab region's label into row `ty` of the buffer, starting at the
+/// region's `x_start` (the same x-ranges hit-testing uses).
+fn draw_tabs(buf: &mut [char], cols: u16, ty: u16, regions: &[layout::TabRegion]) {
+    for region in regions {
+        for (i, ch) in region.label.chars().enumerate() {
+            let x = region.x_start as usize + i;
+            if x >= cols as usize {
+                break;
+            }
+            let idx = ty as usize * cols as usize + x;
+            if idx < buf.len() {
+                buf[idx] = ch;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +215,18 @@ mod tests {
         assert!(divider_touches(&div, right)); // divider is on right pane's left edge
         let elsewhere = Rect { x: 0, y: 10, w: 5, h: 4 };
         assert!(!divider_touches(&div, elsewhere)); // no row overlap
+    }
+
+    #[test]
+    fn draw_tabs_writes_labels_at_their_ranges() {
+        let cols: u16 = 20;
+        let mut buf = vec![' '; 20 * 2];
+        let regions = layout::tab_layout(&["a".to_string(), "b".to_string()], 0, cols);
+        // Tab row is the last row (y = 1).
+        draw_tabs(&mut buf, cols, 1, &regions);
+        // Row 1 is the tab row: its flat offset is 1*cols == cols.
+        let row: String = (0..cols).map(|x| buf[cols as usize + x as usize]).collect();
+        assert!(row.starts_with("[0*a]")); // active window 0 marked with '*'
+        assert!(row.contains("[1:b]"));
     }
 }
