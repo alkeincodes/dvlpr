@@ -33,44 +33,51 @@ impl PaneCells for crate::ghostty::screen::GhosttyScreen {
     }
 }
 
-/// Composites frames; owns a reusable viewport-sized cell buffer.
-#[derive(Default)]
-pub struct Compositor {
-    buf: Vec<char>,
+/// A composed full-viewport snapshot: the cell grid plus the global cursor
+/// position. Chars only (no color/attributes — matches the current cell model).
+#[derive(Clone)]
+pub struct Grid {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<char>,
+    /// Global cursor position as (col, row), already mapped into viewport space.
+    pub cursor: (u16, u16),
 }
+
+impl Grid {
+    pub fn dims(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+}
+
+/// Composites frames. Stateless — kept as a struct so `Session` can own one.
+#[derive(Default)]
+pub struct Compositor;
 
 impl Compositor {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    /// Composite the active window into one full-viewport ANSI frame.
-    ///
-    /// `tab_names` has one entry per window (so `window_count == tab_names.len()`);
-    /// `focused` is the active window's focused pane; `panes` provides cell access
-    /// for the (visible) panes of the active window.
-    ///
-    /// Contract: `viewport` is the full client viewport rooted at the origin
-    /// (`viewport.x == 0 && viewport.y == 0`); the buffer is sized `w*h` and indexed
-    /// by absolute coords, so a non-zero origin is not supported (the daemon always
-    /// composites the whole viewport at (0,0)).
-    pub fn render(
-        &mut self,
+    /// Composite the active window into a `Grid`. See the old `render` contract:
+    /// `viewport` must be rooted at (0, 0); `tab_names` has one entry per window;
+    /// `focused` is the active window's focused pane.
+    pub fn compose(
+        &self,
         viewport: Rect,
         root: &Node,
         tab_names: &[String],
         active_window: usize,
         focused: PaneId,
         panes: &[(PaneId, &dyn PaneCells)],
-    ) -> Vec<u8> {
+    ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
-            "render expects a viewport rooted at (0, 0)"
+            "compose expects a viewport rooted at (0, 0)"
         );
         let cols = viewport.w;
         let rows = viewport.h;
-        self.buf.clear();
-        self.buf.resize(cols as usize * rows as usize, ' ');
+        let mut buf = vec![' '; cols as usize * rows as usize];
 
         let window_count = tab_names.len();
         let content = layout::content_area(viewport, window_count);
@@ -79,7 +86,7 @@ impl Compositor {
         // Panes.
         for (id, rect) in &rects {
             if let Some(p) = lookup(panes, *id) {
-                blit_pane(&mut self.buf, cols, *rect, p);
+                blit_pane(&mut buf, cols, *rect, p);
             }
         }
 
@@ -87,31 +94,17 @@ impl Compositor {
         let focused_rect = rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r);
         for d in layout::dividers(root, content) {
             let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
-            draw_divider(&mut self.buf, cols, &d, heavy);
+            draw_divider(&mut buf, cols, &d, heavy);
         }
 
         // Tab bar (only when >1 window).
         if let Some(ty) = layout::tab_row(viewport, window_count) {
             let regions = layout::tab_layout(tab_names, active_window, cols);
-            draw_tabs(&mut self.buf, cols, ty, &regions);
-        }
-
-        // Serialize the buffer to the full-frame wire format.
-        let mut out = Vec::with_capacity(self.buf.len() * 2 + rows as usize * 2 + 16);
-        out.extend_from_slice(b"\x1b[2J\x1b[H");
-        let mut tmp = [0u8; 4];
-        for y in 0..rows {
-            if y > 0 {
-                out.extend_from_slice(b"\r\n");
-            }
-            for x in 0..cols {
-                let ch = self.buf[y as usize * cols as usize + x as usize];
-                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
-            }
+            draw_tabs(&mut buf, cols, ty, &regions);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
-        let (gx, gy) = match focused_rect {
+        let cursor = match focused_rect {
             Some(fr) => {
                 let (cx, cy) = lookup(panes, focused).map_or((0, 0), |p| p.cursor());
                 (
@@ -121,9 +114,76 @@ impl Compositor {
             }
             None => (0, 0),
         };
-        out.extend_from_slice(format!("\x1b[{};{}H", gy + 1, gx + 1).as_bytes());
-        out
+
+        Grid {
+            cols,
+            rows,
+            cells: buf,
+            cursor,
+        }
     }
+
+    /// Convenience: a full-frame serialization of `compose`. Used by `Session::render`
+    /// (until Task 2) and the compositor unit tests.
+    pub fn render(
+        &self,
+        viewport: Rect,
+        root: &Node,
+        tab_names: &[String],
+        active_window: usize,
+        focused: PaneId,
+        panes: &[(PaneId, &dyn PaneCells)],
+    ) -> Vec<u8> {
+        serialize_full(&self.compose(viewport, root, tab_names, active_window, focused, panes))
+    }
+}
+
+/// Serialize a full frame: clear+home, every row joined by CRLF, then a cursor CUP.
+/// Identical to the bytes the old `Compositor::render` produced.
+pub fn serialize_full(grid: &Grid) -> Vec<u8> {
+    let cols = grid.cols;
+    let rows = grid.rows;
+    let mut out = Vec::with_capacity(grid.cells.len() * 2 + rows as usize * 2 + 16);
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    let mut tmp = [0u8; 4];
+    for y in 0..rows {
+        if y > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        for x in 0..cols {
+            let ch = grid.cells[y as usize * cols as usize + x as usize];
+            out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+        }
+    }
+    let (gx, gy) = grid.cursor;
+    out.extend_from_slice(format!("\x1b[{};{}H", gy + 1, gx + 1).as_bytes());
+    out
+}
+
+/// Serialize a per-row diff: for each row whose cells changed, a CUP to that row's
+/// start followed by the whole row; then a trailing cursor CUP if any row was
+/// redrawn (row writes move the cursor) or the cursor itself moved. Empty when
+/// nothing changed. `prev` and `next` MUST have the same dimensions.
+pub fn diff_rows(prev: &Grid, next: &Grid) -> Vec<u8> {
+    debug_assert_eq!(prev.dims(), next.dims(), "diff_rows requires equal dims");
+    let cols = next.cols as usize;
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 4];
+    for y in 0..next.rows as usize {
+        let lo = y * cols;
+        let hi = lo + cols;
+        if prev.cells[lo..hi] != next.cells[lo..hi] {
+            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
+            for &ch in &next.cells[lo..hi] {
+                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+    }
+    if !out.is_empty() || prev.cursor != next.cursor {
+        let (gx, gy) = next.cursor;
+        out.extend_from_slice(format!("\x1b[{};{}H", gy + 1, gx + 1).as_bytes());
+    }
+    out
 }
 
 /// Find a pane's cell source by id (linear scan — pane counts are small).
@@ -245,8 +305,7 @@ mod tests {
 
     #[test]
     fn compositor_constructs() {
-        let c = Compositor::new();
-        assert!(c.buf.is_empty());
+        let _c = Compositor::new();
     }
 
     #[test]
@@ -354,7 +413,7 @@ mod tests {
         // One window, one pane filling a 3x2 viewport. No tab bar, no dividers.
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(3, 2, &["ab", "cd"], (1, 0));
-        let mut c = Compositor::new();
+        let c = Compositor::new();
         let vp = Rect {
             x: 0,
             y: 0,
@@ -379,7 +438,7 @@ mod tests {
         };
         let left = StubScreen::new(3, 1, &["LLL"], (0, 0));
         let right = StubScreen::new(3, 1, &["RRR"], (0, 0));
-        let mut c = Compositor::new();
+        let c = Compositor::new();
         let vp = Rect {
             x: 0,
             y: 0,
@@ -404,7 +463,7 @@ mod tests {
     fn render_includes_tab_bar_only_when_multiple_windows() {
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(20, 1, &["hello"], (0, 0));
-        let mut c = Compositor::new();
+        let c = Compositor::new();
         let vp = Rect {
             x: 0,
             y: 0,
@@ -425,6 +484,56 @@ mod tests {
     }
 
     #[test]
+    fn diff_rows_emits_only_changed_rows_then_cursor() {
+        // 4x2 grids: row 0 identical, row 1 differs. Cursor moves (0,0)->(1,1).
+        let prev = Grid {
+            cols: 4,
+            rows: 2,
+            cells: vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+            cursor: (0, 0),
+        };
+        let next = Grid {
+            cols: 4,
+            rows: 2,
+            cells: vec!['a', 'b', 'c', 'd', 'X', 'Y', 'Z', 'W'],
+            cursor: (1, 1),
+        };
+        let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
+        // No full-clear, row 1 redrawn (CUP to row 2 col 1), then cursor CUP to (2,2).
+        assert!(!out.contains("\x1b[2J"));
+        assert_eq!(out, "\x1b[2;1HXYZW\x1b[2;2H");
+    }
+
+    #[test]
+    fn diff_rows_unchanged_grid_is_empty() {
+        let g = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec!['a', 'b'],
+            cursor: (0, 0),
+        };
+        assert!(diff_rows(&g, &g).is_empty());
+    }
+
+    #[test]
+    fn diff_rows_cursor_only_move_emits_just_a_cup() {
+        let prev = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec!['a', 'b'],
+            cursor: (0, 0),
+        };
+        let next = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec!['a', 'b'],
+            cursor: (1, 0),
+        };
+        let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
+        assert_eq!(out, "\x1b[1;2H");
+    }
+
+    #[test]
     fn render_places_cursor_at_focused_pane_in_global_coords() {
         // Two stacked panes; focus the bottom one; its cursor maps to global rows.
         let tree = Node::Split {
@@ -435,7 +544,7 @@ mod tests {
         };
         let top = StubScreen::new(4, 1, &["topp"], (0, 0));
         let bottom = StubScreen::new(4, 1, &["bott"], (2, 0)); // cursor col 2
-        let mut c = Compositor::new();
+        let c = Compositor::new();
         let vp = Rect {
             x: 0,
             y: 0,
