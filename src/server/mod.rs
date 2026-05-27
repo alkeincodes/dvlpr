@@ -10,10 +10,10 @@ use tokio::sync::mpsc;
 
 use crate::layout::PaneId;
 use crate::pane::PaneOutput;
-use crate::session::Session;
 use crate::protocol::{
     read_msg, write_msg, ClientHello, ClientMsg, ServerHello, ServerMsg, PROTOCOL_VERSION,
 };
+use crate::session::Session;
 
 /// How a daemon should start: where to listen and what to run in the pane.
 pub struct ServerConfig {
@@ -52,7 +52,10 @@ enum Event {
         rows: u16,
     },
     ClientGone(ClientId),
-    PaneOutput { pane_id: PaneId, output: PaneOutput },
+    PaneOutput {
+        pane_id: PaneId,
+        output: PaneOutput,
+    },
 }
 
 /// Run the daemon to completion (until the pane exits).
