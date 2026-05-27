@@ -59,9 +59,9 @@ impl Compositor {
         Self
     }
 
-    /// Composite the active window into a `Grid`. See the old `render` contract:
-    /// `viewport` must be rooted at (0, 0); `tab_names` has one entry per window;
-    /// `focused` is the active window's focused pane.
+    /// Composite the active window into a `Grid`. Contract: `viewport` must be
+    /// rooted at (0, 0); `tab_names` has one entry per window; `focused` is the
+    /// active window's focused pane.
     pub fn compose(
         &self,
         viewport: Rect,
@@ -141,6 +141,11 @@ impl Compositor {
 /// Serialize a full frame: clear+home, every row joined by CRLF, then a cursor CUP.
 /// Identical to the bytes the old `Compositor::render` produced.
 pub fn serialize_full(grid: &Grid) -> Vec<u8> {
+    debug_assert_eq!(
+        grid.cells.len(),
+        grid.cols as usize * grid.rows as usize,
+        "Grid::cells length must equal cols*rows"
+    );
     let cols = grid.cols;
     let rows = grid.rows;
     let mut out = Vec::with_capacity(grid.cells.len() * 2 + rows as usize * 2 + 16);
@@ -166,6 +171,11 @@ pub fn serialize_full(grid: &Grid) -> Vec<u8> {
 /// nothing changed. `prev` and `next` MUST have the same dimensions.
 pub fn diff_rows(prev: &Grid, next: &Grid) -> Vec<u8> {
     debug_assert_eq!(prev.dims(), next.dims(), "diff_rows requires equal dims");
+    debug_assert_eq!(
+        next.cells.len(),
+        next.cols as usize * next.rows as usize,
+        "Grid::cells length must equal cols*rows"
+    );
     let cols = next.cols as usize;
     let mut out = Vec::new();
     let mut tmp = [0u8; 4];
@@ -563,5 +573,23 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         // Bottom pane rect is {x0,y2}; its cursor (2,0) -> global (2,2) -> "\x1b[3;3H".
         assert!(s.ends_with("\x1b[3;3H"));
+    }
+
+    #[test]
+    fn diff_rows_dirty_row_unchanged_cursor_still_emits_cup() {
+        let prev = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec!['a', 'b'],
+            cursor: (0, 0),
+        };
+        let next = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec!['X', 'Y'],
+            cursor: (0, 0),
+        };
+        let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
+        assert_eq!(out, "\x1b[1;1HXY\x1b[1;1H");
     }
 }
