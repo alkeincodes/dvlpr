@@ -24,11 +24,12 @@ pub fn acquire_instance_lock(lock_path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Spawn `dvlpr server` detached from the controlling terminal.
-pub fn spawn_detached_server() -> io::Result<()> {
+/// Spawn `dvlpr server <name>` detached from the controlling terminal.
+pub fn spawn_detached_server(name: &str) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("server")
+        .arg(name)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

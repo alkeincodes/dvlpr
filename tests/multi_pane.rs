@@ -16,6 +16,7 @@ fn spawn_daemon(socket_path: std::path::PathBuf) {
         command: vec!["cat".into()],
         cwd: ".".into(),
         keymap: Some(dvlpr::config::Config::default()),
+        session: "default".into(),
     };
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()

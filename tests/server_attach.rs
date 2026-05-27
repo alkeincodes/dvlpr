@@ -15,6 +15,7 @@ async fn client_handshakes_and_receives_a_frame_with_command_output() {
         command: vec!["sh".into(), "-c".into(), "printf READY; sleep 5".into()],
         cwd: ".".into(),
         keymap: Some(dvlpr::config::Config::default()),
+        session: "default".into(),
     };
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()

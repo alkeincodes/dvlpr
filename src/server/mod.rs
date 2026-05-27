@@ -30,20 +30,28 @@ pub struct ServerConfig {
     /// Keymap to use. `None` => load from `~/.config/dvlpr/config.toml` (production
     /// default). Tests pass `Some(Config::default())` for deterministic bindings.
     pub keymap: Option<Config>,
+    /// The session name this daemon serves (its socket is `{session}.sock`).
+    pub session: String,
 }
 
 impl ServerConfig {
-    pub fn for_default_session() -> io::Result<Self> {
+    pub fn for_session(name: &str) -> io::Result<Self> {
+        socket::validate_session_name(name)?;
         let dir = socket::runtime_dir();
         socket::ensure_runtime_dir(&dir)?;
-        let socket_path = socket::socket_path_in(&dir, "default");
+        let socket_path = socket::socket_path_in(&dir, name);
         socket::check_sun_path_len(&socket_path)?;
         Ok(ServerConfig {
             socket_path,
             command: Vec::new(), // empty => default shell
             cwd: std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
             keymap: None,
+            session: name.to_string(),
         })
+    }
+
+    pub fn for_default_session() -> io::Result<Self> {
+        Self::for_session("default")
     }
 }
 
@@ -666,4 +674,27 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn for_session_rejects_an_invalid_name() {
+        // Validation runs first, so no runtime dir or socket is created.
+        assert!(ServerConfig::for_session("bad/name").is_err());
+        assert!(ServerConfig::for_session("").is_err());
+    }
+
+    #[test]
+    fn for_session_sets_name_and_socket_path() {
+        let cfg = ServerConfig::for_session("okname").unwrap();
+        assert_eq!(cfg.session, "okname");
+        assert!(
+            cfg.socket_path.ends_with("okname.sock"),
+            "socket path should be <runtime>/okname.sock, got {:?}",
+            cfg.socket_path
+        );
+    }
 }

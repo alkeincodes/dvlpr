@@ -27,9 +27,13 @@ async fn main() {
 
 /// Foreground daemon (the process spawned by `spawn_detached_server`).
 async fn run_server() -> std::io::Result<()> {
-    // `for_default_session` already ensures the runtime dir exists with 0700.
-    let config = ServerConfig::for_default_session()?;
-    let lock_path = socket::runtime_dir().join("daemon.lock");
+    // argv: `dvlpr server [name]` — default if absent.
+    let session = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "default".to_string());
+    // `for_session` already ensures the runtime dir exists with 0700.
+    let config = ServerConfig::for_session(&session)?;
+    let lock_path = socket::lock_path_in(&socket::runtime_dir(), &session);
     // Hold the lock for the daemon's lifetime.
     let _lock = match daemon::acquire_instance_lock(&lock_path) {
         Ok(lock) => lock,
@@ -46,7 +50,7 @@ async fn run_client() -> std::io::Result<()> {
     let path = socket::default_socket_path();
 
     if !socket::is_live(&path).await {
-        daemon::spawn_detached_server()?;
+        daemon::spawn_detached_server("default")?;
         // Wait for the daemon to come up.
         let mut up = false;
         for _ in 0..100 {

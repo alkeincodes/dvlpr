@@ -56,6 +56,7 @@ async fn pane_survives_detach_and_screen_is_restored_on_reattach() {
         command: vec!["sh".into(), "-c".into(), "printf MARKER; sleep 30".into()],
         cwd: ".".into(),
         keymap: Some(dvlpr::config::Config::default()),
+        session: "default".into(),
     };
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
