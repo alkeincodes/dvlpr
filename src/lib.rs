@@ -1,4 +1,5 @@
 pub mod client;
+pub mod compositor;
 pub mod daemon;
 pub mod ghostty;
 pub mod layout;
