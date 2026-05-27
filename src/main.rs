@@ -25,6 +25,10 @@ async fn main() {
         Cmd::Attach { session } => attach_existing(&session).await,
         Cmd::Ls => list_sessions().await,
         Cmd::Kill { session } => kill_session(&session).await,
+        Cmd::Ssh {
+            destination,
+            session,
+        } => run_ssh(&destination, session.as_deref()),
         Cmd::Usage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
@@ -50,6 +54,11 @@ enum Cmd {
     Kill { session: String },
     /// `dvlpr server [name]` — internal daemon entrypoint
     Server { session: String },
+    /// `dvlpr ssh <destination> [session]` — exec `ssh -t <dest> dvlpr [session]`
+    Ssh {
+        destination: String,
+        session: Option<String>,
+    },
     /// A usage error to print on stderr (exit 2)
     Usage(String),
 }
@@ -65,7 +74,7 @@ fn parse_args(args: &[String]) -> Cmd {
         }
     };
     const USAGE: &str =
-        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ls | kill -t <name>";
+        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name>";
     match args.first().map(String::as_str) {
         None => Cmd::Run {
             session: "default".into(),
@@ -98,6 +107,17 @@ fn parse_args(args: &[String]) -> Cmd {
             Some(name) => Cmd::Kill { session: name },
             None => Cmd::Usage("usage: dvlpr kill -t <name>".into()),
         },
+        Some("ssh") => match &args[1..] {
+            [dest] if !dest.starts_with('-') => Cmd::Ssh {
+                destination: dest.clone(),
+                session: None,
+            },
+            [dest, session] if !dest.starts_with('-') => Cmd::Ssh {
+                destination: dest.clone(),
+                session: Some(session.clone()),
+            },
+            _ => Cmd::Usage("usage: dvlpr ssh <destination> [session]".into()),
+        },
         // A single bare token is a session name (create-or-attach shorthand); extra
         // positional junk is a usage error rather than a silently-ignored typo.
         Some(name) => {
@@ -125,6 +145,34 @@ fn nested_block(cmd: &Cmd, dvlpr_env: Option<&str>) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// Pure: build the argv passed to `ssh`. `-t` forces remote PTY allocation so the
+/// remote client's raw mode and `terminal::size()` work; the remote command is
+/// `dvlpr [session]` (bare `dvlpr <name>` is create-or-attach).
+fn build_ssh_argv(destination: &str, session: Option<&str>) -> Vec<String> {
+    let mut v = vec!["-t".into(), destination.into(), "dvlpr".into()];
+    if let Some(s) = session {
+        v.push(s.into());
+    }
+    v
+}
+
+/// Exec `ssh -t <destination> dvlpr [session]`, replacing this process. Clears
+/// `$DVLPR` so an ssh `SendEnv`/remote `AcceptEnv` cannot make the remote `dvlpr`
+/// falsely refuse as nested. Returns only on failure (validation or exec error).
+fn run_ssh(destination: &str, session: Option<&str>) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    if let Some(s) = session {
+        socket::validate_session_name(s)?;
+    }
+    let err = std::process::Command::new("ssh")
+        .env_remove("DVLPR")
+        .args(build_ssh_argv(destination, session))
+        .exec();
+    // `exec` returns only on failure; surface ssh-not-found etc. as an error so
+    // main()'s `Err` path prints it and exits non-zero.
+    Err(std::io::Error::other(format!("failed to exec ssh: {err}")))
 }
 
 /// Foreground daemon (the process spawned by `spawn_detached_server`).
@@ -234,7 +282,7 @@ async fn list_sessions() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{nested_block, parse_args, Cmd};
+    use super::{build_ssh_argv, nested_block, parse_args, Cmd};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -348,5 +396,56 @@ mod tests {
             parse_args(&v(&["new", "-s", "a", "b"])),
             Cmd::Usage(_)
         ));
+    }
+
+    #[test]
+    fn build_ssh_argv_shapes_the_remote_command() {
+        assert_eq!(
+            build_ssh_argv("host", None),
+            vec!["-t".to_string(), "host".into(), "dvlpr".into()]
+        );
+        assert_eq!(
+            build_ssh_argv("me@host", Some("work")),
+            vec![
+                "-t".to_string(),
+                "me@host".into(),
+                "dvlpr".into(),
+                "work".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_ssh_command() {
+        assert_eq!(
+            parse_args(&v(&["ssh", "host"])),
+            Cmd::Ssh {
+                destination: "host".into(),
+                session: None
+            }
+        );
+        assert_eq!(
+            parse_args(&v(&["ssh", "me@host", "work"])),
+            Cmd::Ssh {
+                destination: "me@host".into(),
+                session: Some("work".into())
+            }
+        );
+        // No destination, leading-dash destination, and extra args are usage errors.
+        assert!(matches!(parse_args(&v(&["ssh"])), Cmd::Usage(_)));
+        assert!(matches!(parse_args(&v(&["ssh", "-X"])), Cmd::Usage(_)));
+        assert!(matches!(
+            parse_args(&v(&["ssh", "host", "work", "extra"])),
+            Cmd::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn nested_block_allows_ssh_when_env_set() {
+        let ssh = Cmd::Ssh {
+            destination: "host".into(),
+            session: None,
+        };
+        assert_eq!(nested_block(&ssh, Some("parent")), None);
     }
 }
