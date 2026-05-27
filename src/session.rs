@@ -123,7 +123,7 @@ impl Session {
     ) -> io::Result<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
-        let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h)?;
+        let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h, &self.session_name)?;
         let screen = GhosttyScreen::new(w, h);
         let id = self.next_pane_id;
         self.next_pane_id += 1;

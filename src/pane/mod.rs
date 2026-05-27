@@ -62,6 +62,7 @@ impl PaneRuntime {
         cwd: &str,
         cols: u16,
         rows: u16,
+        session_name: &str,
     ) -> io::Result<(PaneRuntime, mpsc::UnboundedReceiver<PaneOutput>)> {
         let argv = if command.is_empty() {
             default_shell()
@@ -90,6 +91,9 @@ impl PaneRuntime {
         // Our renderer preserves the cell styling these produce and re-emits it as SGR.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // Mark this child as living inside a dvlpr session, named for the session.
+        // The CLI reads $DVLPR at startup to refuse opening a nested session.
+        cmd.env("DVLPR", session_name);
 
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // Slave fd no longer needed in this process once the child holds it.
@@ -190,6 +194,7 @@ mod tests {
             ".",
             80,
             24,
+            "test",
         )
         .expect("spawn pane");
 
@@ -208,23 +213,57 @@ mod tests {
 
     #[tokio::test]
     async fn foreground_pid_is_some_for_a_live_pane() {
-        let (pane, _rx) =
-            PaneRuntime::spawn(&["sh".into(), "-c".into(), "sleep 30".into()], ".", 80, 24)
-                .expect("spawn pane");
+        let (pane, _rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            ".",
+            80,
+            24,
+            "test",
+        )
+        .expect("spawn pane");
         // The PTY has a foreground process group as soon as the child is running.
         assert!(pane.foreground_pid().is_some());
     }
 
     #[tokio::test]
     async fn close_tears_down_without_blocking_the_runtime() {
-        let (pane, _rx) =
-            PaneRuntime::spawn(&["sh".into(), "-c".into(), "sleep 30".into()], ".", 80, 24)
-                .expect("spawn pane");
+        let (pane, _rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            ".",
+            80,
+            24,
+            "test",
+        )
+        .expect("spawn pane");
         // close() must move the blocking kill()+wait() off the async runtime and
         // return promptly (it does not block on the child).
         pane.close();
         // Give the spawned blocking task a moment; the test completing without a
         // hang/panic is the assertion.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_sets_dvlpr_env_to_session_name() {
+        let (pane, mut rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "printf %s \"$DVLPR\"".into()],
+            ".",
+            80,
+            24,
+            "mysess",
+        )
+        .expect("spawn pane");
+
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(out)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            match out {
+                PaneOutput::Bytes(b) => collected.extend_from_slice(&b),
+                PaneOutput::Exited => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert!(text.contains("mysess"), "got: {text:?}");
+        drop(pane);
     }
 }
