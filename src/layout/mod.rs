@@ -372,24 +372,38 @@ pub fn split_area_at(node: &Node, area: Rect, path: &[Side]) -> Option<(Rect, Sp
 
 const TAB_NAME_MAX: usize = 12;
 
-/// Lay out window tabs left-to-right: each label is `[<idx><marker><name>]`
-/// where marker is `*` for the active window else `:`, names truncated to
-/// TAB_NAME_MAX cells, separated by a single space. Stops once `width` is reached.
+/// Lay out window tabs after a (separately-drawn) session-name prefix. Each label
+/// is `<1-based-idx>:<name>`, with a trailing `*` on the active window and an extra
+/// `Z` when the active window is zoomed. Names are truncated to TAB_NAME_MAX,
+/// separated by a single space. The first region's `x_start` is offset past the
+/// prefix (`session_name` width + two spaces); the prefix itself is NOT a region
+/// (it is not clickable). Stops once `width` is reached.
 ///
 /// v1 semantics: lengths/offsets are counted in Unicode scalar values
-/// (`chars().count()`), which equals terminal display cells for the ASCII window
-/// names we expect. Wide/zero-width characters (CJK, emoji) would make the drawn
-/// label and the clickable x-range drift; supporting display-width is deferred
-/// (would need a unicode-width dependency, out of scope for this std-only module).
-pub fn tab_layout(names: &[String], active: usize, width: u16) -> Vec<TabRegion> {
+/// (`chars().count()`), which equals terminal display cells for the ASCII names we
+/// expect; wide/zero-width chars would drift (deferred, as before).
+pub fn tab_layout(
+    session_name: &str,
+    names: &[String],
+    active: usize,
+    zoomed: bool,
+    width: u16,
+) -> Vec<TabRegion> {
     let mut out = Vec::new();
-    let mut x: u16 = 0;
+    // Prefix occupies "<session>  " (name + two spaces); tabs start after it.
+    let prefix = session_name.chars().count() as u16 + 2;
+    let mut x: u16 = prefix;
     for (i, name) in names.iter().enumerate() {
         if x >= width {
             break;
         }
-        let marker = if i == active { '*' } else { ':' };
-        let label = format!("[{}{}{}]", i, marker, truncate(name, TAB_NAME_MAX));
+        let mut label = format!("{}:{}", i + 1, truncate(name, TAB_NAME_MAX));
+        if i == active {
+            label.push('*');
+            if zoomed {
+                label.push('Z');
+            }
+        }
         let len = label.chars().count() as u16;
         let x_end = x.saturating_add(len.saturating_sub(1)).min(width - 1);
         out.push(TabRegion {
@@ -511,7 +525,7 @@ mod tests {
             h: 24,
         };
         let names = vec!["a".to_string(), "b".to_string()];
-        let tabs = tab_layout(&names, 0, 80);
+        let tabs = tab_layout("s", &names, 0, false, 80);
         // 2 windows => tab row at y 23 => SGR row 24. Click within tab[1]'s range.
         let col = tabs[1].x_start + 1; // 1-based
         assert_eq!(hit_test(&tree, vp, 2, &tabs, col, 24), Hit::Tab(1));
@@ -531,27 +545,31 @@ mod tests {
     }
 
     #[test]
-    fn tab_layout_produces_labels_and_ranges() {
-        let names = vec!["shell".to_string(), "vim".to_string(), "logs".to_string()];
-        let tabs = tab_layout(&names, 1, 80);
-        // Labels: "[0:shell]" (9), space, "[1*vim]" (7), space, "[2:logs]" (8).
-        assert_eq!(tabs.len(), 3);
-        assert_eq!(tabs[0].label, "[0:shell]");
-        assert_eq!(tabs[0].x_start, 0);
-        assert_eq!(tabs[0].x_end, 8); // 9 chars at x 0..=8
-        assert_eq!(tabs[1].label, "[1*vim]"); // active marked with '*'
-        assert_eq!(tabs[1].x_start, 10); // 9 + 1 space
-        assert_eq!(tabs[1].x_end, 16); // 7 chars at 10..=16
-        assert_eq!(tabs[2].label, "[2:logs]");
-        assert_eq!(tabs[2].x_start, 18); // 16 + 1 + 1
+    fn tab_layout_is_one_based_with_active_marker() {
+        let names = vec!["zsh".to_string(), "claude".to_string()];
+        let tabs = tab_layout("work", &names, 1, false, 80);
+        // prefix "work" + two spaces = 6 cells; first tab starts at x=6.
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].x_start, 6);
+        assert_eq!(tabs[0].label, "1:zsh");
+        assert_eq!(tabs[1].label, "2:claude*"); // active gets a trailing '*'
+        assert_eq!(tabs[1].window, 1);
+    }
+
+    #[test]
+    fn tab_layout_marks_zoomed_active_window() {
+        let names = vec!["zsh".to_string(), "claude".to_string()];
+        let tabs = tab_layout("work", &names, 1, true, 80);
+        assert_eq!(tabs[1].label, "2:claude*Z"); // active + zoomed
+        assert_eq!(tabs[0].label, "1:zsh"); // inactive unmarked
     }
 
     #[test]
     fn tab_layout_truncates_long_names() {
         let names = vec!["a-very-long-window-name".to_string()];
-        let tabs = tab_layout(&names, 0, 80);
-        // name truncated to 12 cells: first 11 chars ("a-very-long") + '…'.
-        assert_eq!(tabs[0].label, "[0*a-very-long…]");
+        let tabs = tab_layout("s", &names, 0, false, 80);
+        // "1:" + truncate(name, 12) + "*"
+        assert_eq!(tabs[0].label, "1:a-very-long…*");
     }
 
     #[test]

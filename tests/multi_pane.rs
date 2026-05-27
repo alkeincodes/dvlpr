@@ -109,7 +109,10 @@ async fn ctrl_a_c_creates_a_window_and_shows_the_tab_bar() {
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
     send_input(&mut w, &[0x01, b'c']).await; // Ctrl-a c => new window
     assert!(
-        until_frame(&mut r, 5, |f| f.contains("[0:") && f.contains("[1*")).await,
+        until_frame(&mut r, 5, |f| f.contains("1:")
+            && f.contains("2:")
+            && f.contains('*'))
+        .await,
         "expected a tab bar with window 0 (inactive) and window 1 (active)"
     );
 }

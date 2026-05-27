@@ -62,13 +62,16 @@ impl Compositor {
     /// Composite the active window into a `Grid`. Contract: `viewport` must be
     /// rooted at (0, 0); `tab_names` has one entry per window; `focused` is the
     /// active window's focused pane.
+    #[allow(clippy::too_many_arguments)]
     pub fn compose(
         &self,
         viewport: Rect,
         root: &Node,
+        session_name: &str,
         tab_names: &[String],
         active_window: usize,
         focused: PaneId,
+        zoomed: bool,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Grid {
         debug_assert!(
@@ -97,10 +100,10 @@ impl Compositor {
             draw_divider(&mut buf, cols, &d, heavy);
         }
 
-        // Status/tab bar (always present when the viewport has rows).
+        // Status/tab bar (always present): session prefix at the left, then tabs.
         if let Some(ty) = layout::tab_row(viewport, window_count) {
-            let regions = layout::tab_layout(tab_names, active_window, cols);
-            draw_tabs(&mut buf, cols, ty, &regions);
+            let regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
+            draw_tabs(&mut buf, cols, ty, session_name, &regions);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -125,16 +128,28 @@ impl Compositor {
 
     /// Convenience: a full-frame serialization of `compose`. Used by the compositor
     /// unit tests; `Session::render` delegates to `serialize_full` directly.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         viewport: Rect,
         root: &Node,
+        session_name: &str,
         tab_names: &[String],
         active_window: usize,
         focused: PaneId,
+        zoomed: bool,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Vec<u8> {
-        serialize_full(&self.compose(viewport, root, tab_names, active_window, focused, panes))
+        serialize_full(&self.compose(
+            viewport,
+            root,
+            session_name,
+            tab_names,
+            active_window,
+            focused,
+            zoomed,
+            panes,
+        ))
     }
 }
 
@@ -309,9 +324,25 @@ fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
     }
 }
 
-/// Draw each tab region's label into row `ty` of the buffer, starting at the
-/// region's `x_start` (the same x-ranges hit-testing uses).
-fn draw_tabs(buf: &mut [char], cols: u16, ty: u16, regions: &[layout::TabRegion]) {
+/// Draw the session-name prefix at the row's left, then each tab region's label at
+/// its `x_start` (the same x-ranges hit-testing uses). The prefix is not clickable.
+fn draw_tabs(
+    buf: &mut [char],
+    cols: u16,
+    ty: u16,
+    session_name: &str,
+    regions: &[layout::TabRegion],
+) {
+    for (x, ch) in session_name.chars().enumerate() {
+        if x >= cols as usize {
+            break;
+        }
+        let idx = ty as usize * cols as usize + x;
+        if idx < buf.len() {
+            buf[idx] = ch;
+        }
+    }
+    // (the two-space gap is left blank; regions' x_start already accounts for it)
     for region in regions {
         for (i, ch) in region.label.chars().enumerate() {
             let x = region.x_start as usize + i;
@@ -463,20 +494,23 @@ mod tests {
     fn draw_tabs_writes_labels_at_their_ranges() {
         let cols: u16 = 20;
         let mut buf = vec![' '; 20 * 2];
-        let regions = layout::tab_layout(&["a".to_string(), "b".to_string()], 0, cols);
+        let regions = layout::tab_layout("s", &["a".to_string(), "b".to_string()], 0, false, cols);
         // Tab row is the last row (y = 1).
-        draw_tabs(&mut buf, cols, 1, &regions);
+        draw_tabs(&mut buf, cols, 1, "s", &regions);
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
         let row: String = (0..cols).map(|x| buf[cols as usize + x as usize]).collect();
-        assert!(row.starts_with("[0*a]")); // active window 0 marked with '*'
-        assert!(row.contains("[1:b]"));
+        // prefix "s" at x=0, gap at x=1,2; tabs start at x=3 ("s" + 2 spaces = 3).
+        assert!(row.starts_with("s")); // session prefix
+        assert!(row.contains("1:a*")); // active window 0 → 1-based label with '*'
+        assert!(row.contains("2:b")); // inactive window 1 → 1-based label without marker
     }
 
     #[test]
     fn render_single_pane_matches_full_frame_format() {
         // One window, one pane in a 3x2 viewport. The bottom row is the always-on
         // status bar, so the content area is 3x1. Row 0 gets "ab ", row 1 gets
-        // the bar label "[0*w0]" truncated to 3 cols → "[0*".
+        // the bar: session prefix "s" + two-space gap + "1:w0*", clipped to 3 cols
+        // → "s  " (prefix + gap, tabs don't fit).
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(3, 2, &["ab", "cd"], (1, 0));
         let c = Compositor::new();
@@ -486,12 +520,21 @@ mod tests {
             w: 3,
             h: 2,
         };
-        let out = c.render(vp, &tree, &["w0".to_string()], 0, 1, &[(1, &pane)]);
+        let out = c.render(
+            vp,
+            &tree,
+            "s",
+            &["w0".to_string()],
+            0,
+            1,
+            false,
+            &[(1, &pane)],
+        );
         let s = String::from_utf8(out).unwrap();
         // Content area is h=1; pane row 0 ("ab ") fills it.
-        // Bar row (y=1) shows "[0*w0]" clipped to 3 cols → "[0*".
+        // Bar row (y=1): "s  " (prefix at x=0, two blank spaces for the gap).
         // Cursor: pane rect {x:0,y:0,w:3,h:1}, pane cursor (1,0) -> global (1,0) -> "\x1b[1;2H".
-        assert_eq!(s, "\x1b[2J\x1b[Hab \r\n[0*\x1b[1;2H");
+        assert_eq!(s, "\x1b[2J\x1b[Hab \r\ns  \x1b[1;2H");
     }
 
     #[test]
@@ -517,9 +560,11 @@ mod tests {
         let out = c.render(
             vp,
             &tree,
+            "s",
             &["w".to_string()],
             0,
             1,
+            false,
             &[(1, &left), (2, &right)],
         );
         let s = String::from_utf8(out).unwrap();
@@ -538,17 +583,26 @@ mod tests {
             w: 20,
             h: 2,
         };
-        // Two windows -> the bottom row is a tab bar.
+        // Two windows -> the bottom row has session prefix + tab labels.
         let names = vec!["one".to_string(), "two".to_string()];
-        let out = c.render(vp, &tree, &names, 1, 1, &[(1, &pane)]);
+        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &[(1, &pane)]);
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("[0:one]"));
-        assert!(s.contains("[1*two]")); // active window 1 marked with '*'
+        assert!(s.contains("1:one")); // inactive window 0 (1-based, no marker)
+        assert!(s.contains("2:two*")); // active window 1 marked with '*'
 
         // With a single window, the status bar is still drawn (always-on).
-        let single = c.render(vp, &tree, &["one".to_string()], 0, 1, &[(1, &pane)]);
+        let single = c.render(
+            vp,
+            &tree,
+            "s",
+            &["one".to_string()],
+            0,
+            1,
+            false,
+            &[(1, &pane)],
+        );
         let s2 = String::from_utf8(single).unwrap();
-        assert!(s2.contains("[0*one]"));
+        assert!(s2.contains("1:one*")); // active single window (1-based, '*' marker)
     }
 
     #[test]
@@ -624,9 +678,11 @@ mod tests {
         let out = c.render(
             vp,
             &tree,
+            "s",
             &["w".to_string()],
             0,
             2,
+            false,
             &[(1, &top), (2, &bottom)],
         );
         let s = String::from_utf8(out).unwrap();

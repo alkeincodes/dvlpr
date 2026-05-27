@@ -27,9 +27,11 @@ struct Window {
     name: String,
     root: Node,
     focused: PaneId,
+    zoomed: bool,
 }
 
 pub struct Session {
+    session_name: String,
     windows: Vec<Window>,
     active_window: usize,
     panes: HashMap<PaneId, Pane>,
@@ -55,11 +57,23 @@ pub struct CommandEffect {
 /// children plus a 1-cell divider).
 const MIN_SPLIT_AXIS: u16 = 5;
 
+/// The seed name for a freshly-created window: the spawn command's basename, or
+/// the placeholder "shell" when the command is empty (an empty command means the
+/// default shell, resolved only inside PaneRuntime::spawn — not duplicated here).
+/// The real name is filled in by the first `refresh_window_names`.
+fn initial_window_name(command: &[String]) -> String {
+    match command.first() {
+        Some(c) => c.rsplit('/').next().unwrap_or(c).to_string(),
+        None => "shell".to_string(),
+    }
+}
+
 impl Session {
     /// Create a session with one window holding a single pane running `command`.
     /// Returns the session, the first pane's id, and its output receiver (the
     /// caller spawns a forwarder that tags the output with the pane id).
     pub fn new(
+        session_name: String,
         command: Vec<String>,
         cwd: String,
         cols: u16,
@@ -69,6 +83,7 @@ impl Session {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut session = Session {
+            session_name,
             windows: Vec::new(),
             active_window: 0,
             panes: HashMap::new(),
@@ -92,9 +107,10 @@ impl Session {
         );
         let (id, rx) = session.spawn_pane(content)?;
         session.windows.push(Window {
-            name: "0".to_string(),
+            name: initial_window_name(&session.command),
             root: Node::Leaf(id),
             focused: id,
+            zoomed: false,
         });
         Ok((session, id, rx))
     }
@@ -172,9 +188,11 @@ impl Session {
         self.compositor.compose(
             viewport,
             &win.root,
+            &self.session_name,
             &names,
             self.active_window,
             win.focused,
+            win.zoomed,
             &refs,
         )
     }
@@ -320,11 +338,11 @@ impl Session {
             Ok(v) => v,
             Err(_) => return,
         };
-        let name = self.windows.len().to_string();
         self.windows.push(Window {
-            name,
+            name: initial_window_name(&self.command),
             root: Node::Leaf(id),
             focused: id,
+            zoomed: false,
         });
         self.active_window = self.windows.len() - 1;
         self.relayout_all();
@@ -459,7 +477,18 @@ impl Session {
             return layout::Hit::None;
         };
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let tabs = layout::tab_layout(&names, self.active_window, self.cols);
+        let zoomed = self
+            .windows
+            .get(self.active_window)
+            .map(|w| w.zoomed)
+            .unwrap_or(false);
+        let tabs = layout::tab_layout(
+            &self.session_name,
+            &names,
+            self.active_window,
+            zoomed,
+            self.cols,
+        );
         layout::hit_test(
             &win.root,
             self.viewport(),
@@ -468,6 +497,29 @@ impl Session {
             col,
             row,
         )
+    }
+
+    /// Refresh every window's name from its focused pane's foreground process.
+    /// `resolve` maps a pid to a friendly name (injected so tests can fake it;
+    /// production passes `crate::procinfo::process_name`). When `resolve` yields
+    /// `None` (or there is no foreground pid) the window keeps its current name —
+    /// no flicker to a placeholder. Returns true if any name changed.
+    pub fn refresh_window_names(&mut self, resolve: impl Fn(i32) -> Option<String>) -> bool {
+        let mut changed = false;
+        for win in &mut self.windows {
+            let new = self
+                .panes
+                .get(&win.focused)
+                .and_then(|p| p.runtime.foreground_pid())
+                .and_then(&resolve);
+            if let Some(new) = new {
+                if new != win.name {
+                    win.name = new;
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Recompute the dragged split's ratio from the pointer position and relayout.
@@ -512,6 +564,7 @@ mod tests {
     #[tokio::test]
     async fn session_renders_pane_output_as_full_frame() {
         let (mut session, pane_id, mut rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "printf READY; sleep 5".into()],
             ".".into(),
             40,
@@ -546,6 +599,7 @@ mod tests {
     #[tokio::test]
     async fn input_and_resize_do_not_panic_and_keep_rendering() {
         let (mut session, pane_id, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -572,6 +626,7 @@ mod tests {
     #[tokio::test]
     async fn pane_exit_removes_pane_and_empties_single_window_session() {
         let (mut session, pane_id, mut rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "true".into()],
             ".".into(),
             40,
@@ -605,6 +660,7 @@ mod tests {
     #[tokio::test]
     async fn split_horizontal_spawns_a_second_pane_and_focuses_it() {
         let (mut session, first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -630,6 +686,7 @@ mod tests {
     async fn split_is_rejected_when_too_small() {
         // 3-row viewport can't host a horizontal split (needs >= 5 rows).
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -650,6 +707,7 @@ mod tests {
     #[tokio::test]
     async fn new_window_then_select_switches_active_window() {
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -671,6 +729,7 @@ mod tests {
     #[tokio::test]
     async fn close_pane_collapses_split_and_returns_a_runtime() {
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -693,6 +752,7 @@ mod tests {
     #[tokio::test]
     async fn detach_command_sets_the_detach_flag() {
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -710,6 +770,7 @@ mod tests {
     #[tokio::test]
     async fn pane_exit_keeps_focus_when_a_non_focused_pane_closes() {
         let (mut session, first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
@@ -741,6 +802,7 @@ mod tests {
     #[tokio::test]
     async fn click_focuses_the_pane_under_the_pointer() {
         let (mut session, first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             41,
@@ -777,6 +839,7 @@ mod tests {
     #[tokio::test]
     async fn drag_on_a_divider_changes_the_split_ratio() {
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             41,
@@ -835,7 +898,8 @@ mod tests {
 
     #[tokio::test]
     async fn compose_returns_grid_matching_viewport_dims() {
-        let (session, _id, _rx) = Session::new(vec!["cat".into()], ".".into(), 30, 8).unwrap();
+        let (session, _id, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8).unwrap();
         let grid = session.compose();
         assert_eq!(grid.dims(), (30, 8));
         assert_eq!(grid.cells.len(), 30 * 8);
@@ -844,10 +908,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_window_names_updates_only_on_change() {
+        let (mut session, _id, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8).unwrap();
+        // First resolve to "claude": name changes -> true.
+        assert!(session.refresh_window_names(|_pid| Some("claude".to_string())));
+        // Same value again: no change -> false.
+        assert!(!session.refresh_window_names(|_pid| Some("claude".to_string())));
+        // Resolver returns None: keep current name -> false.
+        assert!(!session.refresh_window_names(|_pid| None));
+    }
+
+    #[tokio::test]
     async fn pane_exit_adjusts_active_window_for_index_after_before_and_at() {
         // Build 3 windows (indices 0,1,2). Exercise window collapse for an index
         // AFTER the active one (no shift), BEFORE it (shift down), and AT it (clamp).
         let (mut session, _first, _rx) = Session::new(
+            "test".into(),
             vec!["sh".into(), "-c".into(), "sleep 5".into()],
             ".".into(),
             40,
