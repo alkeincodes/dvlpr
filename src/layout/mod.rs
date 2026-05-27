@@ -16,7 +16,10 @@ pub struct Rect {
 impl Rect {
     /// True if the 0-based cell (x, y) lies inside this rect.
     pub fn contains(&self, x: u16, y: u16) -> bool {
-        x >= self.x && x < self.x.saturating_add(self.w) && y >= self.y && y < self.y.saturating_add(self.h)
+        x >= self.x
+            && x < self.x.saturating_add(self.w)
+            && y >= self.y
+            && y < self.y.saturating_add(self.h)
     }
 }
 
@@ -92,7 +95,10 @@ pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
 /// The content rect (viewport minus the tab-bar row when there is more than one window).
 pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
     if tab_row(viewport, window_count).is_some() {
-        Rect { h: viewport.h - 1, ..viewport }
+        Rect {
+            h: viewport.h - 1,
+            ..viewport
+        }
     } else {
         viewport
     }
@@ -110,7 +116,11 @@ fn collect_rects(node: &Node, area: Rect, out: &mut Vec<(PaneId, Rect)>) {
     match node {
         Node::Leaf(id) => out.push((*id, area)),
         Node::Split {
-            dir, ratio, first, second, ..
+            dir,
+            ratio,
+            first,
+            second,
+            ..
         } => {
             let (a, _divider, b) = split_area(area, *dir, *ratio);
             collect_rects(first, a, out);
@@ -132,9 +142,24 @@ fn split_area(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect, Rect) {
             let avail = area.h - divider_h;
             let first_h = ((ratio * avail as f32).floor() as i64).clamp(0, avail as i64) as u16;
             let second_h = avail - first_h;
-            let first = Rect { x: area.x, y: area.y, w: area.w, h: first_h };
-            let divider = Rect { x: area.x, y: area.y + first_h, w: area.w, h: divider_h };
-            let second = Rect { x: area.x, y: area.y + first_h + divider_h, w: area.w, h: second_h };
+            let first = Rect {
+                x: area.x,
+                y: area.y,
+                w: area.w,
+                h: first_h,
+            };
+            let divider = Rect {
+                x: area.x,
+                y: area.y + first_h,
+                w: area.w,
+                h: divider_h,
+            };
+            let second = Rect {
+                x: area.x,
+                y: area.y + first_h + divider_h,
+                w: area.w,
+                h: second_h,
+            };
             (first, divider, second)
         }
         SplitDir::Vertical => {
@@ -142,9 +167,24 @@ fn split_area(area: Rect, dir: SplitDir, ratio: f32) -> (Rect, Rect, Rect) {
             let avail = area.w - divider_w;
             let first_w = ((ratio * avail as f32).floor() as i64).clamp(0, avail as i64) as u16;
             let second_w = avail - first_w;
-            let first = Rect { x: area.x, y: area.y, w: first_w, h: area.h };
-            let divider = Rect { x: area.x + first_w, y: area.y, w: divider_w, h: area.h };
-            let second = Rect { x: area.x + first_w + divider_w, y: area.y, w: second_w, h: area.h };
+            let first = Rect {
+                x: area.x,
+                y: area.y,
+                w: first_w,
+                h: area.h,
+            };
+            let divider = Rect {
+                x: area.x + first_w,
+                y: area.y,
+                w: divider_w,
+                h: area.h,
+            };
+            let second = Rect {
+                x: area.x + first_w + divider_w,
+                y: area.y,
+                w: second_w,
+                h: area.h,
+            };
             (first, divider, second)
         }
     }
@@ -160,11 +200,19 @@ pub fn dividers(node: &Node, area: Rect) -> Vec<Divider> {
 
 fn collect_dividers(node: &Node, area: Rect, path: &mut SplitPath, out: &mut Vec<Divider>) {
     if let Node::Split {
-        dir, ratio, first, second, ..
+        dir,
+        ratio,
+        first,
+        second,
+        ..
     } = node
     {
         let (a, divider, b) = split_area(area, *dir, *ratio);
-        out.push(Divider { rect: divider, path: path.clone(), dir: *dir });
+        out.push(Divider {
+            rect: divider,
+            path: path.clone(),
+            dir: *dir,
+        });
         path.push(Side::First);
         collect_dividers(first, a, path, out);
         path.pop();
@@ -307,7 +355,12 @@ pub fn tab_layout(names: &[String], active: usize, width: u16) -> Vec<TabRegion>
         let label = format!("[{}{}{}]", i, marker, truncate(name, TAB_NAME_MAX));
         let len = label.chars().count() as u16;
         let x_end = x.saturating_add(len.saturating_sub(1)).min(width - 1);
-        out.push(TabRegion { window: i, x_start: x, x_end, label });
+        out.push(TabRegion {
+            window: i,
+            x_start: x,
+            x_end,
+            label,
+        });
         x = x.saturating_add(len).saturating_add(1); // one-space separator
     }
     out
@@ -384,7 +437,12 @@ mod tests {
     #[test]
     fn hit_test_maps_clicks_to_panes() {
         let tree = sample_tree();
-        let vp = Rect { x: 0, y: 0, w: 11, h: 4 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 11,
+            h: 4,
+        };
         // Single window => no tab row, content = full viewport.
         // Left pane is x 0..=4 (w 5); divider at x 5; right pane x 6..=10.
         // SGR coords are 1-based: col 1 => x 0 (left pane).
@@ -396,7 +454,12 @@ mod tests {
     #[test]
     fn hit_test_detects_the_divider() {
         let tree = sample_tree();
-        let vp = Rect { x: 0, y: 0, w: 11, h: 4 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 11,
+            h: 4,
+        };
         // Divider column is x 5 => SGR col 6.
         assert_eq!(hit_test(&tree, vp, 1, &[], 6, 1), Hit::Divider(vec![]));
     }
@@ -404,7 +467,12 @@ mod tests {
     #[test]
     fn hit_test_detects_a_tab_click() {
         let tree = Node::Leaf(1);
-        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         let names = vec!["a".to_string(), "b".to_string()];
         let tabs = tab_layout(&names, 0, 80);
         // 2 windows => tab row at y 23 => SGR row 24. Click within tab[1]'s range.
@@ -415,7 +483,12 @@ mod tests {
     #[test]
     fn hit_test_outside_everything_is_none() {
         let tree = Node::Leaf(1);
-        let vp = Rect { x: 0, y: 0, w: 10, h: 5 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 5,
+        };
         assert_eq!(hit_test(&tree, vp, 1, &[], 0, 0), Hit::None); // 0 is not a valid 1-based coord
         assert_eq!(hit_test(&tree, vp, 1, &[], 99, 99), Hit::None); // out of bounds
     }
@@ -580,7 +653,18 @@ mod tests {
 
     #[test]
     fn single_leaf_has_no_dividers() {
-        assert_eq!(dividers(&Node::Leaf(1), Rect { x: 0, y: 0, w: 10, h: 5 }), vec![]);
+        assert_eq!(
+            dividers(
+                &Node::Leaf(1),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 5
+                }
+            ),
+            vec![]
+        );
     }
 
     #[test]
@@ -591,9 +675,25 @@ mod tests {
             first: Box::new(Node::Leaf(1)),
             second: Box::new(Node::Leaf(2)),
         };
-        let ds = dividers(&tree, Rect { x: 0, y: 0, w: 11, h: 4 });
+        let ds = dividers(
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 11,
+                h: 4,
+            },
+        );
         assert_eq!(ds.len(), 1);
-        assert_eq!(ds[0].rect, Rect { x: 5, y: 0, w: 1, h: 4 }); // vertical divider column
+        assert_eq!(
+            ds[0].rect,
+            Rect {
+                x: 5,
+                y: 0,
+                w: 1,
+                h: 4
+            }
+        ); // vertical divider column
         assert_eq!(ds[0].path, Vec::<Side>::new()); // root split
         assert_eq!(ds[0].dir, SplitDir::Vertical);
     }
@@ -612,7 +712,15 @@ mod tests {
             }),
             second: Box::new(Node::Leaf(3)),
         };
-        let ds = dividers(&tree, Rect { x: 0, y: 0, w: 21, h: 5 });
+        let ds = dividers(
+            &tree,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 21,
+                h: 5,
+            },
+        );
         // Outer divider (root, empty path) + inner horizontal divider (path [First]).
         assert_eq!(ds.len(), 2);
         assert_eq!(ds[0].path, Vec::<Side>::new());
@@ -623,22 +731,45 @@ mod tests {
 
     #[test]
     fn single_window_has_no_tab_row_and_full_content() {
-        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         assert_eq!(tab_row(vp, 1), None);
         assert_eq!(content_area(vp, 1), vp);
     }
 
     #[test]
     fn multi_window_reserves_bottom_row_for_tabs() {
-        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         assert_eq!(tab_row(vp, 3), Some(23)); // bottom row
-        assert_eq!(content_area(vp, 3), Rect { x: 0, y: 0, w: 80, h: 23 });
+        assert_eq!(
+            content_area(vp, 3),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 23
+            }
+        );
     }
 
     #[test]
     fn single_leaf_fills_the_area() {
         let tree = Node::Leaf(7);
-        let area = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         assert_eq!(pane_rects(&tree, area), vec![(7, area)]);
     }
 
@@ -651,11 +782,38 @@ mod tests {
             first: Box::new(Node::Leaf(1)),
             second: Box::new(Node::Leaf(2)),
         };
-        let area = Rect { x: 0, y: 0, w: 10, h: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 5,
+        };
         // avail = 5 - 1 = 4; first_h = floor(0.5*4)=2; second_h = 2.
         let rects = pane_rects(&tree, area);
-        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 10, h: 2 }));
-        assert_eq!(rects[1], (2, Rect { x: 0, y: 3, w: 10, h: 2 })); // y = 0 + 2 + 1 divider
+        assert_eq!(
+            rects[0],
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 2
+                }
+            )
+        );
+        assert_eq!(
+            rects[1],
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 3,
+                    w: 10,
+                    h: 2
+                }
+            )
+        ); // y = 0 + 2 + 1 divider
     }
 
     #[test]
@@ -666,11 +824,38 @@ mod tests {
             first: Box::new(Node::Leaf(1)),
             second: Box::new(Node::Leaf(2)),
         };
-        let area = Rect { x: 0, y: 0, w: 11, h: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 11,
+            h: 4,
+        };
         // avail = 11 - 1 = 10; first_w = 5; second_w = 5.
         let rects = pane_rects(&tree, area);
-        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 5, h: 4 }));
-        assert_eq!(rects[1], (2, Rect { x: 6, y: 0, w: 5, h: 4 })); // x = 0 + 5 + 1 divider
+        assert_eq!(
+            rects[0],
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 5,
+                    h: 4
+                }
+            )
+        );
+        assert_eq!(
+            rects[1],
+            (
+                2,
+                Rect {
+                    x: 6,
+                    y: 0,
+                    w: 5,
+                    h: 4
+                }
+            )
+        ); // x = 0 + 5 + 1 divider
     }
 
     #[test]
@@ -687,13 +872,51 @@ mod tests {
             }),
             second: Box::new(Node::Leaf(3)),
         };
-        let area = Rect { x: 0, y: 0, w: 21, h: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 21,
+            h: 5,
+        };
         let rects = pane_rects(&tree, area);
         // Outer V: avail_w=20, first_w=10 (x 0..10), divider x=10, second x=11 w=10.
         // Left H: area {0,0,10,5}: avail_h=4, first_h=2, second y=3 h=2.
-        assert_eq!(rects[0], (1, Rect { x: 0, y: 0, w: 10, h: 2 }));
-        assert_eq!(rects[1], (2, Rect { x: 0, y: 3, w: 10, h: 2 }));
-        assert_eq!(rects[2], (3, Rect { x: 11, y: 0, w: 10, h: 5 }));
+        assert_eq!(
+            rects[0],
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 2
+                }
+            )
+        );
+        assert_eq!(
+            rects[1],
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 3,
+                    w: 10,
+                    h: 2
+                }
+            )
+        );
+        assert_eq!(
+            rects[2],
+            (
+                3,
+                Rect {
+                    x: 11,
+                    y: 0,
+                    w: 10,
+                    h: 5
+                }
+            )
+        );
     }
 
     #[test]
@@ -705,7 +928,12 @@ mod tests {
             first: Box::new(Node::Leaf(1)),
             second: Box::new(Node::Leaf(2)),
         };
-        let area = Rect { x: 4, y: 2, w: 13, h: 7 };
+        let area = Rect {
+            x: 4,
+            y: 2,
+            w: 13,
+            h: 7,
+        };
         let rects = pane_rects(&tree, area);
         let (_, a) = rects[0];
         let (_, b) = rects[1];
@@ -728,7 +956,12 @@ mod tests {
             first: Box::new(Node::Leaf(1)),
             second: Box::new(Node::Leaf(2)),
         };
-        let area = Rect { x: 0, y: 0, w: 10, h: 0 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 0,
+        };
         let rects = pane_rects(&tree, area);
         // Both panes are zero-height; their heights sum to exactly 0 (no overflow).
         assert_eq!(rects[0].1.h, 0);
@@ -738,13 +971,23 @@ mod tests {
 
     #[test]
     fn rect_contains_checks_bounds() {
-        let r = Rect { x: 2, y: 3, w: 4, h: 5 };
+        let r = Rect {
+            x: 2,
+            y: 3,
+            w: 4,
+            h: 5,
+        };
         assert!(r.contains(2, 3)); // top-left corner included
         assert!(r.contains(5, 7)); // bottom-right corner included (x<2+4, y<3+5)
         assert!(!r.contains(1, 3)); // left of
         assert!(!r.contains(6, 3)); // right edge excluded (2+4=6)
         assert!(!r.contains(2, 8)); // bottom edge excluded (3+5=8)
-        let empty = Rect { x: 0, y: 0, w: 0, h: 0 };
+        let empty = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
         assert!(!empty.contains(0, 0)); // zero-size contains nothing
     }
 }
