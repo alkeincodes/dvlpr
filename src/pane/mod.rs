@@ -84,6 +84,12 @@ impl PaneRuntime {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
+        // Advertise color support to the child. The daemon may have been launched with a
+        // bare or color-less TERM (e.g. detached at boot), so set a known color-capable
+        // TERM and COLORTERM=truecolor rather than inheriting whatever it happens to have.
+        // Our renderer preserves the cell styling these produce and re-emits it as SGR.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
 
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // Slave fd no longer needed in this process once the child holds it.

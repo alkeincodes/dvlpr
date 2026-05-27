@@ -10,6 +10,7 @@ use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
 
+use crate::compositor::{CellStyle, Color};
 use crate::ghostty::sys;
 
 pub struct GhosttyScreen {
@@ -153,6 +154,69 @@ impl GhosttyScreen {
         }
     }
 
+    /// The character AND its style at (x, y). A single grid-ref lookup feeds both the
+    /// codepoint and the cell style, so this is the path the compositor blits through
+    /// (color/attributes preserved). Out-of-range or any FFI failure degrades to a
+    /// default-styled `' '`, mirroring `cell`.
+    pub fn styled_cell(&self, x: u16, y: u16) -> (char, CellStyle) {
+        if x >= self.cols || y >= self.rows {
+            return (' ', CellStyle::default());
+        }
+        // SAFETY: same ACTIVE-screen point + sized GhosttyGridRef contract as `cell`;
+        // all out-params are valid; every error path falls back to a default cell.
+        unsafe {
+            let point = sys::GhosttyPoint {
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+                value: sys::GhosttyPointValue {
+                    coordinate: sys::GhosttyPointCoordinate { x, y: y as u32 },
+                },
+            };
+            let mut gref: sys::GhosttyGridRef = mem::zeroed();
+            gref.size = mem::size_of::<sys::GhosttyGridRef>();
+            if sys::ghostty_terminal_grid_ref(self.term, point, &mut gref) != 0 {
+                return (' ', CellStyle::default());
+            }
+
+            // Codepoint.
+            let mut ch = ' ';
+            let mut cell: sys::GhosttyCell = 0;
+            if sys::ghostty_grid_ref_cell(&gref, &mut cell) == 0 {
+                let mut cp: u32 = 0;
+                if sys::ghostty_cell_get(
+                    cell,
+                    sys::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT,
+                    (&raw mut cp).cast(),
+                ) == 0
+                {
+                    ch = char::from_u32(cp)
+                        .filter(|c| !c.is_control())
+                        .unwrap_or(' ');
+                }
+            }
+
+            // Style (fg/bg color + text attributes).
+            let mut gstyle: sys::GhosttyStyle = mem::zeroed();
+            gstyle.size = mem::size_of::<sys::GhosttyStyle>();
+            let style = if sys::ghostty_grid_ref_style(&gref, &mut gstyle) == 0 {
+                CellStyle {
+                    fg: style_color(gstyle.fg_color),
+                    bg: style_color(gstyle.bg_color),
+                    bold: gstyle.bold,
+                    italic: gstyle.italic,
+                    faint: gstyle.faint,
+                    underline: gstyle.underline != 0,
+                    blink: gstyle.blink,
+                    inverse: gstyle.inverse,
+                    strikethrough: gstyle.strikethrough,
+                }
+            } else {
+                CellStyle::default()
+            };
+
+            (ch, style)
+        }
+    }
+
     pub fn cursor(&self) -> (u16, u16) {
         let mut cx: u16 = 0;
         let mut cy: u16 = 0;
@@ -202,6 +266,23 @@ impl GhosttyScreen {
     }
 }
 
+/// Map a libghostty-vt cell color to our `Color`. `NONE` (and any unknown tag) becomes
+/// `Default` so the client renders it with its own terminal theme; palette indices and
+/// RGB are preserved distinctly (we re-emit `38;5;n` vs `38;2;r;g;b`).
+fn style_color(c: sys::GhosttyStyleColor) -> Color {
+    match c.tag {
+        // SAFETY: the union member is selected by `tag`, per the C API contract.
+        sys::GhosttyStyleColorTag_GHOSTTY_STYLE_COLOR_PALETTE => {
+            Color::Palette(unsafe { c.value.palette })
+        }
+        sys::GhosttyStyleColorTag_GHOSTTY_STYLE_COLOR_RGB => {
+            let rgb = unsafe { c.value.rgb };
+            Color::Rgb(rgb.r, rgb.g, rgb.b)
+        }
+        _ => Color::Default,
+    }
+}
+
 impl Drop for GhosttyScreen {
     fn drop(&mut self) {
         // SAFETY: `term` was created by `ghostty_terminal_new` and is freed exactly
@@ -239,6 +320,42 @@ mod tests {
         let mut s = GhosttyScreen::new(5, 2);
         s.feed(b"x");
         assert_eq!(s.cell(99, 99), ' ');
+    }
+
+    #[test]
+    fn styled_cell_carries_truecolor_fg_and_bold() {
+        let mut s = GhosttyScreen::new(10, 2);
+        // SGR: bold + 24-bit fg (10,20,30), then 'X'.
+        s.feed(b"\x1b[1;38;2;10;20;30mX");
+        let (ch, style) = s.styled_cell(0, 0);
+        assert_eq!(ch, 'X');
+        assert!(style.bold, "bold attribute should survive");
+        assert_eq!(style.fg, Color::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn styled_cell_carries_palette_color() {
+        let mut s = GhosttyScreen::new(10, 2);
+        // SGR: 256-color palette index 4 as fg, then 'Z'.
+        s.feed(b"\x1b[38;5;4mZ");
+        let (ch, style) = s.styled_cell(0, 0);
+        assert_eq!(ch, 'Z');
+        assert_eq!(style.fg, Color::Palette(4));
+    }
+
+    #[test]
+    fn styled_cell_for_plain_text_is_default_styled() {
+        let mut s = GhosttyScreen::new(10, 2);
+        s.feed(b"y");
+        let (ch, style) = s.styled_cell(0, 0);
+        assert_eq!(ch, 'y');
+        assert_eq!(style, CellStyle::default());
+    }
+
+    #[test]
+    fn styled_cell_out_of_bounds_is_default() {
+        let s = GhosttyScreen::new(5, 2);
+        assert_eq!(s.styled_cell(99, 99), (' ', CellStyle::default()));
     }
 
     #[test]

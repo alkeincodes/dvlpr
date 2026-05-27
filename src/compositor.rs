@@ -15,6 +15,13 @@ pub trait PaneCells {
     fn rows(&self) -> u16;
     /// The character at (x, y); returns `' '` for out-of-range coordinates.
     fn cell(&self, x: u16, y: u16) -> char;
+    /// The character and its style at (x, y); returns a default-styled `' '` for
+    /// out-of-range coordinates. The default impl pairs `cell` with a default style,
+    /// so style-less stubs need not implement it; real screens override it to carry
+    /// color/attributes.
+    fn styled_cell(&self, x: u16, y: u16) -> (char, CellStyle) {
+        (self.cell(x, y), CellStyle::default())
+    }
     fn cursor(&self) -> (u16, u16);
 }
 
@@ -28,18 +35,64 @@ impl PaneCells for crate::ghostty::screen::GhosttyScreen {
     fn cell(&self, x: u16, y: u16) -> char {
         self.cell(x, y)
     }
+    fn styled_cell(&self, x: u16, y: u16) -> (char, CellStyle) {
+        self.styled_cell(x, y)
+    }
     fn cursor(&self) -> (u16, u16) {
         self.cursor()
     }
 }
 
-/// A composed full-viewport snapshot: the cell grid plus the global cursor
-/// position. Chars only (no color/attributes — matches the current cell model).
+/// A single cell's color. `Default` means "unset" — the client renders it with its
+/// own terminal theme's default fg/bg, rather than us forcing a concrete color.
+/// Palette and Rgb are kept distinct so we emit `38;5;n` vs `38;2;r;g;b` and let the
+/// user's terminal apply its own palette/theme to indexed colors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Color {
+    #[default]
+    Default,
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// The visual style of one cell: fg/bg color plus text-decoration flags. Mirrors the
+/// subset of libghostty-vt's cell style we re-emit as SGR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CellStyle {
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub faint: bool,
+    pub underline: bool,
+    pub blink: bool,
+    pub inverse: bool,
+    pub strikethrough: bool,
+}
+
+/// One composed cell: its character plus how it should be styled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StyledCell {
+    pub ch: char,
+    pub style: CellStyle,
+}
+
+impl Default for StyledCell {
+    fn default() -> Self {
+        StyledCell {
+            ch: ' ',
+            style: CellStyle::default(),
+        }
+    }
+}
+
+/// A composed full-viewport snapshot: the styled cell grid plus the global cursor
+/// position.
 #[derive(Clone)]
 pub struct Grid {
     pub cols: u16,
     pub rows: u16,
-    pub cells: Vec<char>,
+    pub cells: Vec<StyledCell>,
     /// Global cursor position as (col, row), already mapped into viewport space.
     pub cursor: (u16, u16),
 }
@@ -80,7 +133,7 @@ impl Compositor {
         );
         let cols = viewport.w;
         let rows = viewport.h;
-        let mut buf = vec![' '; cols as usize * rows as usize];
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
 
         let window_count = tab_names.len();
         let content = layout::content_area(viewport, window_count);
@@ -153,8 +206,53 @@ impl Compositor {
     }
 }
 
-/// Serialize a full frame: clear+home, every row joined by CRLF, then a cursor CUP.
-/// Identical to the bytes the old `Compositor::render` produced.
+/// Append a full SGR sequence that *resets then applies* `style`, so it is correct
+/// regardless of the previous pen (a default style emits a bare `\x1b[0m`). Building
+/// every change off a reset keeps the serializers stateless beyond a single "pen"
+/// comparison and avoids tracking which attributes need clearing.
+fn push_sgr(out: &mut Vec<u8>, style: &CellStyle) {
+    out.extend_from_slice(b"\x1b[0");
+    if style.bold {
+        out.extend_from_slice(b";1");
+    }
+    if style.faint {
+        out.extend_from_slice(b";2");
+    }
+    if style.italic {
+        out.extend_from_slice(b";3");
+    }
+    if style.underline {
+        out.extend_from_slice(b";4");
+    }
+    if style.blink {
+        out.extend_from_slice(b";5");
+    }
+    if style.inverse {
+        out.extend_from_slice(b";7");
+    }
+    if style.strikethrough {
+        out.extend_from_slice(b";9");
+    }
+    push_color(out, style.fg, true);
+    push_color(out, style.bg, false);
+    out.push(b'm');
+}
+
+/// Append the color portion of an SGR sequence. `Default` emits nothing (the leading
+/// reset in `push_sgr` already restored the terminal default).
+fn push_color(out: &mut Vec<u8>, color: Color, fg: bool) {
+    let base = if fg { 38 } else { 48 };
+    match color {
+        Color::Default => {}
+        Color::Palette(n) => out.extend_from_slice(format!(";{base};5;{n}").as_bytes()),
+        Color::Rgb(r, g, b) => out.extend_from_slice(format!(";{base};2;{r};{g};{b}").as_bytes()),
+    }
+}
+
+/// Serialize a full frame: clear+home, a reset to establish a known default pen, then
+/// every row joined by CRLF with minimal SGR transitions, a trailing reset if the pen
+/// ended non-default, and finally a cursor CUP. For all-default content this adds only
+/// the single leading `\x1b[0m` over the old char-only format.
 pub fn serialize_full(grid: &Grid) -> Vec<u8> {
     debug_assert_eq!(
         grid.cells.len(),
@@ -164,26 +262,42 @@ pub fn serialize_full(grid: &Grid) -> Vec<u8> {
     let cols = grid.cols;
     let rows = grid.rows;
     let mut out = Vec::with_capacity(grid.cells.len() * 2 + rows as usize * 2 + 16);
-    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    // Clear+home, then reset SGR so the frame paints from a known default pen
+    // regardless of any leftover style on the client.
+    out.extend_from_slice(b"\x1b[2J\x1b[H\x1b[0m");
+    let mut pen = CellStyle::default();
     let mut tmp = [0u8; 4];
     for y in 0..rows {
         if y > 0 {
             out.extend_from_slice(b"\r\n");
         }
         for x in 0..cols {
-            let ch = grid.cells[y as usize * cols as usize + x as usize];
-            out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            let cell = &grid.cells[y as usize * cols as usize + x as usize];
+            if cell.style != pen {
+                push_sgr(&mut out, &cell.style);
+                pen = cell.style;
+            }
+            out.extend_from_slice(cell.ch.encode_utf8(&mut tmp).as_bytes());
         }
+    }
+    // Leave the client's pen at default so the next frame (esp. a diff) can assume it.
+    if pen != CellStyle::default() {
+        out.extend_from_slice(b"\x1b[0m");
     }
     let (gx, gy) = grid.cursor;
     out.extend_from_slice(format!("\x1b[{};{}H", gy + 1, gx + 1).as_bytes());
     out
 }
 
-/// Serialize a per-row diff: for each row whose cells changed, a CUP to that row's
-/// start followed by the whole row; then a trailing cursor CUP if any row was
-/// redrawn (row writes move the cursor) or the cursor itself moved. Empty when
-/// nothing changed. `prev` and `next` MUST have the same dimensions.
+/// Serialize a per-row diff: for each row whose cells changed (character OR style), a
+/// CUP to that row's start followed by the whole row, with SGR emitted only when a
+/// cell's style differs from the running pen. The pen is tracked continuously across
+/// redrawn rows (SGR persists across cursor jumps in the terminal, and unredrawn rows
+/// keep their already-rendered attributes); it starts at default because every frame
+/// leaves the client's pen at default. A trailing reset restores that invariant if any
+/// styled cell was emitted; then a cursor CUP if any row was redrawn or the cursor
+/// moved. Empty when nothing changed. For all-default content this is byte-identical to
+/// the old char-only diff. `prev` and `next` MUST have the same dimensions.
 pub fn diff_rows(prev: &Grid, next: &Grid) -> Vec<u8> {
     debug_assert_eq!(prev.dims(), next.dims(), "diff_rows requires equal dims");
     debug_assert_eq!(
@@ -194,15 +308,25 @@ pub fn diff_rows(prev: &Grid, next: &Grid) -> Vec<u8> {
     let cols = next.cols as usize;
     let mut out = Vec::new();
     let mut tmp = [0u8; 4];
+    let mut pen = CellStyle::default();
     for y in 0..next.rows as usize {
         let lo = y * cols;
         let hi = lo + cols;
         if prev.cells[lo..hi] != next.cells[lo..hi] {
             out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
-            for &ch in &next.cells[lo..hi] {
-                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            for cell in &next.cells[lo..hi] {
+                if cell.style != pen {
+                    push_sgr(&mut out, &cell.style);
+                    pen = cell.style;
+                }
+                out.extend_from_slice(cell.ch.encode_utf8(&mut tmp).as_bytes());
             }
         }
+    }
+    // Restore the default-pen invariant for the next frame (only reachable when a row
+    // was redrawn, so `out` is already non-empty).
+    if pen != CellStyle::default() {
+        out.extend_from_slice(b"\x1b[0m");
     }
     if !out.is_empty() || prev.cursor != next.cursor {
         let (gx, gy) = next.cursor;
@@ -234,7 +358,7 @@ pub fn fit(src: &Grid, cols: u16, rows: u16) -> Grid {
     let copy_w = cols.min(src.cols);
     let copy_h = rows.min(src.rows);
 
-    let mut cells = vec![' '; cols as usize * rows as usize];
+    let mut cells = vec![StyledCell::default(); cols as usize * rows as usize];
     for j in 0..copy_h {
         for i in 0..copy_w {
             let src_idx = j as usize * src.cols as usize + i as usize;
@@ -270,15 +394,17 @@ fn lookup<'a>(panes: &'a [(PaneId, &'a dyn PaneCells)], id: PaneId) -> Option<&'
     panes.iter().find(|(pid, _)| *pid == id).map(|(_, p)| *p)
 }
 
-/// Copy a pane's cells into `buf` (a `cols`-wide grid) at `rect`'s offset.
-fn blit_pane(buf: &mut [char], cols: u16, rect: Rect, pane: &dyn PaneCells) {
+/// Copy a pane's styled cells into `buf` (a `cols`-wide grid) at `rect`'s offset.
+fn blit_pane(buf: &mut [StyledCell], cols: u16, rect: Rect, pane: &dyn PaneCells) {
     for y in 0..rect.h {
         for x in 0..rect.w {
             let bx = rect.x + x;
             let by = rect.y + y;
             let idx = by as usize * cols as usize + bx as usize;
             if idx < buf.len() {
-                buf[idx] = pane.cell(x, y); // pane.cell returns ' ' for out-of-range
+                // styled_cell returns a default-styled ' ' for out-of-range.
+                let (ch, style) = pane.styled_cell(x, y);
+                buf[idx] = StyledCell { ch, style };
             }
         }
     }
@@ -287,7 +413,7 @@ fn blit_pane(buf: &mut [char], cols: u16, rect: Rect, pane: &dyn PaneCells) {
 /// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
 /// focused pane). Junctions where dividers cross are simple last-write-wins
 /// overwrites (proper `┼` junctions are deferred polish).
-fn draw_divider(buf: &mut [char], cols: u16, d: &layout::Divider, heavy: bool) {
+fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool) {
     let glyph = match (d.dir, heavy) {
         (SplitDir::Vertical, false) => '│',
         (SplitDir::Vertical, true) => '┃',
@@ -298,7 +424,11 @@ fn draw_divider(buf: &mut [char], cols: u16, d: &layout::Divider, heavy: bool) {
         for x in d.rect.x..d.rect.x + d.rect.w {
             let idx = y as usize * cols as usize + x as usize;
             if idx < buf.len() {
-                buf[idx] = glyph;
+                // Chrome (dividers) is unstyled; overwrite any pane style underneath.
+                buf[idx] = StyledCell {
+                    ch: glyph,
+                    style: CellStyle::default(),
+                };
             }
         }
     }
@@ -327,7 +457,7 @@ fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
 /// Draw the session-name prefix at the row's left, then each tab region's label at
 /// its `x_start` (the same x-ranges hit-testing uses). The prefix is not clickable.
 fn draw_tabs(
-    buf: &mut [char],
+    buf: &mut [StyledCell],
     cols: u16,
     ty: u16,
     session_name: &str,
@@ -339,7 +469,10 @@ fn draw_tabs(
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = ch;
+            buf[idx] = StyledCell {
+                ch,
+                style: CellStyle::default(),
+            };
         }
     }
     // (the two-space gap is left blank; regions' x_start already accounts for it)
@@ -351,7 +484,10 @@ fn draw_tabs(
             }
             let idx = ty as usize * cols as usize + x;
             if idx < buf.len() {
-                buf[idx] = ch;
+                buf[idx] = StyledCell {
+                    ch,
+                    style: CellStyle::default(),
+                };
             }
         }
     }
@@ -398,6 +534,19 @@ mod tests {
         }
     }
 
+    /// A default-styled cell, for terse grid literals in tests.
+    fn sc(ch: char) -> StyledCell {
+        StyledCell {
+            ch,
+            style: CellStyle::default(),
+        }
+    }
+
+    /// A row of default-styled cells from a `&str`.
+    fn scs(s: &str) -> Vec<StyledCell> {
+        s.chars().map(sc).collect()
+    }
+
     #[test]
     fn compositor_constructs() {
         let _c = Compositor::new();
@@ -407,7 +556,7 @@ mod tests {
     fn blit_copies_cells_at_offset() {
         // 4x3 viewport buffer, blit a 2x2 pane "ab"/"cd" at offset (1,1).
         let cols: u16 = 4;
-        let mut buf = vec![' '; 4 * 3];
+        let mut buf = vec![StyledCell::default(); 4 * 3];
         let pane = StubScreen::new(2, 2, &["ab", "cd"], (0, 0));
         blit_pane(
             &mut buf,
@@ -422,11 +571,11 @@ mod tests {
         );
         let at = |r: usize, c: usize| r * cols as usize + c;
         // Row 1: positions 1,2 == 'a','b'. Row 2: positions 1,2 == 'c','d'.
-        assert_eq!(buf[at(1, 1)], 'a');
-        assert_eq!(buf[at(1, 2)], 'b');
-        assert_eq!(buf[at(2, 1)], 'c');
-        assert_eq!(buf[at(2, 2)], 'd');
-        assert_eq!(buf[at(0, 0)], ' '); // untouched cell stays blank
+        assert_eq!(buf[at(1, 1)].ch, 'a');
+        assert_eq!(buf[at(1, 2)].ch, 'b');
+        assert_eq!(buf[at(2, 1)].ch, 'c');
+        assert_eq!(buf[at(2, 2)].ch, 'd');
+        assert_eq!(buf[at(0, 0)].ch, ' '); // untouched cell stays blank
     }
 
     use crate::layout::Divider;
@@ -434,7 +583,7 @@ mod tests {
     #[test]
     fn draw_divider_fills_with_light_or_heavy_glyph() {
         let cols: u16 = 5;
-        let mut buf = vec![' '; 5 * 2];
+        let mut buf = vec![StyledCell::default(); 5 * 2];
         // Vertical divider, 1 wide x 2 tall, at x=2.
         let d = Divider {
             rect: Rect {
@@ -448,10 +597,10 @@ mod tests {
         };
         let at = |r: usize, c: usize| r * cols as usize + c;
         draw_divider(&mut buf, cols, &d, false);
-        assert_eq!(buf[at(0, 2)], '│');
-        assert_eq!(buf[at(1, 2)], '│');
+        assert_eq!(buf[at(0, 2)].ch, '│');
+        assert_eq!(buf[at(1, 2)].ch, '│');
         draw_divider(&mut buf, cols, &d, true);
-        assert_eq!(buf[at(0, 2)], '┃'); // heavy
+        assert_eq!(buf[at(0, 2)].ch, '┃'); // heavy
     }
 
     #[test]
@@ -493,12 +642,14 @@ mod tests {
     #[test]
     fn draw_tabs_writes_labels_at_their_ranges() {
         let cols: u16 = 20;
-        let mut buf = vec![' '; 20 * 2];
+        let mut buf = vec![StyledCell::default(); 20 * 2];
         let regions = layout::tab_layout("s", &["a".to_string(), "b".to_string()], 0, false, cols);
         // Tab row is the last row (y = 1).
         draw_tabs(&mut buf, cols, 1, "s", &regions);
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
-        let row: String = (0..cols).map(|x| buf[cols as usize + x as usize]).collect();
+        let row: String = (0..cols)
+            .map(|x| buf[cols as usize + x as usize].ch)
+            .collect();
         // prefix "s" at x=0, gap at x=1,2; tabs start at x=3 ("s" + 2 spaces = 3).
         assert!(row.starts_with("s")); // session prefix
         assert!(row.contains("1:a*")); // active window 0 → 1-based label with '*'
@@ -534,7 +685,7 @@ mod tests {
         // Content area is h=1; pane row 0 ("ab ") fills it.
         // Bar row (y=1): "s  " (prefix at x=0, two blank spaces for the gap).
         // Cursor: pane rect {x:0,y:0,w:3,h:1}, pane cursor (1,0) -> global (1,0) -> "\x1b[1;2H".
-        assert_eq!(s, "\x1b[2J\x1b[Hab \r\ns  \x1b[1;2H");
+        assert_eq!(s, "\x1b[2J\x1b[H\x1b[0mab \r\ns  \x1b[1;2H");
     }
 
     #[test]
@@ -611,13 +762,13 @@ mod tests {
         let prev = Grid {
             cols: 4,
             rows: 2,
-            cells: vec!['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+            cells: scs("abcdefgh"),
             cursor: (0, 0),
         };
         let next = Grid {
             cols: 4,
             rows: 2,
-            cells: vec!['a', 'b', 'c', 'd', 'X', 'Y', 'Z', 'W'],
+            cells: scs("abcdXYZW"),
             cursor: (1, 1),
         };
         let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
@@ -631,7 +782,7 @@ mod tests {
         let g = Grid {
             cols: 2,
             rows: 1,
-            cells: vec!['a', 'b'],
+            cells: scs("ab"),
             cursor: (0, 0),
         };
         assert!(diff_rows(&g, &g).is_empty());
@@ -642,13 +793,13 @@ mod tests {
         let prev = Grid {
             cols: 2,
             rows: 1,
-            cells: vec!['a', 'b'],
+            cells: scs("ab"),
             cursor: (0, 0),
         };
         let next = Grid {
             cols: 2,
             rows: 1,
-            cells: vec!['a', 'b'],
+            cells: scs("ab"),
             cursor: (1, 0),
         };
         let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
@@ -695,21 +846,78 @@ mod tests {
         let prev = Grid {
             cols: 2,
             rows: 1,
-            cells: vec!['a', 'b'],
+            cells: scs("ab"),
             cursor: (0, 0),
         };
         let next = Grid {
             cols: 2,
             rows: 1,
-            cells: vec!['X', 'Y'],
+            cells: scs("XY"),
             cursor: (0, 0),
         };
         let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
         assert_eq!(out, "\x1b[1;1HXY\x1b[1;1H");
     }
 
+    #[test]
+    fn serialize_full_emits_sgr_for_styled_cells() {
+        // 2x1 grid: a bold red-fg 'A' followed by a default 'B'. The transition to 'B'
+        // re-emits a bare reset; the frame already ends at default so no trailing reset.
+        let red_bold = CellStyle {
+            fg: Color::Rgb(255, 0, 0),
+            bold: true,
+            ..CellStyle::default()
+        };
+        let grid = Grid {
+            cols: 2,
+            rows: 1,
+            cells: vec![
+                StyledCell {
+                    ch: 'A',
+                    style: red_bold,
+                },
+                StyledCell {
+                    ch: 'B',
+                    style: CellStyle::default(),
+                },
+            ],
+            cursor: (0, 0),
+        };
+        let s = String::from_utf8(serialize_full(&grid)).unwrap();
+        assert_eq!(
+            s,
+            "\x1b[2J\x1b[H\x1b[0m\x1b[0;1;38;2;255;0;0mA\x1b[0mB\x1b[1;1H"
+        );
+    }
+
+    #[test]
+    fn diff_rows_resets_pen_after_a_styled_change() {
+        // A cell gains a palette background: the diff emits the SGR, then a trailing reset
+        // so the next frame can assume a default pen.
+        let prev = Grid {
+            cols: 1,
+            rows: 1,
+            cells: vec![StyledCell::default()],
+            cursor: (0, 0),
+        };
+        let next = Grid {
+            cols: 1,
+            rows: 1,
+            cells: vec![StyledCell {
+                ch: ' ',
+                style: CellStyle {
+                    bg: Color::Palette(4),
+                    ..CellStyle::default()
+                },
+            }],
+            cursor: (0, 0),
+        };
+        let out = String::from_utf8(diff_rows(&prev, &next)).unwrap();
+        assert_eq!(out, "\x1b[1;1H\x1b[0;48;5;4m \x1b[0m\x1b[1;1H");
+    }
+
     fn grid(cols: u16, rows: u16, cells: &str, cursor: (u16, u16)) -> Grid {
-        let cells: Vec<char> = cells.chars().collect();
+        let cells = scs(cells);
         assert_eq!(
             cells.len(),
             cols as usize * rows as usize,
@@ -737,7 +945,10 @@ mod tests {
         let g = grid(2, 1, "ab", (0, 0));
         let f = fit(&g, 4, 3);
         assert_eq!((f.cols, f.rows), (4, 3));
-        assert_eq!(f.cells.iter().collect::<String>(), "     ab     ");
+        assert_eq!(
+            f.cells.iter().map(|c| c.ch).collect::<String>(),
+            "     ab     "
+        );
         assert_eq!(f.cursor, (1, 1));
     }
 
@@ -746,7 +957,7 @@ mod tests {
         let g = grid(4, 3, "abcdefghijkl", (3, 2));
         let f = fit(&g, 2, 1);
         assert_eq!((f.cols, f.rows), (2, 1));
-        assert_eq!(f.cells.iter().collect::<String>(), "ab");
+        assert_eq!(f.cells.iter().map(|c| c.ch).collect::<String>(), "ab");
         assert_eq!(f.cursor, (1, 0));
     }
 
@@ -755,7 +966,7 @@ mod tests {
         let g = grid(2, 3, "abcdef", (0, 2));
         let f = fit(&g, 4, 1);
         assert_eq!((f.cols, f.rows), (4, 1));
-        assert_eq!(f.cells.iter().collect::<String>(), " ab ");
+        assert_eq!(f.cells.iter().map(|c| c.ch).collect::<String>(), " ab ");
         assert_eq!(f.cursor, (1, 0));
     }
 

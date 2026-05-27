@@ -115,14 +115,16 @@ async fn until_full_frame_dims(r: &mut Reader, secs: u64, cols: u16, rows: u16) 
     false
 }
 
-/// Split a FULL frame (`\x1b[2J\x1b[H` + rows joined by `\r\n` + a trailing cursor CUP)
-/// into its content rows. `serialize_full` emits every cell, so each row is exactly the
-/// grid's width and the row count equals the grid's height. The composed grid carries no
-/// SGR, so the only remaining ESC after stripping the leading clear+home is the trailing
-/// CUP, which we cut off.
+/// Split a FULL frame (`\x1b[2J\x1b[H\x1b[0m` + rows joined by `\r\n` + a trailing
+/// cursor CUP) into its content rows. `serialize_full` emits every cell, so each row is
+/// exactly the grid's width and the row count equals the grid's height. The pane here
+/// (`stty size`) emits no color, so after stripping the leading clear+home+reset the only
+/// remaining ESC is the trailing CUP, which we cut off.
 fn full_frame_rows(data: &[u8]) -> Vec<String> {
     let s = String::from_utf8_lossy(data);
     let body = s.strip_prefix("\x1b[2J\x1b[H").unwrap_or(&s);
+    // serialize_full always resets the pen right after clear+home.
+    let body = body.strip_prefix("\x1b[0m").unwrap_or(body);
     let body = match body.rfind("\x1b[") {
         Some(i) => &body[..i],
         None => body,
