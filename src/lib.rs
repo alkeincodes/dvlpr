@@ -6,6 +6,7 @@ pub mod ghostty;
 pub mod input;
 pub mod layout;
 pub mod pane;
+pub mod procinfo;
 pub mod protocol;
 pub mod server;
 pub mod session;
