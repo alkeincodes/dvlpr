@@ -246,11 +246,17 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         }
     }
 
-    // Yield once to allow the per-client writer tasks to drain the `Closed`
-    // (or `Detach`) message from their channels to the socket before the
-    // current-thread runtime stops polling. Without this yield the runtime
-    // drops immediately after `block_on` returns and the spawned writer tasks
-    // are cancelled before they can flush.
+    // Best-effort teardown flush: yield once so the per-client writer tasks get a
+    // poll to drain the final `Closed`/`Detach` message to the socket before this
+    // function returns and (on the current-thread test runtime) the runtime drops,
+    // cancelling those spawned tasks. This is reliable for the small control
+    // messages we send here — they complete synchronously while the socket buffer
+    // has room — but it is NOT a deterministic flush: a large `Frame` (up to
+    // MAX_FRAME_BYTES) still queued ahead of `Closed` on a backpressured client
+    // could pend and be lost. A deterministic fix would track the writer
+    // `JoinHandle`s and await them after dropping the `frame_tx` senders; deferred
+    // as it touches the per-client lifecycle and risks a teardown hang if any
+    // sender clone outlives the loop. See known-limitations notes.
     tokio::task::yield_now().await;
 
     for runtime in session.shutdown() {
