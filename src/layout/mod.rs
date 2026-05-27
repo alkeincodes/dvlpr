@@ -240,9 +240,80 @@ pub fn first_leaf(node: &Node) -> PaneId {
     }
 }
 
+/// Set the `ratio` of the split reached by following `path` from the root,
+/// clamped to [0.05, 0.95] so neither child ever collapses to nothing. Returns
+/// false if the path does not lead to a split.
+pub fn set_ratio(node: &mut Node, path: &[Side], ratio: f32) -> bool {
+    let mut cur = node;
+    for side in path {
+        match cur {
+            Node::Split { first, second, .. } => {
+                cur = match side {
+                    Side::First => first,
+                    Side::Second => second,
+                };
+            }
+            Node::Leaf(_) => return false,
+        }
+    }
+    match cur {
+        Node::Split { ratio: r, .. } => {
+            *r = ratio.clamp(0.05, 0.95);
+            true
+        }
+        Node::Leaf(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_ratio_at_root_updates_the_split() {
+        let mut tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        assert!(set_ratio(&mut tree, &[], 0.7));
+        if let Node::Split { ratio, .. } = tree {
+            assert!((ratio - 0.7).abs() < 1e-6);
+        } else {
+            panic!("expected a split");
+        }
+    }
+
+    #[test]
+    fn set_ratio_follows_a_path_and_clamps() {
+        let mut tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }),
+            second: Box::new(Node::Leaf(3)),
+        };
+        // Path [First] reaches the inner horizontal split. 0.99 clamps to 0.95.
+        assert!(set_ratio(&mut tree, &[Side::First], 0.99));
+        if let Node::Split { first, .. } = &tree {
+            if let Node::Split { ratio, .. } = first.as_ref() {
+                assert!((ratio - 0.95).abs() < 1e-6);
+            } else {
+                panic!("expected inner split");
+            }
+        }
+    }
+
+    #[test]
+    fn set_ratio_on_a_bad_path_returns_false() {
+        let mut tree = Node::Leaf(1);
+        assert!(!set_ratio(&mut tree, &[Side::First], 0.5)); // leaf has no children
+    }
 
     #[test]
     fn closing_the_only_pane_returns_none() {
