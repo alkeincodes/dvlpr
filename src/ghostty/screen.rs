@@ -108,6 +108,24 @@ impl GhosttyScreen {
         }
         (cx.min(self.cols - 1), cy.min(self.rows - 1))
     }
+
+    pub fn render_ansi(&self) -> Vec<u8> {
+        let cells = self.cols as usize * self.rows as usize;
+        let mut out = Vec::with_capacity(cells + self.rows as usize * 2 + 32);
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        for y in 0..self.rows {
+            if y > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            for x in 0..self.cols {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(self.cell(x, y).encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        let (cx, cy) = self.cursor();
+        out.extend_from_slice(format!("\x1b[{};{}H", cy + 1, cx + 1).as_bytes());
+        out
+    }
 }
 
 impl Drop for GhosttyScreen {
@@ -164,5 +182,23 @@ mod tests {
         assert_eq!(s.cell(1, 1), 'd');
         let (_cx, cy) = s.cursor();
         assert_eq!(cy, 1);
+    }
+
+    fn row_text(s: &GhosttyScreen, y: u16) -> String {
+        (0..s.cols()).map(|x| s.cell(x, y)).collect()
+    }
+
+    #[test]
+    fn render_ansi_matches_phase1_full_frame_format() {
+        let mut s = GhosttyScreen::new(3, 2);
+        s.feed(b"ab\r\ncd");
+        let out = String::from_utf8(s.render_ansi()).unwrap();
+        assert!(out.starts_with("\x1b[2J\x1b[H"));
+        assert_eq!(row_text(&s, 0), "ab ");
+        assert_eq!(row_text(&s, 1), "cd ");
+        assert!(out.contains("ab "));
+        assert!(out.contains("cd "));
+        let (cx, cy) = s.cursor();
+        assert!(out.ends_with(&format!("\x1b[{};{}H", cy + 1, cx + 1)));
     }
 }
