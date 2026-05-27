@@ -109,6 +109,16 @@ impl GhosttyScreen {
         (cx.min(self.cols - 1), cy.min(self.rows - 1))
     }
 
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        // SAFETY: `term` is valid; pixel sizes of 0 are accepted for cell-based VT.
+        let rc = unsafe { sys::ghostty_terminal_resize(self.term, cols, rows, 0, 0) };
+        debug_assert!(rc == 0, "ghostty_terminal_resize failed (rc={rc})");
+        self.cols = cols;
+        self.rows = rows;
+    }
+
     pub fn render_ansi(&self) -> Vec<u8> {
         let cells = self.cols as usize * self.rows as usize;
         let mut out = Vec::with_capacity(cells + self.rows as usize * 2 + 32);
@@ -200,5 +210,19 @@ mod tests {
         assert!(out.contains("cd "));
         let (cx, cy) = s.cursor();
         assert!(out.ends_with(&format!("\x1b[{};{}H", cy + 1, cx + 1)));
+    }
+
+    #[test]
+    fn resize_updates_dimensions_and_keeps_rendering() {
+        let mut s = GhosttyScreen::new(10, 4);
+        s.feed(b"hello");
+        s.resize(4, 2);
+        assert_eq!(s.cols(), 4);
+        assert_eq!(s.rows(), 2);
+        assert_eq!(s.cell(0, 0), 'h');
+        let (cx, cy) = s.cursor();
+        assert!(cx < 4 && cy < 2);
+        let out = s.render_ansi();
+        assert!(out.starts_with(b"\x1b[2J\x1b[H"));
     }
 }
