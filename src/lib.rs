@@ -6,3 +6,4 @@ pub mod layout;
 pub mod pane;
 pub mod protocol;
 pub mod server;
+pub mod session;
