@@ -119,6 +119,47 @@ impl Session {
         self.compositor
             .render(viewport, &win.root, &names, self.active_window, win.focused, &refs)
     }
+
+    /// Write user input to the focused pane of the active window.
+    pub fn input(&self, bytes: &[u8]) {
+        if let Some(win) = self.windows.get(self.active_window) {
+            if let Some(pane) = self.panes.get(&win.focused) {
+                pane.runtime.write_input(bytes);
+            }
+        }
+    }
+
+    /// Resize the viewport: recompute every pane's rect (across all windows) and
+    /// resize each pane's PTY + screen to match, draining any size-report replies.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        // Clamp to at least 1x1 so a 0-sized client resize can't produce a
+        // degenerate viewport (matches the prior single-screen behavior).
+        self.cols = cols.max(1);
+        self.rows = rows.max(1);
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: self.cols,
+            h: self.rows,
+        };
+        let content = layout::content_area(viewport, self.windows.len());
+        let mut targets: Vec<(PaneId, Rect)> = Vec::new();
+        for win in &self.windows {
+            targets.extend(layout::pane_rects(&win.root, content));
+        }
+        for (id, rect) in targets {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                let w = rect.w.max(1);
+                let h = rect.h.max(1);
+                pane.runtime.resize(w, h);
+                pane.screen.resize(w, h);
+                let replies = pane.screen.take_pty_writes();
+                if !replies.is_empty() {
+                    pane.runtime.write_input(&replies);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +193,32 @@ mod tests {
         assert!(found, "expected a rendered frame containing READY");
         // One window => no tab bar => same full-frame shape as before.
         assert!(session.render().starts_with(b"\x1b[2J\x1b[H"));
+        // Tear the pane down off-loop rather than dropping a live runtime inline.
+        // The test module can see Session's private fields, so this works without
+        // `pane_exited` (which is implemented and exercised in Task 4).
+        if let Some(p) = session.panes.remove(&pane_id) {
+            p.runtime.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn input_and_resize_do_not_panic_and_keep_rendering() {
+        let (mut session, pane_id, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            10,
+        )
+        .expect("session");
+
+        session.input(b"echo hi\n"); // routed to the focused pane's PTY
+        session.resize(20, 6); // resizes the pane's PTY + screen
+        let frame = session.render();
+        assert!(frame.starts_with(b"\x1b[2J\x1b[H"));
+        // The rendered frame is sized to the new viewport: 6 rows => 5 CRLF
+        // separators between the 6 content rows.
+        let crlfs = frame.windows(2).filter(|w| w == b"\r\n").count();
+        assert_eq!(crlfs, 5);
         // Tear the pane down off-loop rather than dropping a live runtime inline.
         // The test module can see Session's private fields, so this works without
         // `pane_exited` (which is implemented and exercised in Task 4).
