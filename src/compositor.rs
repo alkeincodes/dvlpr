@@ -137,7 +137,11 @@ impl Compositor {
 
         let window_count = tab_names.len();
         let content = layout::content_area(viewport, window_count);
-        let rects = layout::pane_rects(root, content);
+        let rects = if zoomed {
+            vec![(focused, content)]
+        } else {
+            layout::pane_rects(root, content)
+        };
 
         // Panes.
         for (id, rect) in &rects {
@@ -146,11 +150,13 @@ impl Compositor {
             }
         }
 
-        // Dividers (heavy on the focused pane's borders).
+        // Dividers (skipped entirely while zoomed — only one pane is shown).
         let focused_rect = rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r);
-        for d in layout::dividers(root, content) {
-            let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
-            draw_divider(&mut buf, cols, &d, heavy);
+        if !zoomed {
+            for d in layout::dividers(root, content) {
+                let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
+                draw_divider(&mut buf, cols, &d, heavy);
+            }
         }
 
         // Status/tab bar (always present): session prefix at the left, then tabs.

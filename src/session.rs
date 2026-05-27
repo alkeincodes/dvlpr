@@ -146,8 +146,12 @@ impl Session {
     fn relayout_all(&mut self) {
         let content = layout::content_area(self.viewport(), self.windows.len());
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
-        for win in &self.windows {
-            targets.extend(layout::pane_rects(&win.root, content));
+        for (wi, win) in self.windows.iter().enumerate() {
+            if wi == self.active_window && win.zoomed {
+                targets.push((win.focused, content));
+            } else {
+                targets.extend(layout::pane_rects(&win.root, content));
+            }
         }
         for (id, rect) in targets {
             if let Some(pane) = self.panes.get_mut(&id) {
@@ -243,22 +247,44 @@ impl Session {
         self.active_window
     }
 
+    /// Clear the active window's zoom flag (called before any layout change so the
+    /// user never lands in a "split happened but I can't see it" state).
+    fn unzoom_active(&mut self) {
+        if let Some(win) = self.windows.get_mut(self.active_window) {
+            win.zoomed = false;
+        }
+    }
+
     /// Apply a structural command, returning the side effects the run loop must
     /// perform. Marks nothing dirty itself — the caller repaints after applying.
     pub fn apply_command(&mut self, cmd: Command) -> CommandEffect {
         let mut eff = CommandEffect::default();
         match cmd {
-            Command::SplitHorizontal => self.split_focused(SplitDir::Horizontal, &mut eff),
-            Command::SplitVertical => self.split_focused(SplitDir::Vertical, &mut eff),
-            Command::ClosePane => eff.closed = self.close_focused(),
-            Command::NewWindow => self.new_window(&mut eff),
+            Command::SplitHorizontal => {
+                self.unzoom_active();
+                self.split_focused(SplitDir::Horizontal, &mut eff)
+            }
+            Command::SplitVertical => {
+                self.unzoom_active();
+                self.split_focused(SplitDir::Vertical, &mut eff)
+            }
+            Command::ClosePane => {
+                self.unzoom_active();
+                eff.closed = self.close_focused()
+            }
+            Command::NewWindow => {
+                self.unzoom_active(); // leaving the current window
+                self.new_window(&mut eff)
+            }
             Command::NextWindow => {
                 if !self.windows.is_empty() {
+                    self.unzoom_active();
                     self.active_window = (self.active_window + 1) % self.windows.len();
                 }
             }
             Command::PrevWindow => {
                 if !self.windows.is_empty() {
+                    self.unzoom_active();
                     let n = self.windows.len();
                     self.active_window = (self.active_window + n - 1) % n;
                 }
@@ -267,11 +293,17 @@ impl Session {
                 if n >= 1 {
                     let idx = n - 1;
                     if idx < self.windows.len() {
+                        self.unzoom_active();
                         self.active_window = idx;
                     }
                 }
             }
-            Command::ToggleZoom => {} // implemented in the zoom task
+            Command::ToggleZoom => {
+                if let Some(win) = self.windows.get_mut(self.active_window) {
+                    win.zoomed = !win.zoomed;
+                }
+                self.relayout_all();
+            }
             Command::Detach => eff.detach = true,
         }
         eff
@@ -415,10 +447,13 @@ impl Session {
         self.windows.is_empty()
     }
 
-    /// The (pane id, rect) list for the active window's panes (content area).
+    /// The (pane id, rect) list for the active window's panes (content area). When
+    /// the active window is zoomed, this is just the focused pane at the full
+    /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
         let content = layout::content_area(self.viewport(), self.windows.len());
         match self.windows.get(self.active_window) {
+            Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
             None => Vec::new(),
         }
@@ -454,6 +489,7 @@ impl Session {
                     }
                     layout::Hit::Tab(idx) => {
                         if idx < self.windows.len() {
+                            self.unzoom_active();
                             self.active_window = idx;
                         }
                         *drag = None;
@@ -477,18 +513,34 @@ impl Session {
             return layout::Hit::None;
         };
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let zoomed = self
-            .windows
-            .get(self.active_window)
-            .map(|w| w.zoomed)
-            .unwrap_or(false);
         let tabs = layout::tab_layout(
             &self.session_name,
             &names,
             self.active_window,
-            zoomed,
+            win.zoomed,
             self.cols,
         );
+        if win.zoomed {
+            if col == 0 || row == 0 {
+                return layout::Hit::None;
+            }
+            let (x, y) = (col - 1, row - 1);
+            if let Some(ty) = layout::tab_row(self.viewport(), self.windows.len()) {
+                if y == ty {
+                    for t in &tabs {
+                        if x >= t.x_start && x <= t.x_end {
+                            return layout::Hit::Tab(t.window);
+                        }
+                    }
+                    return layout::Hit::None;
+                }
+            }
+            let content = layout::content_area(self.viewport(), self.windows.len());
+            if content.contains(x, y) {
+                return layout::Hit::Pane(win.focused);
+            }
+            return layout::Hit::None;
+        }
         layout::hit_test(
             &win.root,
             self.viewport(),
@@ -497,6 +549,11 @@ impl Session {
             col,
             row,
         )
+    }
+
+    #[cfg(test)]
+    pub fn hit_for_test(&self, col: u16, row: u16) -> layout::Hit {
+        self.hit(col, row)
     }
 
     /// Refresh every window's name from its focused pane's foreground process.
@@ -917,6 +974,69 @@ mod tests {
         assert!(!session.refresh_window_names(|_pid| Some("claude".to_string())));
         // Resolver returns None: keep current name -> false.
         assert!(!session.refresh_window_names(|_pid| None));
+    }
+
+    #[tokio::test]
+    async fn zoom_shows_only_focused_pane_then_restores() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::SplitVertical); // now two panes
+        assert_eq!(session.active_pane_rects().len(), 2);
+
+        session.apply_command(Command::ToggleZoom);
+        // Zoomed: exactly one rect, the focused pane, at the full content area.
+        let zoomed = session.active_pane_rects();
+        assert_eq!(zoomed.len(), 1);
+        assert_eq!(zoomed[0].0, session.focused_pane());
+        let content = crate::layout::content_area(
+            crate::layout::Rect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 12,
+            },
+            session.window_count(),
+        );
+        assert_eq!(zoomed[0].1, content);
+
+        session.apply_command(Command::ToggleZoom); // unzoom
+        assert_eq!(session.active_pane_rects().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn split_auto_unzooms() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::SplitVertical);
+        session.apply_command(Command::ToggleZoom);
+        assert_eq!(session.active_pane_rects().len(), 1); // zoomed
+        session.apply_command(Command::SplitVertical); // layout change -> unzoom
+        assert!(session.active_pane_rects().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn window_switch_auto_unzooms() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::SplitVertical);
+        session.apply_command(Command::ToggleZoom);
+        assert_eq!(session.active_pane_rects().len(), 1);
+        session.apply_command(Command::NewWindow); // creates + switches to window 2
+        session.apply_command(Command::SelectWindow(1)); // back to window 1
+                                                         // Window 1 was auto-unzoomed when we switched away.
+        assert!(session.active_pane_rects().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn hit_while_zoomed_resolves_body_to_focused_pane() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::SplitVertical);
+        session.apply_command(Command::ToggleZoom);
+        // A click in the right half of the body (where the sibling used to be)
+        // must resolve to the focused pane, not the hidden sibling or a divider.
+        let hit = session.hit_for_test(35, 5);
+        assert_eq!(hit, crate::layout::Hit::Pane(session.focused_pane()));
     }
 
     #[tokio::test]
