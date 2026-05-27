@@ -85,7 +85,9 @@ impl GhosttyScreen {
             {
                 return ' ';
             }
-            char::from_u32(cp).filter(|c| !c.is_control()).unwrap_or(' ')
+            char::from_u32(cp)
+                .filter(|c| !c.is_control())
+                .unwrap_or(' ')
         }
     }
 
