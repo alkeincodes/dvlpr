@@ -23,6 +23,9 @@ const ESC: u8 = 0x1b;
 /// well-formed report is far shorter; this caps a malformed/runaway sequence so it
 /// can never buffer unbounded client input.
 const MAX_MOUSE_SEQ: usize = 32;
+/// Upper bound on a buffered non-mouse CSI sequence, so an unterminated `ESC [ …`
+/// can't buffer unbounded input before being flushed to the pane.
+const MAX_CSI_SEQ: usize = 32;
 
 /// A mouse button action decoded from an SGR report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,15 +171,21 @@ impl InputParser {
                 }
             }
             State::NCsi => {
-                if b == b'<' {
+                // The SGR mouse introducer is `ESC [ <`; `<` counts only as the
+                // first byte after `[` (pending is exactly `[ESC, '[']`, len 2).
+                if b == b'<' && self.pending.len() == 2 {
                     self.pending.push(b);
                     self.state = State::NMouse;
                 } else {
-                    // CSI that is not a mouse report (e.g. an arrow): forward the
-                    // whole `ESC [ <b>` to the pane unchanged.
                     self.pending.push(b);
-                    out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
-                    self.state = State::Ground;
+                    // A CSI final byte (0x40..=0x7e) ends the sequence; forward the
+                    // whole thing (params/intermediates included) to the pane
+                    // unchanged. Bound the buffer so a sequence that never
+                    // terminates can't grow without limit.
+                    if (0x40..=0x7e).contains(&b) || self.pending.len() >= MAX_CSI_SEQ {
+                        out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
+                        self.state = State::Ground;
+                    }
                 }
             }
             State::NMouse => {
@@ -274,6 +283,11 @@ fn parse_sgr(buf: &[u8]) -> Option<MouseEvent> {
     let x: u16 = it.next()?.parse().ok()?;
     let y: u16 = it.next()?.parse().ok()?;
     if it.next().is_some() {
+        return None;
+    }
+    // Ignore wheel/scroll events (Pb bit 6): out of scope this phase. Decoding them
+    // as button-0/1 presses would inject spurious clicks into focus/resize handling.
+    if b & 64 != 0 {
         return None;
     }
     let kind = if b & 32 != 0 {
@@ -476,5 +490,29 @@ mod tests {
             parse_all(&[0x01, 0x1b, b'[', b'C']),
             vec![InputEvent::Command(Command::SplitVertical)]
         );
+    }
+
+    #[test]
+    fn normal_mode_delete_key_passes_through() {
+        // ESC [ 3 ~ (Delete) must reach the pane as one intact sequence.
+        assert_eq!(
+            parse_all(b"\x1b[3~"),
+            vec![InputEvent::Pane(b"\x1b[3~".to_vec())]
+        );
+    }
+
+    #[test]
+    fn normal_mode_modified_arrow_passes_through() {
+        // ESC [ 1 ; 5 C (Ctrl+Right) — parameterized CSI, intact.
+        assert_eq!(
+            parse_all(b"\x1b[1;5C"),
+            vec![InputEvent::Pane(b"\x1b[1;5C".to_vec())]
+        );
+    }
+
+    #[test]
+    fn scroll_wheel_is_ignored() {
+        // ESC [ < 64 ; 5 ; 7 M (scroll up) produces no event this phase.
+        assert_eq!(parse_all(b"\x1b[<64;5;7M"), vec![]);
     }
 }
