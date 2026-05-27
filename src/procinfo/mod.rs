@@ -35,8 +35,20 @@ pub fn friendly_name(argv: &[String]) -> Option<String> {
         return None;
     }
     if RUNTIMES.contains(&exe) {
-        if let Some(script) = argv[1..].iter().find(|a| !a.starts_with('-')) {
-            return Some(strip_js_ext(basename(script)).to_string());
+        // Inline-code flags (`python -c`, `node -e`, `--eval`, …) take the NEXT arg as
+        // source code, not a script path. Naming the window from that would render
+        // arbitrary code — possibly secrets — into the status bar shown to every
+        // attached client, so fall back to the runtime name when we see one. A bare
+        // flag like `--inspect` is not an eval flag: skip it and keep scanning for the
+        // script path (e.g. `node --inspect app.js` → `app`).
+        const EVAL_FLAGS: &[&str] = &["-c", "-e", "--eval", "-p", "--print"];
+        for a in &argv[1..] {
+            if EVAL_FLAGS.contains(&a.as_str()) {
+                return Some(exe.to_string());
+            }
+            if !a.starts_with('-') {
+                return Some(strip_js_ext(basename(a)).to_string());
+            }
         }
     }
     Some(exe.to_string())
@@ -177,6 +189,29 @@ mod tests {
         assert_eq!(friendly_name(&s(&["node"])), Some("node".into()));
         assert_eq!(friendly_name(&[]), None);
         assert_eq!(friendly_name(&s(&["-"])), None); // basename empty after dash strip
+    }
+
+    #[test]
+    fn inline_code_flags_fall_back_to_runtime_name_not_the_code() {
+        // -c/-e/--eval/... take the next arg as SOURCE CODE; never display it (it may
+        // contain secrets) and never let it leak into the status bar.
+        assert_eq!(
+            friendly_name(&s(&["python3", "-c", "print('token=hunter2')"])),
+            Some("python3".into())
+        );
+        assert_eq!(
+            friendly_name(&s(&["node", "-e", "console.log(SECRET)"])),
+            Some("node".into())
+        );
+        assert_eq!(
+            friendly_name(&s(&["ruby", "--eval", "puts ENV['KEY']"])),
+            Some("ruby".into())
+        );
+        // A non-eval flag is still skipped on the way to the real script path.
+        assert_eq!(
+            friendly_name(&s(&["node", "--inspect", "/x/app.js"])),
+            Some("app".into())
+        );
     }
 
     #[test]

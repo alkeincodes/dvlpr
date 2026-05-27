@@ -400,6 +400,17 @@ impl Session {
             Some(pane) => removed.push(pane.runtime),
             None => return removed, // already gone
         }
+        // If the exiting pane is in the active (possibly zoomed) window, unzoom so the
+        // surviving sibling layout becomes visible — parity with the `ClosePane` command.
+        // A pane dying in a *background* window must NOT disturb the active view, so this
+        // is scoped to the active window (the only one that can be zoomed anyway).
+        if self
+            .windows
+            .get(self.active_window)
+            .is_some_and(|w| layout::all_panes(&w.root).contains(&pane_id))
+        {
+            self.unzoom_active();
+        }
         let mut wi = 0;
         while wi < self.windows.len() {
             if layout::all_panes(&self.windows[wi].root).contains(&pane_id) {
@@ -553,6 +564,14 @@ impl Session {
     #[cfg(test)]
     pub fn hit_for_test(&self, col: u16, row: u16) -> layout::Hit {
         self.hit(col, row)
+    }
+
+    #[cfg(test)]
+    pub fn active_zoomed_for_test(&self) -> bool {
+        self.windows
+            .get(self.active_window)
+            .map(|w| w.zoomed)
+            .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -1028,6 +1047,36 @@ mod tests {
         assert_eq!(session.active_pane_rects().len(), 1); // zoomed
         session.apply_command(Command::SplitVertical); // layout change -> unzoom
         assert!(session.active_pane_rects().len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn focused_pane_exit_in_active_window_auto_unzooms() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        session.apply_command(Command::SplitVertical); // two panes in the active window
+        session.apply_command(Command::ToggleZoom);
+        assert!(session.active_zoomed_for_test());
+        // The focused pane's process exits on its own (not a ClosePane command).
+        let focused = session.focused_pane();
+        let _ = session.pane_exited(focused);
+        // Parity with ClosePane: the active window auto-unzooms so the survivor shows.
+        assert!(!session.active_zoomed_for_test());
+    }
+
+    #[tokio::test]
+    async fn background_window_pane_exit_does_not_unzoom_active() {
+        let (mut session, _first, _rx) =
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+        // Window 1 (index 0) gets a second pane; remember one of its pane ids.
+        session.apply_command(Command::SplitVertical);
+        let bg_pane = session.focused_pane();
+        // Switch to a new window (index 1) and zoom it.
+        session.apply_command(Command::NewWindow);
+        session.apply_command(Command::ToggleZoom);
+        assert!(session.active_zoomed_for_test());
+        // A pane in the BACKGROUND window exits — must not disturb the active zoom.
+        let _ = session.pane_exited(bg_pane);
+        assert!(session.active_zoomed_for_test());
     }
 
     #[tokio::test]
