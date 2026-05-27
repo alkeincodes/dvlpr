@@ -42,8 +42,12 @@ impl Drop for ChildKiller {
 /// CAUTION: dropping a `PaneRuntime` runs `ChildKiller::Drop`, which calls the
 /// blocking `wait()` syscall. Do not drop a `PaneRuntime` on a hot tokio worker
 /// where a multi-second `SIGKILL` delivery would stall the runtime. In Phase 1 the
-/// only drop happens at daemon teardown, which is acceptable; an async-safe
-/// teardown (`spawn_blocking` / dedicated thread) is a later-phase concern.
+/// only drop happens at daemon teardown, which is acceptable. Use
+/// `PaneRuntime::close(self)` to tear a pane down from async code: it moves this
+/// blocking drop into `spawn_blocking` (and so requires an active Tokio runtime
+/// context, which `run()` and `#[tokio::test]` both provide). Dropping a
+/// `PaneRuntime` directly still runs the blocking teardown inline, so only do
+/// that off the runtime (e.g. at process exit).
 pub struct PaneRuntime {
     master: Box<dyn MasterPty + Send>,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -144,6 +148,13 @@ impl PaneRuntime {
             pixel_height: 0,
         });
     }
+
+    /// Tear the pane down off the async runtime. `ChildKiller::Drop` performs a
+    /// blocking `kill()`+`wait()`, which must not run on a tokio worker, so move
+    /// the runtime into `spawn_blocking` and let it drop there.
+    pub fn close(self) {
+        tokio::task::spawn_blocking(move || drop(self));
+    }
 }
 
 fn default_shell() -> Vec<String> {
@@ -181,5 +192,22 @@ mod tests {
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("READY"), "got: {text:?}");
         drop(pane);
+    }
+
+    #[tokio::test]
+    async fn close_tears_down_without_blocking_the_runtime() {
+        let (pane, _rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "sleep 30".into()],
+            ".",
+            80,
+            24,
+        )
+        .expect("spawn pane");
+        // close() must move the blocking kill()+wait() off the async runtime and
+        // return promptly (it does not block on the child).
+        pane.close();
+        // Give the spawned blocking task a moment; the test completing without a
+        // hang/panic is the assertion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
