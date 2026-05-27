@@ -173,15 +173,13 @@ fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
         SplitDir::Vertical => {
             let dx = d.rect.x;
             let col_adjacent = dx == focused.x + focused.w || dx + 1 == focused.x;
-            let rows_overlap =
-                d.rect.y < focused.y + focused.h && focused.y < d.rect.y + d.rect.h;
+            let rows_overlap = d.rect.y < focused.y + focused.h && focused.y < d.rect.y + d.rect.h;
             col_adjacent && rows_overlap
         }
         SplitDir::Horizontal => {
             let dy = d.rect.y;
             let row_adjacent = dy == focused.y + focused.h || dy + 1 == focused.y;
-            let cols_overlap =
-                d.rect.x < focused.x + focused.w && focused.x < d.rect.x + d.rect.w;
+            let cols_overlap = d.rect.x < focused.x + focused.w && focused.x < d.rect.x + d.rect.w;
             row_adjacent && cols_overlap
         }
     }
@@ -257,7 +255,17 @@ mod tests {
         let cols: u16 = 4;
         let mut buf = vec![' '; 4 * 3];
         let pane = StubScreen::new(2, 2, &["ab", "cd"], (0, 0));
-        blit_pane(&mut buf, cols, Rect { x: 1, y: 1, w: 2, h: 2 }, &pane);
+        blit_pane(
+            &mut buf,
+            cols,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            &pane,
+        );
         let at = |r: usize, c: usize| r * cols as usize + c;
         // Row 1: positions 1,2 == 'a','b'. Row 2: positions 1,2 == 'c','d'.
         assert_eq!(buf[at(1, 1)], 'a');
@@ -275,7 +283,12 @@ mod tests {
         let mut buf = vec![' '; 5 * 2];
         // Vertical divider, 1 wide x 2 tall, at x=2.
         let d = Divider {
-            rect: Rect { x: 2, y: 0, w: 1, h: 2 },
+            rect: Rect {
+                x: 2,
+                y: 0,
+                w: 1,
+                h: 2,
+            },
             path: vec![],
             dir: SplitDir::Vertical,
         };
@@ -291,15 +304,35 @@ mod tests {
     fn divider_touches_detects_adjacency() {
         // Two panes side by side in a width-11 area: left x0..=4, divider x5, right x6..=10.
         let div = Divider {
-            rect: Rect { x: 5, y: 0, w: 1, h: 4 },
+            rect: Rect {
+                x: 5,
+                y: 0,
+                w: 1,
+                h: 4,
+            },
             path: vec![],
             dir: SplitDir::Vertical,
         };
-        let left = Rect { x: 0, y: 0, w: 5, h: 4 };
-        let right = Rect { x: 6, y: 0, w: 5, h: 4 };
+        let left = Rect {
+            x: 0,
+            y: 0,
+            w: 5,
+            h: 4,
+        };
+        let right = Rect {
+            x: 6,
+            y: 0,
+            w: 5,
+            h: 4,
+        };
         assert!(divider_touches(&div, left)); // divider is on left pane's right edge
         assert!(divider_touches(&div, right)); // divider is on right pane's left edge
-        let elsewhere = Rect { x: 0, y: 10, w: 5, h: 4 };
+        let elsewhere = Rect {
+            x: 0,
+            y: 10,
+            w: 5,
+            h: 4,
+        };
         assert!(!divider_touches(&div, elsewhere)); // no row overlap
     }
 
@@ -322,7 +355,12 @@ mod tests {
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(3, 2, &["ab", "cd"], (1, 0));
         let mut c = Compositor::new();
-        let vp = Rect { x: 0, y: 0, w: 3, h: 2 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 3,
+            h: 2,
+        };
         let out = c.render(vp, &tree, &["w0".to_string()], 0, 1, &[(1, &pane)]);
         let s = String::from_utf8(out).unwrap();
         // Clear+home prefix, the two rows joined by CRLF, then the cursor at the
@@ -342,9 +380,21 @@ mod tests {
         let left = StubScreen::new(3, 1, &["LLL"], (0, 0));
         let right = StubScreen::new(3, 1, &["RRR"], (0, 0));
         let mut c = Compositor::new();
-        let vp = Rect { x: 0, y: 0, w: 7, h: 1 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 7,
+            h: 1,
+        };
         // window 1 focused -> divider on its right edge is heavy.
-        let out = c.render(vp, &tree, &["w".to_string()], 0, 1, &[(1, &left), (2, &right)]);
+        let out = c.render(
+            vp,
+            &tree,
+            &["w".to_string()],
+            0,
+            1,
+            &[(1, &left), (2, &right)],
+        );
         let s = String::from_utf8(out).unwrap();
         // avail=6, first_w=3 (x0..2), divider x3, right x4..6.
         assert!(s.contains("LLL┃RRR")); // heavy divider because pane 1 is focused
@@ -355,7 +405,12 @@ mod tests {
         let tree = Node::Leaf(1);
         let pane = StubScreen::new(20, 1, &["hello"], (0, 0));
         let mut c = Compositor::new();
-        let vp = Rect { x: 0, y: 0, w: 20, h: 2 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 2,
+        };
         // Two windows -> the bottom row is a tab bar.
         let names = vec!["one".to_string(), "two".to_string()];
         let out = c.render(vp, &tree, &names, 1, 1, &[(1, &pane)]);
@@ -381,9 +436,21 @@ mod tests {
         let top = StubScreen::new(4, 1, &["topp"], (0, 0));
         let bottom = StubScreen::new(4, 1, &["bott"], (2, 0)); // cursor col 2
         let mut c = Compositor::new();
-        let vp = Rect { x: 0, y: 0, w: 4, h: 3 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 3,
+        };
         // h=3: avail=2, first_h=1 (y0), divider y1, second y2. Focus pane 2 (bottom).
-        let out = c.render(vp, &tree, &["w".to_string()], 0, 2, &[(1, &top), (2, &bottom)]);
+        let out = c.render(
+            vp,
+            &tree,
+            &["w".to_string()],
+            0,
+            2,
+            &[(1, &top), (2, &bottom)],
+        );
         let s = String::from_utf8(out).unwrap();
         // Bottom pane rect is {x0,y2}; its cursor (2,0) -> global (2,2) -> "\x1b[3;3H".
         assert!(s.ends_with("\x1b[3;3H"));
