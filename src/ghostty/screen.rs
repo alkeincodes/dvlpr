@@ -5,6 +5,7 @@
 //! Single-owner and `!Send`/`!Sync` (holds a raw pointer). All `unsafe` FFI is
 //! confined here; the public API is fully safe.
 
+use std::mem;
 use std::ptr;
 
 use crate::ghostty::sys;
@@ -44,6 +45,49 @@ impl GhosttyScreen {
     pub fn rows(&self) -> u16 {
         self.rows
     }
+
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // SAFETY: `term` is valid; `bytes` ptr+len describe a valid slice.
+        unsafe { sys::ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
+    }
+
+    pub fn cell(&self, x: u16, y: u16) -> char {
+        if x >= self.cols || y >= self.rows {
+            return ' ';
+        }
+        // SAFETY: an ACTIVE-screen point at (x, y); `gref.size` set per the API's
+        // sized-struct contract; all out-params are valid; errors fall back to space.
+        unsafe {
+            let point = sys::GhosttyPoint {
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+                value: sys::GhosttyPointValue {
+                    coordinate: sys::GhosttyPointCoordinate { x, y: y as u32 },
+                },
+            };
+            let mut gref: sys::GhosttyGridRef = mem::zeroed();
+            gref.size = mem::size_of::<sys::GhosttyGridRef>();
+            if sys::ghostty_terminal_grid_ref(self.term, point, &mut gref) != 0 {
+                return ' ';
+            }
+            let mut cell: sys::GhosttyCell = 0;
+            if sys::ghostty_grid_ref_cell(&gref, &mut cell) != 0 {
+                return ' ';
+            }
+            let mut cp: u32 = 0;
+            if sys::ghostty_cell_get(
+                cell,
+                sys::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT,
+                (&raw mut cp).cast(),
+            ) != 0
+            {
+                return ' ';
+            }
+            char::from_u32(cp).filter(|c| !c.is_control()).unwrap_or(' ')
+        }
+    }
 }
 
 impl Drop for GhosttyScreen {
@@ -66,5 +110,22 @@ mod tests {
         for _ in 0..16 {
             let _ = GhosttyScreen::new(40, 10);
         }
+    }
+
+    #[test]
+    fn feed_text_lands_in_cells() {
+        let mut s = GhosttyScreen::new(10, 3);
+        s.feed(b"hi");
+        assert_eq!(s.cell(0, 0), 'h');
+        assert_eq!(s.cell(1, 0), 'i');
+        assert_eq!(s.cell(2, 0), ' ');
+        assert_eq!(s.cell(0, 1), ' ');
+    }
+
+    #[test]
+    fn out_of_bounds_cell_is_space() {
+        let mut s = GhosttyScreen::new(5, 2);
+        s.feed(b"x");
+        assert_eq!(s.cell(99, 99), ' ');
     }
 }
