@@ -154,9 +154,84 @@ fn collect_dividers(node: &Node, area: Rect, path: &mut SplitPath, out: &mut Vec
     }
 }
 
+/// Replace the focused leaf with a split of (focused, new_id) at ratio 0.5.
+/// Returns true if the focused pane was found.
+pub fn split_pane(node: &mut Node, focused: PaneId, dir: SplitDir, new_id: PaneId) -> bool {
+    match node {
+        Node::Leaf(id) if *id == focused => {
+            let existing = std::mem::replace(node, Node::Leaf(focused));
+            *node = Node::Split {
+                dir,
+                ratio: 0.5,
+                first: Box::new(existing),
+                second: Box::new(Node::Leaf(new_id)),
+            };
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { first, second, .. } => {
+            split_pane(first, focused, dir, new_id) || split_pane(second, focused, dir, new_id)
+        }
+    }
+}
+
+/// Every pane id in the tree, in tree order.
+pub fn all_panes(node: &Node) -> Vec<PaneId> {
+    let mut out = Vec::new();
+    fn go(n: &Node, out: &mut Vec<PaneId>) {
+        match n {
+            Node::Leaf(id) => out.push(*id),
+            Node::Split { first, second, .. } => {
+                go(first, out);
+                go(second, out);
+            }
+        }
+    }
+    go(node, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_replaces_focused_leaf_with_a_split() {
+        let mut tree = Node::Leaf(1);
+        let ok = split_pane(&mut tree, 1, SplitDir::Horizontal, 2);
+        assert!(ok);
+        assert_eq!(
+            tree,
+            Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(2)),
+            }
+        );
+    }
+
+    #[test]
+    fn split_targets_the_focused_leaf_in_a_tree() {
+        let mut tree = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        let ok = split_pane(&mut tree, 2, SplitDir::Vertical, 3);
+        assert!(ok);
+        // Leaf 2 became a split of (2, 3).
+        assert_eq!(all_panes(&tree), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn split_unknown_pane_is_a_noop() {
+        let mut tree = Node::Leaf(1);
+        let ok = split_pane(&mut tree, 99, SplitDir::Vertical, 2);
+        assert!(!ok);
+        assert_eq!(tree, Node::Leaf(1));
+    }
 
     #[test]
     fn single_leaf_has_no_dividers() {
