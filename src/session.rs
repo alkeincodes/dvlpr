@@ -160,6 +160,54 @@ impl Session {
             }
         }
     }
+
+    /// Handle a pane's process exit: remove it from the pane map and from its
+    /// window's tree (collapsing the split into the sibling), close the window if
+    /// it becomes empty, and return the removed `PaneRuntime`(s) so the caller can
+    /// tear them down off the async runtime (via `PaneRuntime::close`). The pane id
+    /// is removed from the map FIRST, so any late output for it is dropped by `feed`.
+    pub fn pane_exited(&mut self, pane_id: PaneId) -> Vec<PaneRuntime> {
+        let mut removed = Vec::new();
+        match self.panes.remove(&pane_id) {
+            Some(pane) => removed.push(pane.runtime),
+            None => return removed, // already gone
+        }
+        let mut wi = 0;
+        while wi < self.windows.len() {
+            if layout::all_panes(&self.windows[wi].root).contains(&pane_id) {
+                // `Node::Leaf(0)` is a throwaway placeholder (id 0 is never live).
+                let root = std::mem::replace(&mut self.windows[wi].root, Node::Leaf(0));
+                match layout::close_pane(root, pane_id) {
+                    Some(new_root) => {
+                        self.windows[wi].focused = layout::first_leaf(&new_root);
+                        self.windows[wi].root = new_root;
+                        wi += 1;
+                    }
+                    None => {
+                        self.windows.remove(wi);
+                        // Keep `active_window` pointing at the same logical window:
+                        // removing a window BEFORE it shifts its index down by one.
+                        if self.active_window > wi {
+                            self.active_window -= 1;
+                        }
+                        // If the active window itself was the removed tail, clamp.
+                        if !self.windows.is_empty() && self.active_window >= self.windows.len() {
+                            self.active_window = self.windows.len() - 1;
+                        }
+                        // do not advance wi (the next window shifted into this slot)
+                    }
+                }
+            } else {
+                wi += 1;
+            }
+        }
+        removed
+    }
+
+    /// True when no windows remain (the daemon should shut down).
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +273,38 @@ mod tests {
         if let Some(p) = session.panes.remove(&pane_id) {
             p.runtime.close();
         }
+    }
+
+    #[tokio::test]
+    async fn pane_exit_removes_pane_and_empties_single_window_session() {
+        let (mut session, pane_id, mut rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "true".into()],
+            ".".into(),
+            40,
+            10,
+        )
+        .expect("session");
+
+        // Drain until the pane reports it exited.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(PaneOutput::Exited)) => break,
+                Ok(Some(_)) => continue,
+                _ => panic!("pane did not exit in time"),
+            }
+        }
+
+        let removed = session.pane_exited(pane_id);
+        assert_eq!(removed.len(), 1); // the exited pane's runtime is returned
+        assert!(session.is_empty()); // its only window collapsed away
+
+        // Tearing the returned runtime down off-loop must be safe.
+        for rt in removed {
+            rt.close();
+        }
+
+        // A second pane_exited for the same id is a harmless no-op.
+        assert!(session.pane_exited(pane_id).is_empty());
     }
 }
