@@ -64,7 +64,12 @@ impl Session {
             cwd,
         };
         // One window => no tab bar => the pane fills the whole viewport.
-        let (id, rx) = session.spawn_pane(Rect { x: 0, y: 0, w: cols, h: rows })?;
+        let (id, rx) = session.spawn_pane(Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        })?;
         session.windows.push(Window {
             name: "0".to_string(),
             root: Node::Leaf(id),
@@ -116,8 +121,14 @@ impl Session {
             .map(|(id, p)| (*id, &p.screen as &dyn PaneCells))
             .collect();
         let win = &self.windows[self.active_window];
-        self.compositor
-            .render(viewport, &win.root, &names, self.active_window, win.focused, &refs)
+        self.compositor.render(
+            viewport,
+            &win.root,
+            &names,
+            self.active_window,
+            win.focused,
+            &refs,
+        )
     }
 
     /// Write user input to the focused pane of the active window.

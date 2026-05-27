@@ -196,13 +196,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_tears_down_without_blocking_the_runtime() {
-        let (pane, _rx) = PaneRuntime::spawn(
-            &["sh".into(), "-c".into(), "sleep 30".into()],
-            ".",
-            80,
-            24,
-        )
-        .expect("spawn pane");
+        let (pane, _rx) =
+            PaneRuntime::spawn(&["sh".into(), "-c".into(), "sleep 30".into()], ".", 80, 24)
+                .expect("spawn pane");
         // close() must move the blocking kill()+wait() off the async runtime and
         // return promptly (it does not block on the child).
         pane.close();
