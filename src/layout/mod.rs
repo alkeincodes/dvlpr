@@ -70,6 +70,15 @@ pub struct TabRegion {
     pub label: String,
 }
 
+/// What a mouse click landed on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Hit {
+    Pane(PaneId),
+    Divider(SplitPath),
+    Tab(usize),
+    None,
+}
+
 /// The y of the 1-row tab bar (bottom of the viewport), or `None` when there is
 /// only one window (single-window sessions use the full viewport — no tab bar).
 pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
@@ -315,9 +324,101 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Hit-test a 1-based SGR mouse coordinate against the active window's geometry.
+/// Tab row is checked first, then dividers (a click exactly on a divider means
+/// "resize"), then panes. Returns `Hit::None` for clicks outside everything.
+pub fn hit_test(
+    node: &Node,
+    viewport: Rect,
+    window_count: usize,
+    tabs: &[TabRegion],
+    col: u16,
+    row: u16,
+) -> Hit {
+    // SGR coordinates are 1-based; 0 is invalid. Convert to 0-based.
+    if col == 0 || row == 0 {
+        return Hit::None;
+    }
+    let x = col - 1;
+    let y = row - 1;
+
+    if let Some(ty) = tab_row(viewport, window_count) {
+        if y == ty {
+            for t in tabs {
+                if x >= t.x_start && x <= t.x_end {
+                    return Hit::Tab(t.window);
+                }
+            }
+            return Hit::None;
+        }
+    }
+
+    let content = content_area(viewport, window_count);
+    for d in dividers(node, content) {
+        if d.rect.contains(x, y) {
+            return Hit::Divider(d.path);
+        }
+    }
+    for (id, r) in pane_rects(node, content) {
+        if r.contains(x, y) {
+            return Hit::Pane(id);
+        }
+    }
+    Hit::None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_tree() -> Node {
+        // Vertical split: leaf 1 (left) | leaf 2 (right).
+        Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        }
+    }
+
+    #[test]
+    fn hit_test_maps_clicks_to_panes() {
+        let tree = sample_tree();
+        let vp = Rect { x: 0, y: 0, w: 11, h: 4 };
+        // Single window => no tab row, content = full viewport.
+        // Left pane is x 0..=4 (w 5); divider at x 5; right pane x 6..=10.
+        // SGR coords are 1-based: col 1 => x 0 (left pane).
+        assert_eq!(hit_test(&tree, vp, 1, &[], 1, 1), Hit::Pane(1));
+        // col 7 => x 6 (right pane).
+        assert_eq!(hit_test(&tree, vp, 1, &[], 7, 1), Hit::Pane(2));
+    }
+
+    #[test]
+    fn hit_test_detects_the_divider() {
+        let tree = sample_tree();
+        let vp = Rect { x: 0, y: 0, w: 11, h: 4 };
+        // Divider column is x 5 => SGR col 6.
+        assert_eq!(hit_test(&tree, vp, 1, &[], 6, 1), Hit::Divider(vec![]));
+    }
+
+    #[test]
+    fn hit_test_detects_a_tab_click() {
+        let tree = Node::Leaf(1);
+        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let names = vec!["a".to_string(), "b".to_string()];
+        let tabs = tab_layout(&names, 0, 80);
+        // 2 windows => tab row at y 23 => SGR row 24. Click within tab[1]'s range.
+        let col = tabs[1].x_start + 1; // 1-based
+        assert_eq!(hit_test(&tree, vp, 2, &tabs, col, 24), Hit::Tab(1));
+    }
+
+    #[test]
+    fn hit_test_outside_everything_is_none() {
+        let tree = Node::Leaf(1);
+        let vp = Rect { x: 0, y: 0, w: 10, h: 5 };
+        assert_eq!(hit_test(&tree, vp, 1, &[], 0, 0), Hit::None); // 0 is not a valid 1-based coord
+        assert_eq!(hit_test(&tree, vp, 1, &[], 99, 99), Hit::None); // out of bounds
+    }
 
     #[test]
     fn tab_layout_produces_labels_and_ranges() {
