@@ -240,9 +240,11 @@ impl Session {
                 }
             }
             Command::SelectWindow(n) => {
-                let idx = n.saturating_sub(1);
-                if idx < self.windows.len() {
-                    self.active_window = idx;
+                if n >= 1 {
+                    let idx = n - 1;
+                    if idx < self.windows.len() {
+                        self.active_window = idx;
+                    }
                 }
             }
             Command::Detach => eff.detach = true,
@@ -286,7 +288,11 @@ impl Session {
             Ok(v) => v,
             Err(_) => return,
         };
-        layout::split_pane(&mut self.windows[wi].root, focused, dir, new_id);
+        let split_ok = layout::split_pane(&mut self.windows[wi].root, focused, dir, new_id);
+        debug_assert!(
+            split_ok,
+            "split_focused: focused leaf {focused} vanished between lookup and split"
+        );
         self.windows[wi].focused = new_id;
         self.relayout_all();
         eff.spawned.push((new_id, rx));
@@ -584,6 +590,37 @@ mod tests {
         let eff = session.apply_command(Command::Detach);
         assert!(eff.detach);
         assert!(eff.spawned.is_empty() && eff.closed.is_empty());
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_exit_keeps_focus_when_a_non_focused_pane_closes() {
+        let (mut session, first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            24,
+        )
+        .expect("session");
+        // Two horizontal splits => three panes in one window; newest pane is focused.
+        session.apply_command(Command::SplitHorizontal);
+        session.apply_command(Command::SplitHorizontal);
+        let focused = session.focused_pane();
+        assert_eq!(session.active_pane_count(), 3);
+        assert_ne!(focused, first);
+
+        // Close `first` — a NON-focused pane. Focus must NOT move.
+        for rt in session.pane_exited(first) {
+            rt.close();
+        }
+        assert_eq!(session.active_pane_count(), 2);
+        assert_eq!(
+            session.focused_pane(),
+            focused,
+            "focus must stay put when a non-focused pane closes"
+        );
         for rt in session.shutdown() {
             rt.close();
         }
