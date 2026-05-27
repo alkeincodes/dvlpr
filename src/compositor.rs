@@ -45,6 +45,20 @@ impl Compositor {
     }
 }
 
+/// Copy a pane's cells into `buf` (a `cols`-wide grid) at `rect`'s offset.
+fn blit_pane(buf: &mut [char], cols: u16, rect: Rect, pane: &dyn PaneCells) {
+    for y in 0..rect.h {
+        for x in 0..rect.w {
+            let bx = rect.x + x;
+            let by = rect.y + y;
+            let idx = by as usize * cols as usize + bx as usize;
+            if idx < buf.len() {
+                buf[idx] = pane.cell(x, y); // pane.cell returns ' ' for out-of-range
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +104,21 @@ mod tests {
     fn compositor_constructs() {
         let c = Compositor::new();
         assert!(c.buf.is_empty());
+    }
+
+    #[test]
+    fn blit_copies_cells_at_offset() {
+        // 4x3 viewport buffer, blit a 2x2 pane "ab"/"cd" at offset (1,1).
+        let cols: u16 = 4;
+        let mut buf = vec![' '; 4 * 3];
+        let pane = StubScreen::new(2, 2, &["ab", "cd"], (0, 0));
+        blit_pane(&mut buf, cols, Rect { x: 1, y: 1, w: 2, h: 2 }, &pane);
+        let at = |r: usize, c: usize| r * cols as usize + c;
+        // Row 1: positions 1,2 == 'a','b'. Row 2: positions 1,2 == 'c','d'.
+        assert_eq!(buf[at(1, 1)], 'a');
+        assert_eq!(buf[at(1, 2)], 'b');
+        assert_eq!(buf[at(2, 1)], 'c');
+        assert_eq!(buf[at(2, 2)], 'd');
+        assert_eq!(buf[at(0, 0)], ' '); // untouched cell stays blank
     }
 }
