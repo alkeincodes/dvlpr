@@ -5,7 +5,9 @@
 //! Single-owner and `!Send`/`!Sync` (holds a raw pointer). All `unsafe` FFI is
 //! confined here; the public API is fully safe.
 
+use std::cell::RefCell;
 use std::mem;
+use std::os::raw::c_void;
 use std::ptr;
 
 use crate::ghostty::sys;
@@ -14,6 +16,34 @@ pub struct GhosttyScreen {
     term: sys::GhosttyTerminal,
     cols: u16,
     rows: u16,
+    // Heap-stable buffer the write_pty callback appends to. Boxed so its address is
+    // stable across moves of GhosttyScreen — the terminal holds a raw userdata
+    // pointer to it for the terminal's whole lifetime.
+    pty_writes: Box<RefCell<Vec<u8>>>,
+}
+
+/// Trampoline libghostty-vt calls (synchronously, inside `vt_write` and inside
+/// `resize` when in-band size reporting is on) when the terminal needs to send a
+/// reply to the PTY (DSR cursor-position / DECRQM mode / size reports). It appends
+/// the reply bytes to the `RefCell<Vec<u8>>` pointed to by `userdata`.
+///
+/// # Safety
+/// `userdata` must be the `*const RefCell<Vec<u8>>` registered in `new`, valid
+/// for the terminal's lifetime; `data`/`len` describe a valid slice for the call.
+unsafe extern "C" fn write_pty_trampoline(
+    _terminal: sys::GhosttyTerminal,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    if userdata.is_null() || data.is_null() || len == 0 {
+        return;
+    }
+    // Form only `&RefCell` (never `&mut`): interior mutability keeps this sound and
+    // single-threaded (GhosttyScreen is !Send/!Sync).
+    let buf = &*(userdata as *const RefCell<Vec<u8>>);
+    let slice = std::slice::from_raw_parts(data, len);
+    buf.borrow_mut().extend_from_slice(slice);
 }
 
 impl GhosttyScreen {
@@ -35,7 +65,33 @@ impl GhosttyScreen {
             rc == 0 && !term.is_null(),
             "ghostty_terminal_new failed (rc={rc})"
         );
-        GhosttyScreen { term, cols, rows }
+        let pty_writes = Box::new(RefCell::new(Vec::new()));
+        // Userdata = stable pointer to the boxed RefCell (the Box keeps the heap
+        // address fixed across moves of the returned GhosttyScreen).
+        let userdata = (&*pty_writes as *const RefCell<Vec<u8>>) as *const c_void;
+        // SAFETY: `term` is valid; `userdata` outlives the terminal (the Box is freed
+        // in Drop AFTER ghostty_terminal_free); the trampoline matches the expected
+        // GhosttyTerminalWritePtyFn signature. Set USERDATA before WRITE_PTY.
+        unsafe {
+            let ud_rc = sys::ghostty_terminal_set(
+                term,
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_USERDATA,
+                userdata,
+            );
+            debug_assert_eq!(ud_rc, 0, "set USERDATA failed (rc={ud_rc})");
+            let cb_rc = sys::ghostty_terminal_set(
+                term,
+                sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                write_pty_trampoline as *const c_void,
+            );
+            debug_assert_eq!(cb_rc, 0, "set WRITE_PTY failed (rc={cb_rc})");
+        }
+        GhosttyScreen {
+            term,
+            cols,
+            rows,
+            pty_writes,
+        }
     }
 
     pub fn cols(&self) -> u16 {
@@ -52,6 +108,12 @@ impl GhosttyScreen {
         }
         // SAFETY: `term` is valid; `bytes` ptr+len describe a valid slice.
         unsafe { sys::ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// Drain and return any bytes the terminal asked to write back to the PTY
+    /// (query/status replies accumulated during the preceding `feed`/`resize` calls).
+    pub fn take_pty_writes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pty_writes.borrow_mut())
     }
 
     pub fn cell(&self, x: u16, y: u16) -> char {
@@ -212,6 +274,34 @@ mod tests {
         assert!(out.contains("cd "));
         let (cx, cy) = s.cursor();
         assert!(out.ends_with(&format!("\x1b[{};{}H", cy + 1, cx + 1)));
+    }
+
+    #[test]
+    fn plain_text_produces_no_pty_writes() {
+        let mut s = GhosttyScreen::new(10, 3);
+        s.feed(b"hi");
+        assert!(s.take_pty_writes().is_empty());
+    }
+
+    #[test]
+    fn cursor_position_report_query_is_answered_via_pty_writes() {
+        let mut s = GhosttyScreen::new(80, 24);
+        // DSR — Cursor Position Report: ESC [ 6 n  → terminal replies ESC [ row ; col R.
+        s.feed(b"\x1b[6n");
+        let reply = s.take_pty_writes();
+        assert!(!reply.is_empty(), "expected a CPR reply, got nothing");
+        assert_eq!(reply[0], 0x1b, "reply should start with ESC, got {reply:?}");
+        assert_eq!(
+            reply[1], b'[',
+            "reply should be a CSI sequence, got {reply:?}"
+        );
+        assert_eq!(
+            *reply.last().unwrap(),
+            b'R',
+            "CPR reply should end in 'R', got {reply:?}"
+        );
+        // Draining is destructive: a second take returns empty.
+        assert!(s.take_pty_writes().is_empty());
     }
 
     #[test]
