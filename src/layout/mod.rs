@@ -59,6 +59,17 @@ pub struct Divider {
     pub dir: SplitDir,
 }
 
+/// A window's tab in the tab bar: its rendered label and the inclusive 0-based
+/// x-range it occupies (the single source of truth shared by the compositor's
+/// drawing and the click hit-testing).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabRegion {
+    pub window: usize,
+    pub x_start: u16,
+    pub x_end: u16,
+    pub label: String,
+}
+
 /// The y of the 1-row tab bar (bottom of the viewport), or `None` when there is
 /// only one window (single-window sessions use the full viewport — no tab bar).
 pub fn tab_row(viewport: Rect, window_count: usize) -> Option<u16> {
@@ -265,9 +276,72 @@ pub fn set_ratio(node: &mut Node, path: &[Side], ratio: f32) -> bool {
     }
 }
 
+const TAB_NAME_MAX: usize = 12;
+
+/// Lay out window tabs left-to-right: each label is `[<idx><marker><name>]`
+/// where marker is `*` for the active window else `:`, names truncated to
+/// TAB_NAME_MAX cells, separated by a single space. Stops once `width` is reached.
+///
+/// v1 semantics: lengths/offsets are counted in Unicode scalar values
+/// (`chars().count()`), which equals terminal display cells for the ASCII window
+/// names we expect. Wide/zero-width characters (CJK, emoji) would make the drawn
+/// label and the clickable x-range drift; supporting display-width is deferred
+/// (would need a unicode-width dependency, out of scope for this std-only module).
+pub fn tab_layout(names: &[String], active: usize, width: u16) -> Vec<TabRegion> {
+    let mut out = Vec::new();
+    let mut x: u16 = 0;
+    for (i, name) in names.iter().enumerate() {
+        if x >= width {
+            break;
+        }
+        let marker = if i == active { '*' } else { ':' };
+        let label = format!("[{}{}{}]", i, marker, truncate(name, TAB_NAME_MAX));
+        let len = label.chars().count() as u16;
+        let x_end = x.saturating_add(len.saturating_sub(1)).min(width - 1);
+        out.push(TabRegion { window: i, x_start: x, x_end, label });
+        x = x.saturating_add(len).saturating_add(1); // one-space separator
+    }
+    out
+}
+
+/// Truncate to `max` cells, replacing the tail with `…` when over length.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max - 1).collect();
+        t.push('…');
+        t
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_layout_produces_labels_and_ranges() {
+        let names = vec!["shell".to_string(), "vim".to_string(), "logs".to_string()];
+        let tabs = tab_layout(&names, 1, 80);
+        // Labels: "[0:shell]" (9), space, "[1*vim]" (7), space, "[2:logs]" (8).
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[0].label, "[0:shell]");
+        assert_eq!(tabs[0].x_start, 0);
+        assert_eq!(tabs[0].x_end, 8); // 9 chars at x 0..=8
+        assert_eq!(tabs[1].label, "[1*vim]"); // active marked with '*'
+        assert_eq!(tabs[1].x_start, 10); // 9 + 1 space
+        assert_eq!(tabs[1].x_end, 16); // 7 chars at 10..=16
+        assert_eq!(tabs[2].label, "[2:logs]");
+        assert_eq!(tabs[2].x_start, 18); // 16 + 1 + 1
+    }
+
+    #[test]
+    fn tab_layout_truncates_long_names() {
+        let names = vec!["a-very-long-window-name".to_string()];
+        let tabs = tab_layout(&names, 0, 80);
+        // name truncated to 12 cells: first 11 chars ("a-very-long") + '…'.
+        assert_eq!(tabs[0].label, "[0*a-very-long…]");
+    }
 
     #[test]
     fn set_ratio_at_root_updates_the_split() {
