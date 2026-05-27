@@ -98,8 +98,12 @@ impl FromStr for KeySpec {
         if let Some(rest) = s.strip_prefix("C-") {
             let mut chars = rest.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) if c.is_ascii() => return Ok(KeySpec::Ctrl(c)),
-                _ => return Err(format!("bad control spec (want C-<ascii>): {s:?}")),
+                // Only alphabetic control combos are accepted (e.g. C-a); they map
+                // to unambiguous control bytes. Normalize case so C-A == C-a.
+                (Some(c), None) if c.is_ascii_alphabetic() => {
+                    return Ok(KeySpec::Ctrl(c.to_ascii_lowercase()))
+                }
+                _ => return Err(format!("bad control spec (want C-<a-z>): {s:?}")),
             }
         }
         let mut chars = s.chars();
@@ -305,6 +309,8 @@ mod tests {
         assert!("C-".parse::<KeySpec>().is_err());
         assert!("é".parse::<KeySpec>().is_err()); // non-ASCII rejected, not truncated
         assert!("C-é".parse::<KeySpec>().is_err());
+        assert_eq!("C-A".parse::<KeySpec>().unwrap(), KeySpec::Ctrl('a')); // case-normalized
+        assert!("C-[".parse::<KeySpec>().is_err()); // non-alphabetic ctrl rejected
     }
 
     #[test]
