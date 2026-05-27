@@ -12,8 +12,9 @@ use std::io;
 use tokio::sync::mpsc;
 
 use crate::compositor::{Compositor, PaneCells};
+use crate::config::Command;
 use crate::ghostty::screen::GhosttyScreen;
-use crate::layout::{self, Node, PaneId, Rect};
+use crate::layout::{self, Node, PaneId, Rect, SplitDir};
 use crate::pane::{PaneOutput, PaneRuntime};
 
 struct Pane {
@@ -38,6 +39,20 @@ pub struct Session {
     command: Vec<String>,
     cwd: String,
 }
+
+/// Side effects of a command that the run loop must perform: attach a forwarder
+/// for each newly spawned pane, tear down each removed runtime off the async
+/// runtime, and detach the issuing client if `detach` is set.
+#[derive(Default)]
+pub struct CommandEffect {
+    pub spawned: Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>,
+    pub closed: Vec<PaneRuntime>,
+    pub detach: bool,
+}
+
+/// Minimum cells along the split axis for a split to be allowed (two 2-cell
+/// children plus a 1-cell divider).
+const MIN_SPLIT_AXIS: u16 = 5;
 
 impl Session {
     /// Create a session with one window holding a single pane running `command`.
@@ -94,6 +109,38 @@ impl Session {
         Ok((id, rx))
     }
 
+    fn viewport(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: self.cols,
+            h: self.rows,
+        }
+    }
+
+    /// Resize every pane's PTY + screen to the rect the current geometry assigns
+    /// it (across all windows), draining size-report replies. Called after any
+    /// structural change and on viewport resize.
+    fn relayout_all(&mut self) {
+        let content = layout::content_area(self.viewport(), self.windows.len());
+        let mut targets: Vec<(PaneId, Rect)> = Vec::new();
+        for win in &self.windows {
+            targets.extend(layout::pane_rects(&win.root, content));
+        }
+        for (id, rect) in targets {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                let w = rect.w.max(1);
+                let h = rect.h.max(1);
+                pane.runtime.resize(w, h);
+                pane.screen.resize(w, h);
+                let replies = pane.screen.take_pty_writes();
+                if !replies.is_empty() {
+                    pane.runtime.write_input(&replies);
+                }
+            }
+        }
+    }
+
     /// Feed pane-output bytes into that pane's screen and route any query replies
     /// back to its PTY. Output for an already-closed pane is ignored.
     pub fn feed(&mut self, pane_id: PaneId, bytes: &[u8]) {
@@ -143,32 +190,138 @@ impl Session {
     /// Resize the viewport: recompute every pane's rect (across all windows) and
     /// resize each pane's PTY + screen to match, draining any size-report replies.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        // Clamp to at least 1x1 so a 0-sized client resize can't produce a
-        // degenerate viewport (matches the prior single-screen behavior).
         self.cols = cols.max(1);
         self.rows = rows.max(1);
-        let viewport = Rect {
-            x: 0,
-            y: 0,
-            w: self.cols,
-            h: self.rows,
-        };
-        let content = layout::content_area(viewport, self.windows.len());
-        let mut targets: Vec<(PaneId, Rect)> = Vec::new();
-        for win in &self.windows {
-            targets.extend(layout::pane_rects(&win.root, content));
-        }
-        for (id, rect) in targets {
-            if let Some(pane) = self.panes.get_mut(&id) {
-                let w = rect.w.max(1);
-                let h = rect.h.max(1);
-                pane.runtime.resize(w, h);
-                pane.screen.resize(w, h);
-                let replies = pane.screen.take_pty_writes();
-                if !replies.is_empty() {
-                    pane.runtime.write_input(&replies);
+        self.relayout_all();
+    }
+
+    /// Number of panes in the active window (0 if there is no active window).
+    pub fn active_pane_count(&self) -> usize {
+        self.windows
+            .get(self.active_window)
+            .map(|w| layout::all_panes(&w.root).len())
+            .unwrap_or(0)
+    }
+
+    /// The focused pane id of the active window (0 if none — id 0 is never live).
+    pub fn focused_pane(&self) -> PaneId {
+        self.windows
+            .get(self.active_window)
+            .map(|w| w.focused)
+            .unwrap_or(0)
+    }
+
+    pub fn window_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn active_window_index(&self) -> usize {
+        self.active_window
+    }
+
+    /// Apply a structural command, returning the side effects the run loop must
+    /// perform. Marks nothing dirty itself — the caller repaints after applying.
+    pub fn apply_command(&mut self, cmd: Command) -> CommandEffect {
+        let mut eff = CommandEffect::default();
+        match cmd {
+            Command::SplitHorizontal => self.split_focused(SplitDir::Horizontal, &mut eff),
+            Command::SplitVertical => self.split_focused(SplitDir::Vertical, &mut eff),
+            Command::ClosePane => eff.closed = self.close_focused(),
+            Command::NewWindow => self.new_window(&mut eff),
+            Command::NextWindow => {
+                if !self.windows.is_empty() {
+                    self.active_window = (self.active_window + 1) % self.windows.len();
                 }
             }
+            Command::PrevWindow => {
+                if !self.windows.is_empty() {
+                    let n = self.windows.len();
+                    self.active_window = (self.active_window + n - 1) % n;
+                }
+            }
+            Command::SelectWindow(n) => {
+                let idx = n.saturating_sub(1);
+                if idx < self.windows.len() {
+                    self.active_window = idx;
+                }
+            }
+            Command::Detach => eff.detach = true,
+        }
+        eff
+    }
+
+    fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
+        let wi = self.active_window;
+        let Some(win) = self.windows.get(wi) else {
+            return;
+        };
+        let focused = win.focused;
+        let content = layout::content_area(self.viewport(), self.windows.len());
+        let Some((_, rect)) = layout::pane_rects(&win.root, content)
+            .into_iter()
+            .find(|(id, _)| *id == focused)
+        else {
+            return;
+        };
+        let axis = match dir {
+            SplitDir::Horizontal => rect.h,
+            SplitDir::Vertical => rect.w,
+        };
+        if axis < MIN_SPLIT_AXIS {
+            self.bell(focused);
+            return;
+        }
+        // Size the new pane to the second child rect so it starts at a sane size.
+        let child = match dir {
+            SplitDir::Horizontal => Rect {
+                h: rect.h / 2,
+                ..rect
+            },
+            SplitDir::Vertical => Rect {
+                w: rect.w / 2,
+                ..rect
+            },
+        };
+        let (new_id, rx) = match self.spawn_pane(child) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        layout::split_pane(&mut self.windows[wi].root, focused, dir, new_id);
+        self.windows[wi].focused = new_id;
+        self.relayout_all();
+        eff.spawned.push((new_id, rx));
+    }
+
+    fn close_focused(&mut self) -> Vec<PaneRuntime> {
+        let Some(win) = self.windows.get(self.active_window) else {
+            return Vec::new();
+        };
+        let focused = win.focused;
+        self.pane_exited(focused)
+    }
+
+    fn new_window(&mut self, eff: &mut CommandEffect) {
+        let new_count = self.windows.len() + 1;
+        let content = layout::content_area(self.viewport(), new_count);
+        let (id, rx) = match self.spawn_pane(content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let name = self.windows.len().to_string();
+        self.windows.push(Window {
+            name,
+            root: Node::Leaf(id),
+            focused: id,
+        });
+        self.active_window = self.windows.len() - 1;
+        self.relayout_all();
+        eff.spawned.push((id, rx));
+    }
+
+    /// Ring the focused pane's bell (feedback for a rejected action).
+    fn bell(&self, pane_id: PaneId) {
+        if let Some(pane) = self.panes.get(&pane_id) {
+            pane.runtime.write_input(b"\x07");
         }
     }
 
@@ -190,7 +343,9 @@ impl Session {
                 let root = std::mem::replace(&mut self.windows[wi].root, Node::Leaf(0));
                 match layout::close_pane(root, pane_id) {
                     Some(new_root) => {
-                        self.windows[wi].focused = layout::first_leaf(&new_root);
+                        if self.windows[wi].focused == pane_id {
+                            self.windows[wi].focused = layout::first_leaf(&new_root);
+                        }
                         self.windows[wi].root = new_root;
                         wi += 1;
                     }
@@ -212,7 +367,16 @@ impl Session {
                 wi += 1;
             }
         }
+        self.relayout_all();
         removed
+    }
+
+    /// Consume the session, returning every live pane runtime so the caller can
+    /// tear them down off the async runtime (`PaneRuntime::close`). Use at daemon
+    /// shutdown instead of letting `Session` drop (which would run blocking
+    /// `kill()`/`wait()` on the run loop's worker).
+    pub fn shutdown(mut self) -> Vec<PaneRuntime> {
+        self.panes.drain().map(|(_, pane)| pane.runtime).collect()
     }
 
     /// True when no windows remain (the daemon should shut down).
@@ -224,6 +388,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Command;
     use std::time::Duration;
 
     #[tokio::test]
@@ -317,5 +482,110 @@ mod tests {
 
         // A second pane_exited for the same id is a harmless no-op.
         assert!(session.pane_exited(pane_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_horizontal_spawns_a_second_pane_and_focuses_it() {
+        let (mut session, first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            12,
+        )
+        .expect("session");
+
+        let eff = session.apply_command(Command::SplitHorizontal);
+        assert_eq!(eff.spawned.len(), 1, "a new pane was spawned");
+        let (new_id, _new_rx) = eff.spawned.into_iter().next().unwrap();
+        assert_ne!(new_id, first);
+        // Active window now has two panes; the new one is focused.
+        assert_eq!(session.active_pane_count(), 2);
+        assert_eq!(session.focused_pane(), new_id);
+
+        // Teardown: close both panes off-loop.
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn split_is_rejected_when_too_small() {
+        // 3-row viewport can't host a horizontal split (needs >= 5 rows).
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            3,
+        )
+        .expect("session");
+        let eff = session.apply_command(Command::SplitHorizontal);
+        assert!(
+            eff.spawned.is_empty(),
+            "no pane spawned for a too-small split"
+        );
+        assert_eq!(session.active_pane_count(), 1);
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn new_window_then_select_switches_active_window() {
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            12,
+        )
+        .expect("session");
+        let eff = session.apply_command(Command::NewWindow);
+        assert_eq!(eff.spawned.len(), 1);
+        assert_eq!(session.window_count(), 2);
+        assert_eq!(session.active_window_index(), 1);
+        // Back to window 1 (1-based) => index 0.
+        session.apply_command(Command::SelectWindow(1));
+        assert_eq!(session.active_window_index(), 0);
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_pane_collapses_split_and_returns_a_runtime() {
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            12,
+        )
+        .expect("session");
+        session.apply_command(Command::SplitVertical);
+        assert_eq!(session.active_pane_count(), 2);
+        let eff = session.apply_command(Command::ClosePane);
+        assert_eq!(eff.closed.len(), 1, "the closed pane's runtime is returned");
+        assert_eq!(session.active_pane_count(), 1);
+        for rt in eff.closed {
+            rt.close();
+        }
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn detach_command_sets_the_detach_flag() {
+        let (mut session, _first, _rx) = Session::new(
+            vec!["sh".into(), "-c".into(), "sleep 5".into()],
+            ".".into(),
+            40,
+            12,
+        )
+        .expect("session");
+        let eff = session.apply_command(Command::Detach);
+        assert!(eff.detach);
+        assert!(eff.spawned.is_empty() && eff.closed.is_empty());
+        for rt in session.shutdown() {
+            rt.close();
+        }
     }
 }
