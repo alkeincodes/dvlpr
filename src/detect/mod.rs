@@ -67,6 +67,9 @@ fn is_claude_blocked(tail: &str, lower: &str) -> bool {
         || lower.contains("would you like to proceed?")
         || lower.contains("waiting for permission")
         || lower.contains("do you want to allow this connection?")
+        // AskUserQuestion always renders a "Chat about this" affordance —
+        // a stable signal regardless of menu shape or wording.
+        || lower.contains("chat about this")
         // Any `❯ N. <label>` selection menu means the agent is waiting for
         // user input — whether the labels are yes/no (permission prompts)
         // or open-ended (AskUserQuestion). `❯` (U+276F) is the menu cursor
@@ -260,6 +263,19 @@ mod tests {
                     │   2. moment                      │\n\
                     │   3. dayjs                       │\n\
                     ╰──────────────────────────────────╯\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Blocked);
+    }
+
+    #[test]
+    fn classify_claude_blocked_ask_user_question_chat_about_this_marker() {
+        // "Chat about this" is a footer affordance that AskUserQuestion
+        // consistently renders. Match it as a keyword so we catch the
+        // tool even if the menu's rendering ever changes shape and the
+        // structural `❯ N.` fallback misses.
+        let tail = "Which approach do you want?\n\
+                    1. Refactor first\n\
+                    2. Add tests first\n\
+                    Chat about this · ↑↓ to navigate · enter to select\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Blocked);
     }
 
