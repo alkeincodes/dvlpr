@@ -473,6 +473,14 @@ fn apply_events(
                     *dirty = true;
                 }
             }
+            InputEvent::FocusIn => {
+                // Promotion is already handled by commit_input's
+                // !events.is_empty() check above (the parser returning a non-empty
+                // vec is what flags this client as recently-active). No pane write,
+                // no other side effect. DO NOT add `session.input(b"\x1b[I")` here
+                // — that would write focus bytes into the pane PTY, the exact
+                // leak the parser intercept is fixing.
+            }
         }
         *dirty = true;
     }

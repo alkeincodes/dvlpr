@@ -54,6 +54,11 @@ pub enum InputEvent {
     Command(crate::config::Command),
     /// A mouse event to hit-test against the active window.
     Mouse(MouseEvent),
+    /// The client's host terminal just gained focus. Carries no payload —
+    /// the server already knows which client emitted this from connection
+    /// identity. FocusOut is intentionally not represented; the parser
+    /// consumes the corresponding `ESC [ O` sequence and emits nothing.
+    FocusIn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +181,19 @@ impl InputParser {
                 if b == b'<' && self.pending.len() == 2 {
                     self.pending.push(b);
                     self.state = State::NMouse;
+                } else if (b == b'I' || b == b'O') && self.pending.len() == 2 {
+                    // DECSET 1004 focus report: bare `ESC [ I` (FocusIn) or
+                    // `ESC [ O` (FocusOut), zero parameter bytes. Intercept
+                    // — do NOT push the final byte and do NOT forward to the
+                    // pane. A parameterized CSI with `I`/`O` terminator
+                    // (pending.len() > 2) is unaffected and falls through to
+                    // the pane below.
+                    self.pending.clear();
+                    self.state = State::Ground;
+                    if b == b'I' {
+                        out.push(InputEvent::FocusIn);
+                    }
+                    // FocusOut emits nothing.
                 } else {
                     self.pending.push(b);
                     // A CSI final byte (0x40..=0x7e) ends the sequence; forward the
@@ -231,7 +249,21 @@ impl InputParser {
                     self.step(config, b, out);
                 }
             }
-            State::ACsi | State::ASs3 => {
+            State::ACsi => {
+                // Focus reports `ESC [ I` / `ESC [ O` can land here when the user
+                // is mid-prefix. These are side-channel terminal metadata — they
+                // must NOT cancel the user's armed prefix. Intercept before the
+                // shared arrow-resolution path: emit FocusIn for `I` (nothing for
+                // `O`), then RETURN to State::Armed so the user's next byte
+                // continues command resolution normally.
+                if b == b'I' || b == b'O' {
+                    self.pending.clear();
+                    self.state = State::Armed;
+                    if b == b'I' {
+                        out.push(InputEvent::FocusIn);
+                    }
+                    return;
+                }
                 let named = match b {
                     b'A' => Some(NamedKey::Up),
                     b'B' => Some(NamedKey::Down),
@@ -244,7 +276,24 @@ impl InputParser {
                 if let Some(n) = named {
                     resolve_key(config, Key::Named(n), out);
                 }
-                // Non-arrow final byte after the prefix: unknown command, dropped.
+                // Non-arrow non-focus final byte after the prefix: unknown
+                // command, dropped (existing behavior).
+            }
+            State::ASs3 => {
+                // SS3 arrows from the armed state (`ESC O A/B/C/D`). Focus
+                // events are CSI, not SS3, so this path never sees them.
+                let named = match b {
+                    b'A' => Some(NamedKey::Up),
+                    b'B' => Some(NamedKey::Down),
+                    b'C' => Some(NamedKey::Right),
+                    b'D' => Some(NamedKey::Left),
+                    _ => None,
+                };
+                self.pending.clear();
+                self.state = State::Ground;
+                if let Some(n) = named {
+                    resolve_key(config, Key::Named(n), out);
+                }
             }
         }
     }
@@ -523,5 +572,107 @@ mod tests {
     fn scroll_wheel_is_ignored() {
         // ESC [ < 64 ; 5 ; 7 M (scroll up) produces no event this phase.
         assert_eq!(parse_all(b"\x1b[<64;5;7M"), vec![]);
+    }
+
+    #[test]
+    fn normal_mode_focus_in_emits_focusin_no_pane_bytes() {
+        // Bare ESC [ I (zero parameter bytes) is a DECSET 1004 FocusIn report,
+        // not pane input. The parser intercepts and emits InputEvent::FocusIn.
+        assert_eq!(parse_all(b"\x1b[I"), vec![InputEvent::FocusIn]);
+    }
+
+    #[test]
+    fn normal_mode_focus_out_is_dropped() {
+        // FocusOut: parser consumes the sequence and emits nothing (no promote,
+        // no demote, no pane forwarding).
+        assert_eq!(parse_all(b"\x1b[O"), vec![]);
+    }
+
+    #[test]
+    fn normal_mode_focus_between_pane_bytes_does_not_leak() {
+        // The focus bytes must not appear in any Pane event; surrounding pane
+        // input (x and y) is still forwarded.
+        let evs = parse_all(b"x\x1b[Iy");
+        // Flatten all Pane bytes; assert no ESC byte slipped through.
+        let pane_bytes: Vec<u8> = evs
+            .iter()
+            .flat_map(|e| match e {
+                InputEvent::Pane(b) => b.clone(),
+                _ => vec![],
+            })
+            .collect();
+        assert!(
+            !pane_bytes.contains(&0x1b),
+            "focus bytes must not reach a Pane event; got {pane_bytes:?}"
+        );
+        // And we got exactly one FocusIn from the embedded sequence.
+        let focus_count = evs
+            .iter()
+            .filter(|e| matches!(e, InputEvent::FocusIn))
+            .count();
+        assert_eq!(focus_count, 1);
+        // Both x and y still made it through as pane bytes.
+        assert!(pane_bytes.contains(&b'x'));
+        assert!(pane_bytes.contains(&b'y'));
+    }
+
+    #[test]
+    fn normal_mode_parameterized_csi_ending_in_i_is_not_focus() {
+        // ESC [ 1 ; 2 I has parameter bytes — it's NOT a focus event, so it
+        // must pass through to the pane unchanged (as a normal CSI sequence).
+        let evs = parse_all(b"\x1b[1;2I");
+        // No FocusIn should be emitted.
+        assert!(!evs.iter().any(|e| matches!(e, InputEvent::FocusIn)));
+        // The full sequence reaches the pane verbatim.
+        let pane_bytes: Vec<u8> = evs
+            .into_iter()
+            .flat_map(|e| match e {
+                InputEvent::Pane(b) => b,
+                _ => vec![],
+            })
+            .collect();
+        assert_eq!(pane_bytes, b"\x1b[1;2I");
+    }
+
+    #[test]
+    fn armed_mode_focus_in_emits_focusin_and_preserves_prefix() {
+        // After the user presses the prefix (Ctrl-a = 0x01), the parser is in the
+        // Armed state. A focus event arriving here (ESC [ I) must:
+        //   - emit one FocusIn event (so promotion happens),
+        //   - preserve the Armed state (focus is side-channel terminal metadata,
+        //     not user input — must not cancel the user's command intent).
+        // Verified by feeding `prefix ESC [ I x` in one shot: we expect a FocusIn,
+        // then the next byte `x` resolves to the bound ClosePane command, NOT a
+        // literal pane byte.
+        assert_eq!(
+            parse_all(&[0x01, 0x1b, b'[', b'I', b'x']),
+            vec![
+                InputEvent::FocusIn,
+                InputEvent::Command(crate::config::Command::ClosePane),
+            ]
+        );
+    }
+
+    #[test]
+    fn armed_mode_focus_out_emits_nothing_and_preserves_prefix() {
+        // FocusOut after prefix: zero focus events, prefix preserved, next `x`
+        // still resolves to ClosePane.
+        assert_eq!(
+            parse_all(&[0x01, 0x1b, b'[', b'O', b'x']),
+            vec![InputEvent::Command(crate::config::Command::ClosePane)]
+        );
+    }
+
+    #[test]
+    fn armed_mode_arrow_still_resolves_as_command_regression() {
+        // Regression guard: the existing `prefix ESC [ B = SplitHorizontal`
+        // behavior must not change. (Already covered by
+        // `prefix_then_down_arrow_splits_horizontal`, but re-asserted explicitly
+        // alongside the focus tests so a future ACsi refactor can't silently
+        // break this in isolation.)
+        assert_eq!(
+            parse_all(&[0x01, 0x1b, b'[', b'B']),
+            vec![InputEvent::Command(crate::config::Command::SplitHorizontal)]
+        );
     }
 }
