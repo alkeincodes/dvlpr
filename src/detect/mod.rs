@@ -264,6 +264,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_claude_blocked_trust_folder_safety_check() {
+        // Regression: Claude Code's "Quick safety check / trust this folder"
+        // screen (full-width, NOT inside a bordered dialog). Was blocked
+        // pre-fix via the yes/no anchor; must remain blocked post-fix via
+        // the now-yes/no-agnostic structural fallback.
+        let tail = "Accessing workspace:\n\
+                    /Users/alkein\n\
+                    Quick safety check: Is this a project you created or one you trust?\n\
+                    Claude Code'll be able to read, edit, and execute files here.\n\
+                    Security guide\n\
+                    ❯ 1. Yes, I trust this folder\n  2. No, exit\n\
+                    Enter to confirm · Esc to cancel\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Blocked);
+    }
+
+    #[test]
     fn classify_claude_working_paren_spinner_format() {
         // The on-screen spinner is parenthesized: "(5s · esc to interrupt)".
         // Detection should match it the same as the bare form.
