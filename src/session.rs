@@ -598,7 +598,7 @@ impl Session {
                     })
                     .collect();
                 for r in layout::sidebar_rows(sb, &inputs) {
-                    if r.y == y {
+                    if y >= r.y && y < r.y + r.h {
                         return layout::Hit::SidebarEntry {
                             window_index: r.window_index,
                             pane_id: r.pane_id,
@@ -1730,8 +1730,9 @@ mod tests {
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
 
         // Sidebar width is SIDEBAR_WIDTH_DEFAULT (26); starts at 0-based col 54 (1-based 55..80).
-        // First entry at sidebar row 2 (0-based) = row 3 1-based. Col 70 is inside the sidebar.
-        let hit = session.hit(70, 3);
+        // New layout: first entry at sidebar row 3 (0-based) = row 4 1-based (header=0, divider=1, blank=2).
+        // h=2 so rows 4 and 5 (1-based) are both clickable. Col 70 is inside the sidebar.
+        let hit = session.hit(70, 4);
         match hit {
             layout::Hit::SidebarEntry {
                 window_index,

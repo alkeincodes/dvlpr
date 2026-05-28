@@ -513,12 +513,13 @@ pub struct SidebarRowInput {
     pub pane_id: PaneId,
 }
 
-/// One entry's position within the sidebar region. The y coordinate is
-/// in viewport coords (not sidebar-relative), so hit-test comparisons
-/// can be done against the raw mouse row.
+/// One entry's click region within the sidebar. `y` is viewport-rooted;
+/// `h` covers both rendered rows (row a + row b). Gap row falls
+/// outside the half-open `[y, y + h)` and is not clickable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SidebarRow {
     pub y: u16,
+    pub h: u16,
     pub window_index: usize,
     pub pane_id: PaneId,
 }
@@ -527,20 +528,24 @@ pub struct SidebarRow {
 /// Layout is fixed at the top of `sidebar`:
 ///   row 0 (rect.y + 0) — "AGENTS" header (NOT a click target)
 ///   row 1 (rect.y + 1) — horizontal '─' separator
-///   row 2..N — one row per entry from `entries`, truncated to fit
-///              within `rect.h`
+///   row 2 (rect.y + 2) — leading blank row
+///   rows 3..N — 3 rows per entry (row a + row b + gap), truncated to fit
+///               within `rect.h`. Only rows a+b are clickable (h=2);
+///               the gap row is a miss zone.
 ///
-/// Used by both `Compositor::draw_sidebar` (to know where to write each
-/// row) and `Session::hit` (to translate a click to a SidebarEntry).
+/// Used by `Session::hit` to translate a click to a SidebarEntry.
 pub fn sidebar_rows(rect: Rect, entries: &[SidebarRowInput]) -> Vec<SidebarRow> {
     let mut out = Vec::with_capacity(entries.len());
-    if rect.h < 3 {
+    // 2 header rows + 1 leading blank + 3 rows per entry (a + b + gap).
+    let max_entries = (rect.h.saturating_sub(3) / 3) as usize;
+    if max_entries == 0 {
         return out;
     }
-    let max_entries = (rect.h - 2) as usize;
     for (i, e) in entries.iter().take(max_entries).enumerate() {
+        let y = rect.y + 3 + (i as u16) * 3;
         out.push(SidebarRow {
-            y: rect.y + 2 + i as u16,
+            y,
+            h: 2,
             window_index: e.window_index,
             pane_id: e.pane_id,
         });
@@ -1347,77 +1352,47 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_rows_assigns_one_row_per_entry_below_header_and_separator() {
-        let rect = Rect {
-            x: 64,
-            y: 0,
-            w: 16,
-            h: 10,
-        };
+    fn sidebar_rows_assigns_two_row_targets_per_entry_with_gaps() {
+        let rect = Rect { x: 0, y: 0, w: 26, h: 20 };
         let entries = vec![
-            SidebarRowInput {
-                window_index: 0,
-                pane_id: 1,
-            },
-            SidebarRowInput {
-                window_index: 1,
-                pane_id: 5,
-            },
+            SidebarRowInput { window_index: 0, pane_id: 0 },
+            SidebarRowInput { window_index: 1, pane_id: 1 },
         ];
         let rows = sidebar_rows(rect, &entries);
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].y, 2,
-            "first entry at row 2 (after header+separator)"
-        );
-        assert_eq!(rows[1].y, 3);
+        // Row 0 starts at y=3 (header=0, divider=1, blank=2).
+        assert_eq!(rows[0].y, 3);
+        assert_eq!(rows[0].h, 2);
         assert_eq!(rows[0].window_index, 0);
-        assert_eq!(rows[1].pane_id, 5);
+        // Row 1 starts at y=3 + 3 = 6 (rows a+b + gap).
+        assert_eq!(rows[1].y, 6);
+        assert_eq!(rows[1].h, 2);
+        assert_eq!(rows[1].window_index, 1);
     }
 
     #[test]
-    fn sidebar_rows_truncates_when_rect_too_short() {
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            w: 16,
-            h: 4,
-        };
+    fn sidebar_rows_max_entries_uses_saturating_sub() {
+        // rect.h = 2 → zero entries (no room for content).
+        let rect = Rect { x: 0, y: 0, w: 26, h: 2 };
         let entries = vec![
-            SidebarRowInput {
-                window_index: 0,
-                pane_id: 1,
-            },
-            SidebarRowInput {
-                window_index: 1,
-                pane_id: 2,
-            },
-            SidebarRowInput {
-                window_index: 2,
-                pane_id: 3,
-            },
-            SidebarRowInput {
-                window_index: 3,
-                pane_id: 4,
-            },
+            SidebarRowInput { window_index: 0, pane_id: 0 },
         ];
-        let rows = sidebar_rows(rect, &entries);
-        assert_eq!(rows.len(), 2);
+        assert!(sidebar_rows(rect, &entries).is_empty());
     }
 
     #[test]
-    fn sidebar_rows_returns_empty_when_rect_too_short_for_chrome() {
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            w: 16,
-            h: 2,
-        };
-        let entries = vec![SidebarRowInput {
-            window_index: 0,
-            pane_id: 1,
-        }];
-        assert!(sidebar_rows(rect, &entries).is_empty());
+    fn sidebar_rows_truncates_when_rect_too_short_for_all_entries() {
+        // rect.h = 5 → (5 - 3) / 3 = 0 entries.
+        // rect.h = 6 → (6 - 3) / 3 = 1 entry.
+        let rect_one = Rect { x: 0, y: 0, w: 26, h: 6 };
+        let entries = vec![
+            SidebarRowInput { window_index: 0, pane_id: 0 },
+            SidebarRowInput { window_index: 1, pane_id: 1 },
+            SidebarRowInput { window_index: 2, pane_id: 2 },
+        ];
+        let rows = sidebar_rows(rect_one, &entries);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].window_index, 0);
     }
 
     #[test]
