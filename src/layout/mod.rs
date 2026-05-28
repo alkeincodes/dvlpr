@@ -545,9 +545,48 @@ pub fn tab_hit(tabs: &[TabRegion], x: u16) -> Option<usize> {
         .map(|t| t.window)
 }
 
-/// Hit-test a 1-based SGR mouse coordinate against the active window's geometry.
-/// Tab row is checked first, then dividers (a click exactly on a divider means
-/// "resize"), then panes. Returns `Hit::None` for clicks outside everything.
+/// Hit-test within an already-computed content area. Does NOT handle
+/// the tab/status row, sidebar region, or any other chrome — those are
+/// dispatched by `Session::hit` upstream. Tests divider rects first,
+/// then pane rects. Returns `Hit::None` when the click misses everything.
+///
+/// Use this from `Session::hit` after `compute_regions` produces a
+/// `content_area`. Do NOT pass `viewport` here — `hit_test` is the
+/// wrapper for callers that haven't switched to the new API yet.
+pub fn hit_within_content(
+    node: &Node,
+    content_area: Rect,
+    col: u16,
+    row: u16,
+) -> Hit {
+    if col == 0 || row == 0 {
+        return Hit::None;
+    }
+    let x = col - 1;
+    let y = row - 1;
+
+    if !content_area.contains(x, y) {
+        return Hit::None;
+    }
+
+    for d in dividers(node, content_area) {
+        if d.rect.contains(x, y) {
+            return Hit::Divider(d.path);
+        }
+    }
+    for (id, r) in pane_rects(node, content_area) {
+        if r.contains(x, y) {
+            return Hit::Pane(id);
+        }
+    }
+    Hit::None
+}
+
+/// Backward-compatible hit-test that takes the full viewport. Computes
+/// `Regions` internally and delegates content hits to `hit_within_content`.
+/// Tab-row and sidebar dispatch are NOT handled here — callers that need
+/// them should use `compute_regions` and call `hit_within_content`
+/// directly (see `Session::hit`).
 pub fn hit_test(
     node: &Node,
     viewport: Rect,
@@ -556,7 +595,6 @@ pub fn hit_test(
     col: u16,
     row: u16,
 ) -> Hit {
-    // SGR coordinates are 1-based; 0 is invalid. Convert to 0-based.
     if col == 0 || row == 0 {
         return Hit::None;
     }
@@ -573,17 +611,7 @@ pub fn hit_test(
     }
 
     let content = content_area(viewport, window_count);
-    for d in dividers(node, content) {
-        if d.rect.contains(x, y) {
-            return Hit::Divider(d.path);
-        }
-    }
-    for (id, r) in pane_rects(node, content) {
-        if r.contains(x, y) {
-            return Hit::Pane(id);
-        }
-    }
-    Hit::None
+    hit_within_content(node, content, col, row)
 }
 
 #[cfg(test)]
@@ -1321,5 +1349,30 @@ mod tests {
         let rect = Rect { x: 0, y: 0, w: 16, h: 2 };
         let entries = vec![SidebarRowInput { window_index: 0, pane_id: 1 }];
         assert!(sidebar_rows(rect, &entries).is_empty());
+    }
+
+    #[test]
+    fn hit_within_content_returns_pane_for_pane_click() {
+        let tree = Node::Leaf(7);
+        let content = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let hit = hit_within_content(&tree, content, 5, 5);
+        assert_eq!(hit, Hit::Pane(7));
+    }
+
+    #[test]
+    fn hit_within_content_returns_none_outside_content() {
+        let tree = Node::Leaf(7);
+        let content = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let hit = hit_within_content(&tree, content, 5, 12);
+        assert_eq!(hit, Hit::None);
+    }
+
+    #[test]
+    fn hit_test_backward_compat_wrapper_still_works() {
+        let tree = Node::Leaf(1);
+        let vp = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let tabs = vec![];
+        let hit = hit_test(&tree, vp, 1, &tabs, 5, 5);
+        assert_eq!(hit, Hit::Pane(1));
     }
 }
