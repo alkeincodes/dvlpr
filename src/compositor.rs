@@ -127,6 +127,8 @@ impl Compositor {
         zoomed: bool,
         theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
+        sidebar_visible: bool,
+        agent_entries: &[crate::session::AgentEntry],
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -136,8 +138,8 @@ impl Compositor {
         let rows = viewport.h;
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
 
-        let window_count = tab_names.len();
-        let content = layout::content_area(viewport, window_count);
+        let regions = layout::compute_regions(viewport, sidebar_visible);
+        let content = regions.content_area;
         let rects = if zoomed {
             vec![(focused, content)]
         } else {
@@ -161,9 +163,15 @@ impl Compositor {
         }
 
         // Status/tab bar (always present): session prefix at the left, then tabs.
-        if let Some(ty) = layout::tab_row(viewport, window_count) {
-            let regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
-            draw_tabs(&mut buf, cols, ty, session_name, &regions, active_window, theme);
+        {
+            let ty = regions.tab_status_row;
+            let tab_regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
+            draw_tabs(&mut buf, cols, ty, session_name, &tab_regions, active_window, theme);
+        }
+
+        // Sidebar (if visible).
+        if let Some(sb) = regions.sidebar {
+            draw_sidebar(&mut buf, cols, sb, theme, agent_entries);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -211,6 +219,8 @@ impl Compositor {
             zoomed,
             theme,
             panes,
+            false,
+            &[],
         ))
     }
 }
@@ -544,6 +554,105 @@ fn draw_tabs(
         }
     }
 }
+
+fn state_color(theme: &crate::theme::Theme, state: crate::detect::AgentState) -> Color {
+    match state {
+        crate::detect::AgentState::Idle => theme.agent_idle_fg,
+        crate::detect::AgentState::Working => theme.agent_working_fg,
+        crate::detect::AgentState::Blocked => theme.agent_blocked_fg,
+    }
+}
+
+/// Fill the sidebar region with the AGENTS header, a separator, and
+/// one row per agent entry. Layout per the spec:
+///   column 0 (rect.x)        — vertical '│' separator (entire height)
+///   columns 1..15            — 15-cell content area
+///   row 0 of sidebar         — "AGENTS" centered in the content area
+///   row 1 of sidebar         — horizontal '─' rule across the 15 cols
+///   row 2..N                 — entries: " W<n>:claude  ●"
+///                              (n is 1-based for display)
+/// Empty state: rows 2 and 3 read "(no claude" / " panes)" in
+/// theme.inactive_tab_fg (theme-consistent; not visually muted).
+fn draw_sidebar(
+    buf: &mut [StyledCell],
+    cols: u16,
+    rect: layout::Rect,
+    theme: &crate::theme::Theme,
+    entries: &[crate::session::AgentEntry],
+) {
+    let sep_style = CellStyle::default();
+    let header_style = CellStyle::default();
+    let entry_style = CellStyle::default();
+    let placeholder_style = CellStyle {
+        fg: theme.inactive_tab_fg,
+        ..CellStyle::default()
+    };
+
+    for y in rect.y..rect.y + rect.h {
+        let idx = (y as usize) * (cols as usize) + (rect.x as usize);
+        if idx < buf.len() {
+            buf[idx] = StyledCell {
+                ch: '│',
+                style: sep_style,
+            };
+        }
+    }
+
+    let write_into_row =
+        |buf: &mut [StyledCell], y: u16, text: &str, style: CellStyle| {
+            let start_col = rect.x + 1;
+            let end_col = rect.x + SIDEBAR_LABEL_COLS_END;
+            let mut col = start_col;
+            for ch in text.chars() {
+                if col >= end_col {
+                    break;
+                }
+                let idx = (y as usize) * (cols as usize) + (col as usize);
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch, style };
+                }
+                col += 1;
+            }
+        };
+
+    if rect.h >= 1 {
+        write_into_row(buf, rect.y, "    AGENTS     ", header_style);
+    }
+
+    if rect.h >= 2 {
+        write_into_row(buf, rect.y + 1, "───────────────", header_style);
+    }
+
+    if entries.is_empty() {
+        if rect.h >= 3 {
+            write_into_row(buf, rect.y + 2, " (no claude   ", placeholder_style);
+        }
+        if rect.h >= 4 {
+            write_into_row(buf, rect.y + 3, "  panes)      ", placeholder_style);
+        }
+        return;
+    }
+
+    let max_entries = if rect.h >= 2 { (rect.h - 2) as usize } else { 0 };
+    for (i, entry) in entries.iter().take(max_entries).enumerate() {
+        let y = rect.y + 2 + i as u16;
+        let label = format!(" W{}:claude", entry.window_index + 1);
+        write_into_row(buf, y, &label, entry_style);
+        let dot_col = rect.x + 13;
+        let dot_idx = (y as usize) * (cols as usize) + (dot_col as usize);
+        if dot_idx < buf.len() {
+            buf[dot_idx] = StyledCell {
+                ch: '●',
+                style: CellStyle {
+                    fg: state_color(theme, entry.state),
+                    ..CellStyle::default()
+                },
+            };
+        }
+    }
+}
+
+const SIDEBAR_LABEL_COLS_END: u16 = 16;
 
 #[cfg(test)]
 mod tests {
@@ -1152,5 +1261,74 @@ mod tests {
                 "cursor must stay in-range"
             );
         }
+    }
+
+    #[test]
+    fn draw_sidebar_writes_agents_header() {
+        let cols: u16 = 16;
+        let rows: u16 = 6;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        let row0: String = (0..cols).map(|x| buf[x as usize].ch).collect();
+        assert!(row0.contains("AGENTS"), "row0: {row0:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_colors_dot_by_state_from_theme() {
+        let cols: u16 = 16;
+        let rows: u16 = 6;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries = vec![
+            crate::session::AgentEntry {
+                session_name: "test".into(),
+                window_index: 0,
+                pane_id: 1,
+                agent: crate::detect::Agent::Claude,
+                state: crate::detect::AgentState::Working,
+            },
+        ];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        let dot_idx = (2 * cols as usize) + 13;
+        assert_eq!(buf[dot_idx].ch, '●');
+        assert_eq!(buf[dot_idx].style.fg, theme.agent_working_fg);
+    }
+
+    #[test]
+    fn draw_sidebar_dot_colors_change_with_flavor() {
+        let cols: u16 = 16;
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: 6 };
+        let mut buf_latte = vec![StyledCell::default(); (cols as usize) * 6];
+        let mut buf_mocha = vec![StyledCell::default(); (cols as usize) * 6];
+        let latte = crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte);
+        let mocha = crate::theme::Theme::from_flavor(crate::theme::Flavor::Mocha);
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "test".into(),
+            window_index: 0,
+            pane_id: 1,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Idle,
+        }];
+        draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries);
+        draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries);
+        let dot_idx = (2 * cols as usize) + 13;
+        assert_ne!(buf_latte[dot_idx].style.fg, buf_mocha[dot_idx].style.fg);
+    }
+
+    #[test]
+    fn draw_sidebar_empty_state_uses_inactive_tab_fg() {
+        let cols: u16 = 16;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * 6];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: 6 };
+        let theme = crate::theme::Theme::default();
+        draw_sidebar(&mut buf, cols, rect, &theme, &[]);
+        let row2: String = (1..cols).map(|x| buf[(2 * cols as usize) + x as usize].ch).collect();
+        assert!(row2.contains("no claude"), "row2: {row2:?}");
+        let paren_idx = (2 * cols as usize) + 1;
+        assert_eq!(buf[paren_idx].style.fg, theme.inactive_tab_fg);
     }
 }

@@ -243,6 +243,7 @@ impl Session {
             .map(|(id, p)| (*id, &p.screen as &dyn PaneCells))
             .collect();
         let win = &self.windows[self.active_window];
+        let agent_entries = self.agent_entries();
         self.compositor.compose(
             viewport,
             &win.root,
@@ -253,6 +254,8 @@ impl Session {
             win.zoomed,
             &self.theme,
             &refs,
+            self.sidebar_visible,
+            &agent_entries,
         )
     }
 
