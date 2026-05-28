@@ -242,9 +242,10 @@ impl Theme {
     /// Materialise the role mapping for a given flavor. Background roles are
     /// uniform `Color::Default` (transparent) across every flavor: the host
     /// terminal background shows through everywhere except the active-tab
-    /// chip. Foreground roles split on `Flavor::is_light`: Latte uses `text`
-    /// for `active_tab_fg` (text on vivid peach, bold-acceptable contrast);
-    /// dark flavors use `crust` (≥7:1 on pastel peach / muted orange).
+    /// chip. `active_tab_fg` splits on `Flavor::is_light`: Latte uses `text`
+    /// (text on vivid peach, bold-acceptable contrast); dark flavors use
+    /// `crust` (≥7:1 on pastel peach / muted orange). Other foreground roles
+    /// are uniform across flavors (e.g. `session_fg` = the flavor's `mauve`).
     pub fn from_flavor(flavor: Flavor) -> Self {
         let p: &Palette = match flavor {
             Flavor::Latte     => &LATTE,
@@ -256,14 +257,14 @@ impl Theme {
         let active_tab_fg = if flavor.is_light() { p.text } else { p.crust };
         Theme {
             bar_bg:          Color::Default,
-            session_bg:      Color::Default,
             session_fg:      p.mauve,
-            active_tab_bg:   p.peach,
+            session_bg:      Color::Default,
             active_tab_fg,
+            active_tab_bg:   p.peach,
             active_tab_bold: true,
-            inactive_tab_bg: Color::Default,
             inactive_tab_fg: p.text,
-            agent_idle_fg:    p.green,
+            inactive_tab_bg: Color::Default,
+            agent_idle_fg:   p.green,
             agent_working_fg: p.yellow,
             agent_blocked_fg: p.red,
         }
@@ -338,8 +339,8 @@ mod tests {
     fn theme_default_is_latte() {
         let t = Theme::default();
         assert_eq!(t, Theme::from_flavor(Flavor::Latte));
-        // Spot-check the new uniform rule: bar_bg is transparent in every
-        // flavor, including the current default.
+        // Spot-check that the new uniform rule (bar_bg = Color::Default)
+        // applies to the current default flavor.
         assert_eq!(t.bar_bg, Color::Default);
     }
 

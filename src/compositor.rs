@@ -547,7 +547,8 @@ fn draw_tabs(
     // the bar_bg from the row-fill step.)
 
     // Step 3 — tab segments. Active tab (region.window == active_window) gets
-    // peach bg + bold; inactive tabs get surface0 bg. The single-space gaps
+    // peach bg + bold; inactive tabs get the theme's inactive_tab_bg (now
+    // Color::Default — the cell stays default-styled). The single-space gaps
     // between tabs are not overwritten and retain bar_bg from the row-fill.
     for region in regions.iter() {
         let style = if region.window == active_window {
