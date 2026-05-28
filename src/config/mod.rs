@@ -145,6 +145,7 @@ impl Default for KeyMap {
 pub struct Config {
     pub prefix: KeySpec,
     pub keys: KeyMap,
+    pub theme: crate::theme::Theme,
 }
 
 impl Default for Config {
@@ -152,6 +153,7 @@ impl Default for Config {
         Config {
             prefix: KeySpec::Ctrl('a'),
             keys: KeyMap::default(),
+            theme: crate::theme::Theme::default(),
         }
     }
 }
@@ -163,6 +165,8 @@ struct RawConfig {
     prefix: Option<String>,
     #[serde(default)]
     keys: RawKeys,
+    #[serde(default)]
+    theme: RawTheme,
 }
 
 #[derive(Default, Deserialize)]
@@ -182,6 +186,13 @@ struct RawKeys {
     detach: Option<String>,
 }
 
+/// Raw `[theme]` table. Only `flavor` exists in v1; missing/unknown falls back
+/// to Latte (logged) in `from_toml_str`.
+#[derive(Default, Deserialize)]
+struct RawTheme {
+    flavor: Option<String>,
+}
+
 /// Parse one optional spec, falling back to `default` (and logging) on absence or
 /// a malformed value.
 fn spec_or_default(raw: &Option<String>, field: &str, default: KeySpec) -> KeySpec {
@@ -192,6 +203,21 @@ fn spec_or_default(raw: &Option<String>, field: &str, default: KeySpec) -> KeySp
             Err(e) => {
                 tracing::warn!(field, value = %s, error = %e, "bad key spec; using default");
                 default
+            }
+        },
+    }
+}
+
+/// Parse the optional flavor string, falling back to Latte (and logging) on
+/// absence or an unknown value.
+fn flavor_or_default(raw: &Option<String>) -> crate::theme::Theme {
+    match raw {
+        None => crate::theme::Theme::default(),
+        Some(s) => match crate::theme::Flavor::from_str(s) {
+            Ok(f) => crate::theme::Theme::from_flavor(f),
+            Err(e) => {
+                tracing::warn!(field = "theme.flavor", value = %s, error = %e, "bad flavor; using default");
+                crate::theme::Theme::default()
             }
         },
     }
@@ -224,6 +250,7 @@ impl Config {
             }
         };
         let d = KeyMap::default();
+        let theme = flavor_or_default(&raw.theme.flavor);
         Config {
             prefix: spec_or_default(&raw.prefix, "prefix", KeySpec::Ctrl('a')),
             keys: KeyMap {
@@ -243,6 +270,7 @@ impl Config {
                 prev_window: spec_or_default(&raw.keys.prev_window, "prev-window", d.prev_window),
                 detach: spec_or_default(&raw.keys.detach, "detach", d.detach),
             },
+            theme,
         }
     }
 
@@ -374,5 +402,33 @@ mod tests {
         assert_eq!(c.resolve(&Key::Char(b'x')), Some(Command::ClosePane));
         assert_eq!(c.resolve(&Key::Char(b'c')), Some(Command::NewWindow));
         assert_eq!(c.resolve(&Key::Char(b'z')), None);
+    }
+
+    #[test]
+    fn config_default_theme_is_latte() {
+        let c = Config::default();
+        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
+    }
+
+    #[test]
+    fn toml_with_theme_flavor_macchiato_parses() {
+        let c = Config::from_toml_str(r#"[theme]
+flavor = "macchiato"
+"#);
+        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Macchiato));
+    }
+
+    #[test]
+    fn toml_with_unknown_flavor_falls_back_to_latte() {
+        let c = Config::from_toml_str(r#"[theme]
+flavor = "cappuccino"
+"#);
+        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
+    }
+
+    #[test]
+    fn toml_without_theme_section_falls_back_to_latte() {
+        let c = Config::from_toml_str("prefix = \"C-a\"\n");
+        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
     }
 }

@@ -125,6 +125,7 @@ impl Compositor {
         active_window: usize,
         focused: PaneId,
         zoomed: bool,
+        theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Grid {
         debug_assert!(
@@ -155,14 +156,14 @@ impl Compositor {
         if !zoomed {
             for d in layout::dividers(root, content) {
                 let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
-                draw_divider(&mut buf, cols, &d, heavy);
+                draw_divider(&mut buf, cols, &d, heavy, theme);
             }
         }
 
         // Status/tab bar (always present): session prefix at the left, then tabs.
         if let Some(ty) = layout::tab_row(viewport, window_count) {
             let regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
-            draw_tabs(&mut buf, cols, ty, session_name, &regions);
+            draw_tabs(&mut buf, cols, ty, session_name, &regions, active_window, theme);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -197,6 +198,7 @@ impl Compositor {
         active_window: usize,
         focused: PaneId,
         zoomed: bool,
+        theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Vec<u8> {
         serialize_full(&self.compose(
@@ -207,6 +209,7 @@ impl Compositor {
             active_window,
             focused,
             zoomed,
+            theme,
             panes,
         ))
     }
@@ -419,22 +422,29 @@ fn blit_pane(buf: &mut [StyledCell], cols: u16, rect: Rect, pane: &dyn PaneCells
 /// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
 /// focused pane). Junctions where dividers cross are simple last-write-wins
 /// overwrites (proper `┼` junctions are deferred polish).
-fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool) {
+fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool, theme: &crate::theme::Theme) {
     let glyph = match (d.dir, heavy) {
         (SplitDir::Vertical, false) => '│',
         (SplitDir::Vertical, true) => '┃',
         (SplitDir::Horizontal, false) => '─',
         (SplitDir::Horizontal, true) => '━',
     };
+    // Heavy dividers (focused-pane borders) carry the active-tab accent as fg.
+    // Light dividers stay unstyled — they only need the box-drawing character.
+    let style = if heavy {
+        CellStyle {
+            fg: theme.active_tab_bg,
+            ..CellStyle::default()
+        }
+    } else {
+        CellStyle::default()
+    };
     for y in d.rect.y..d.rect.y + d.rect.h {
         for x in d.rect.x..d.rect.x + d.rect.w {
             let idx = y as usize * cols as usize + x as usize;
             if idx < buf.len() {
-                // Chrome (dividers) is unstyled; overwrite any pane style underneath.
-                buf[idx] = StyledCell {
-                    ch: glyph,
-                    style: CellStyle::default(),
-                };
+                // Chrome (dividers) overwrites any pane style underneath.
+                buf[idx] = StyledCell { ch: glyph, style };
             }
         }
     }
@@ -468,32 +478,68 @@ fn draw_tabs(
     ty: u16,
     session_name: &str,
     regions: &[layout::TabRegion],
+    active_window: usize,
+    theme: &crate::theme::Theme,
 ) {
+    // Step 1 — row fill: paint the whole bar row with bar_bg so gaps and the
+    // right edge carry the bar color. Subsequent segment writes overwrite the
+    // specific cells they occupy.
+    let bar_style = CellStyle {
+        bg: theme.bar_bg,
+        fg: theme.inactive_tab_fg,
+        ..CellStyle::default()
+    };
+    for x in 0..cols as usize {
+        let idx = ty as usize * cols as usize + x;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch: ' ', style: bar_style };
+        }
+    }
+
+    // Step 2 — session prefix segment (mauve / contrast fg).
+    let session_style = CellStyle {
+        bg: theme.session_bg,
+        fg: theme.session_fg,
+        ..CellStyle::default()
+    };
     for (x, ch) in session_name.chars().enumerate() {
         if x >= cols as usize {
             break;
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell {
-                ch,
-                style: CellStyle::default(),
-            };
+            buf[idx] = StyledCell { ch, style: session_style };
         }
     }
-    // (the two-space gap is left blank; regions' x_start already accounts for it)
-    for region in regions {
-        for (i, ch) in region.label.chars().enumerate() {
-            let x = region.x_start as usize + i;
+    // (The two-space gap after the session prefix is left untouched — it keeps
+    // the bar_bg from the row-fill step.)
+
+    // Step 3 — tab segments. Active tab (region.window == active_window) gets
+    // peach bg + bold; inactive tabs get surface0 bg. The single-space gaps
+    // between tabs are not overwritten and retain bar_bg from the row-fill.
+    for region in regions.iter() {
+        let style = if region.window == active_window {
+            CellStyle {
+                bg: theme.active_tab_bg,
+                fg: theme.active_tab_fg,
+                bold: theme.active_tab_bold,
+                ..CellStyle::default()
+            }
+        } else {
+            CellStyle {
+                bg: theme.inactive_tab_bg,
+                fg: theme.inactive_tab_fg,
+                ..CellStyle::default()
+            }
+        };
+        for (j, ch) in region.label.chars().enumerate() {
+            let x = region.x_start as usize + j;
             if x >= cols as usize {
                 break;
             }
             let idx = ty as usize * cols as usize + x;
             if idx < buf.len() {
-                buf[idx] = StyledCell {
-                    ch,
-                    style: CellStyle::default(),
-                };
+                buf[idx] = StyledCell { ch, style };
             }
         }
     }
@@ -553,6 +599,31 @@ mod tests {
         s.chars().map(sc).collect()
     }
 
+    /// Strip all ANSI CSI escape sequences from `s`, leaving only printable
+    /// characters. A CSI sequence is `ESC [` followed by any number of parameter
+    /// bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F), terminated by a final
+    /// byte in the range 0x40-0x7E. Used in tests that assert structural content
+    /// of rendered frames without being coupled to exact SGR byte sequences.
+    fn strip_csi(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // CSI sequence: skip until we hit a byte in 0x40–0x7E (the final byte).
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1; // consume final byte
+            } else {
+                out.push(s[i..].chars().next().unwrap());
+                i += s[i..].chars().next().unwrap().len_utf8();
+            }
+        }
+        out
+    }
+
     #[test]
     fn compositor_constructs() {
         let _c = Compositor::new();
@@ -602,11 +673,29 @@ mod tests {
             dir: SplitDir::Vertical,
         };
         let at = |r: usize, c: usize| r * cols as usize + c;
-        draw_divider(&mut buf, cols, &d, false);
+        // Theme with a sentinel active accent so we can recognise it in the buffer.
+        let theme = crate::theme::Theme {
+            active_tab_bg: Color::Rgb(99, 99, 99),
+            ..crate::theme::Theme::default()
+        };
+
+        // Light divider (heavy = false): glyph is the light one and style is default.
+        draw_divider(&mut buf, cols, &d, false, &theme);
         assert_eq!(buf[at(0, 2)].ch, '│');
         assert_eq!(buf[at(1, 2)].ch, '│');
-        draw_divider(&mut buf, cols, &d, true);
-        assert_eq!(buf[at(0, 2)].ch, '┃'); // heavy
+        assert_eq!(buf[at(0, 2)].style, CellStyle::default());
+        assert_eq!(buf[at(1, 2)].style, CellStyle::default());
+
+        // Heavy divider (heavy = true): glyph is the heavy one AND the fg
+        // carries the active accent (Color::Rgb(99, 99, 99)). All other style
+        // fields stay default (no bg, no bold).
+        draw_divider(&mut buf, cols, &d, true, &theme);
+        assert_eq!(buf[at(0, 2)].ch, '┃');
+        assert_eq!(buf[at(1, 2)].ch, '┃');
+        assert_eq!(buf[at(0, 2)].style.fg, Color::Rgb(99, 99, 99));
+        assert_eq!(buf[at(1, 2)].style.fg, Color::Rgb(99, 99, 99));
+        assert_eq!(buf[at(0, 2)].style.bg, Color::Default, "heavy divider has no bg");
+        assert!(!buf[at(0, 2)].style.bold, "heavy divider is not bold");
     }
 
     #[test]
@@ -646,12 +735,72 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn draw_tabs_paints_themed_blocks() {
+        // 30-column bar row. Three windows: active = index 1 ("vim"). Sentinel
+        // colors per role so the assertions are unambiguous.
+        let cols: u16 = 30;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            bar_bg: Color::Rgb(1, 1, 1),
+            session_fg: Color::Rgb(2, 2, 2),
+            session_bg: Color::Rgb(3, 3, 3),
+            active_tab_fg: Color::Rgb(4, 4, 4),
+            active_tab_bg: Color::Rgb(5, 5, 5),
+            active_tab_bold: true,
+            inactive_tab_fg: Color::Rgb(6, 6, 6),
+            inactive_tab_bg: Color::Rgb(7, 7, 7),
+        };
+        let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
+        let active_window = 1;
+        let regions = layout::tab_layout("work", &names, active_window, false, cols);
+        draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme);
+
+        // Session prefix "work" occupies x=0..=3.
+        for x in 0..4 {
+            assert_eq!(buf[x].style.bg, theme.session_bg, "session bg at x={x}");
+            assert_eq!(buf[x].style.fg, theme.session_fg, "session fg at x={x}");
+        }
+        // Two-space gap (x=4..=5) retains bar_bg and inactive_tab_fg from
+        // the row-fill step (fg is set so future overlay characters in gap
+        // cells have a sensible color rather than the terminal default).
+        for x in 4..6 {
+            assert_eq!(buf[x].style.bg, theme.bar_bg, "gap bg at x={x}");
+            assert_eq!(buf[x].style.fg, theme.inactive_tab_fg, "gap fg at x={x}");
+        }
+        // Active tab (window 1, "2:vim*") starts at the second region's x_start.
+        let active_region = &regions[1];
+        for x in active_region.x_start..=active_region.x_end {
+            let i = x as usize;
+            assert_eq!(buf[i].style.bg, theme.active_tab_bg, "active bg at x={x}");
+            assert_eq!(buf[i].style.fg, theme.active_tab_fg, "active fg at x={x}");
+            assert!(buf[i].style.bold, "active is bold at x={x}");
+        }
+        // Inactive tabs (regions 0 and 2) carry the inactive bg/fg and are NOT bold.
+        for r in [&regions[0], &regions[2]] {
+            for x in r.x_start..=r.x_end {
+                let i = x as usize;
+                assert_eq!(buf[i].style.bg, theme.inactive_tab_bg, "inactive bg at x={x}");
+                assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "inactive fg at x={x}");
+                assert!(!buf[i].style.bold, "inactive is not bold at x={x}");
+            }
+        }
+        // The right-edge fill: every cell beyond the last region carries bar_bg.
+        let last = regions.last().unwrap().x_end;
+        for x in (last + 1)..cols {
+            let i = x as usize;
+            assert_eq!(buf[i].style.bg, theme.bar_bg, "right-edge fill at x={x}");
+            assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "right-edge fg at x={x}");
+        }
+    }
+
+    #[test]
     fn draw_tabs_writes_labels_at_their_ranges() {
         let cols: u16 = 20;
         let mut buf = vec![StyledCell::default(); 20 * 2];
         let regions = layout::tab_layout("s", &["a".to_string(), "b".to_string()], 0, false, cols);
         // Tab row is the last row (y = 1).
-        draw_tabs(&mut buf, cols, 1, "s", &regions);
+        draw_tabs(&mut buf, cols, 1, "s", &regions, 0, &crate::theme::Theme::default());
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
         let row: String = (0..cols)
             .map(|x| buf[cols as usize + x as usize].ch)
@@ -685,13 +834,18 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &pane)],
         );
         let s = String::from_utf8(out).unwrap();
-        // Content area is h=1; pane row 0 ("ab ") fills it.
-        // Bar row (y=1): "s  " (prefix at x=0, two blank spaces for the gap).
-        // Cursor: pane rect {x:0,y:0,w:3,h:1}, pane cursor (1,0) -> global (1,0) -> "\x1b[1;2H".
-        assert_eq!(s, "\x1b[2J\x1b[H\x1b[0mab \r\ns  \x1b[1;2H");
+        // Themed bar: the rendered bytes include SGR escapes for the row-fill
+        // and the session prefix. Assert structure rather than exact bytes so
+        // palette tweaks don't churn this test.
+        assert!(s.starts_with("\x1b[2J\x1b[H\x1b[0m"), "frame must start with clear+home+reset, got: {s:?}");
+        assert!(s.contains("ab "), "frame must contain the pane row content");
+        let plain = strip_csi(&s);
+        assert!(plain.contains("s  "), "frame must contain the session prefix + two-space gap, plain={plain:?}");
+        assert!(s.ends_with("\x1b[1;2H"), "frame must end with the cursor CUP");
     }
 
     #[test]
@@ -722,11 +876,17 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &left), (2, &right)],
         );
         let s = String::from_utf8(out).unwrap();
         // content h=1: avail=6, first_w=3 (x0..2), divider x3, right x4..6.
-        assert!(s.contains("LLL┃RRR")); // heavy divider because pane 1 is focused
+        // The heavy divider now carries an fg SGR escape between "LLL" and
+        // "┃", so the contiguous "LLL┃RRR" substring no longer holds in the
+        // raw bytes. Strip CSI escapes first, then the original ordered check
+        // still works.
+        let plain = strip_csi(&s);
+        assert!(plain.contains("LLL┃RRR"), "ordered divider content present in stripped frame; got: {plain:?}");
     }
 
     #[test]
@@ -742,7 +902,7 @@ mod tests {
         };
         // Two windows -> the bottom row has session prefix + tab labels.
         let names = vec!["one".to_string(), "two".to_string()];
-        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &[(1, &pane)]);
+        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &crate::theme::Theme::default(), &[(1, &pane)]);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("1:one")); // inactive window 0 (1-based, no marker)
         assert!(s.contains("2:two*")); // active window 1 marked with '*'
@@ -756,6 +916,7 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &pane)],
         );
         let s2 = String::from_utf8(single).unwrap();
@@ -840,6 +1001,7 @@ mod tests {
             0,
             2,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &top), (2, &bottom)],
         );
         let s = String::from_utf8(out).unwrap();
