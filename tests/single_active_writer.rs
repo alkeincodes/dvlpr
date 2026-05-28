@@ -115,21 +115,38 @@ async fn until_full_frame_dims(r: &mut Reader, secs: u64, cols: u16, rows: u16) 
     false
 }
 
-/// Split a FULL frame (`\x1b[2J\x1b[H\x1b[0m` + rows joined by `\r\n` + a trailing
-/// cursor CUP) into its content rows. `serialize_full` emits every cell, so each row is
-/// exactly the grid's width and the row count equals the grid's height. The pane here
-/// (`stty size`) emits no color, so after stripping the leading clear+home+reset the only
-/// remaining ESC is the trailing CUP, which we cut off.
+/// Strip all ANSI CSI escape sequences from `s`, leaving only printable
+/// characters. A CSI sequence is `ESC [` followed by any number of parameter
+/// bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F), terminated by a final
+/// byte in the range 0x40-0x7E.
+fn strip_csi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                i += 1;
+            }
+            i += 1; // consume final byte
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Split a serialized full-frame frame into its content rows (one `String` per row).
+/// Strips ALL CSI/SGR escapes (clear+home, leading SGR reset, the themed status-bar
+/// runs, and the trailing cursor CUP) so each row contains only printable
+/// characters and the count of `chars()` per row equals the grid's column width.
 fn full_frame_rows(data: &[u8]) -> Vec<String> {
     let s = String::from_utf8_lossy(data);
-    let body = s.strip_prefix("\x1b[2J\x1b[H").unwrap_or(&s);
-    // serialize_full always resets the pen right after clear+home.
-    let body = body.strip_prefix("\x1b[0m").unwrap_or(body);
-    let body = match body.rfind("\x1b[") {
-        Some(i) => &body[..i],
-        None => body,
-    };
-    body.split("\r\n").map(|r| r.to_string()).collect()
+    let plain = strip_csi(&s);
+    plain.split("\r\n").map(|r| r.to_string()).collect()
 }
 
 #[tokio::test]
