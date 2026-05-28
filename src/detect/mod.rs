@@ -10,6 +10,7 @@ use spinner_verbs::SPINNER_VERBS;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Agent {
     Claude,
+    Codex,
 }
 
 /// The classified state of a known agent inside a pane.
@@ -26,6 +27,7 @@ pub enum AgentState {
 pub fn agent_for(process_name: &str) -> Option<Agent> {
     match process_name {
         "claude" => Some(Agent::Claude),
+        "codex" => Some(Agent::Codex),
         _ => None,
     }
 }
@@ -36,6 +38,7 @@ pub fn agent_for(process_name: &str) -> Option<Agent> {
 pub fn classify(agent: Agent, tail: &str) -> AgentState {
     match agent {
         Agent::Claude => classify_claude(tail),
+        Agent::Codex => AgentState::Idle,
     }
 }
 
@@ -239,9 +242,16 @@ mod tests {
     #[test]
     fn agent_for_known_names() {
         assert_eq!(agent_for("claude"), Some(Agent::Claude));
+        assert_eq!(agent_for("codex"), Some(Agent::Codex));
         assert_eq!(agent_for("zsh"), None);
         assert_eq!(agent_for(""), None);
         assert_eq!(agent_for("Claude"), None); // case-sensitive
+        assert_eq!(agent_for("Codex"), None); // case-sensitive
+    }
+
+    #[test]
+    fn agent_for_codex_name_returns_codex_variant() {
+        assert_eq!(agent_for("codex"), Some(Agent::Codex));
     }
 
     #[test]
