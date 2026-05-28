@@ -56,6 +56,32 @@ impl Drop for MouseGuard {
     }
 }
 
+/// Enables DECSET 1004 (focus reporting) on construction and disables it on drop,
+/// so the user's host terminal sends `\x1b[I` / `\x1b[O` while the client is
+/// attached and stops on detach. The bytes flow over the wire inside the existing
+/// `ClientMsg::Input` and are interpreted server-side by `InputParser` —
+/// FocusIn promotes this client to foreground (interaction-driven promote-most-recent),
+/// FocusOut is consumed and dropped. Writes synchronously to stdout (teardown
+/// must not depend on the async runtime still running).
+struct FocusGuard;
+
+impl FocusGuard {
+    fn enable() -> io::Result<Self> {
+        let mut out = io::stdout();
+        out.write_all(b"\x1b[?1004h")?;
+        out.flush()?;
+        Ok(FocusGuard)
+    }
+}
+
+impl Drop for FocusGuard {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b[?1004l");
+        let _ = out.flush();
+    }
+}
+
 /// Switches the terminal to its alternate screen buffer on construction and back to the
 /// primary screen (restoring the user's prior content + scrollback) on drop. This is the
 /// standard mechanism full-screen apps (vim, tmux, less) use to claim the whole screen;
@@ -114,11 +140,12 @@ pub async fn attach(socket_path: &Path) -> io::Result<()> {
     }
 
     // Guards restore terminal state on every exit path (including panic/early return).
-    // Declared outermost-first so Drop runs in reverse: mouse off, raw off, then leave
-    // the alt screen LAST — which restores the user's original screen + scrollback, so no
-    // manual clear is needed here.
+    // Declared outermost-first so Drop runs in reverse: mouse off, focus off, raw off,
+    // then leave the alt screen LAST — which restores the user's original screen +
+    // scrollback, so no manual clear is needed here.
     let _alt = AltScreenGuard::enter()?;
     let _raw = RawModeGuard::enable()?;
+    let _focus = FocusGuard::enable()?;
     let _mouse = MouseGuard::enable()?;
     run_loop(read_half, write_half).await
 }
