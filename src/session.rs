@@ -139,15 +139,16 @@ impl Session {
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
-        let content = layout::content_area(
+        let content = layout::compute_regions(
             Rect {
                 x: 0,
                 y: 0,
                 w: cols,
                 h: rows,
             },
-            1,
-        );
+            session.sidebar_visible,
+        )
+        .content_area;
         let (id, rx) = session.spawn_pane(content)?;
         session.windows.push(Window {
             name: initial_window_name(&session.command),
@@ -193,11 +194,21 @@ impl Session {
         }
     }
 
+    /// Toggle the sidebar's visibility and cascade the layout change.
+    /// Flips `sidebar_visible`, then calls `relayout_all()` so every
+    /// pane's PTY and GhosttyScreen resize to the new content-area width.
+    /// Without the relayout, child processes (vim, claude, less) keep
+    /// rendering at the old width and corrupt their output.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.relayout_all();
+    }
+
     /// Resize every pane's PTY + screen to the rect the current geometry assigns
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
     fn relayout_all(&mut self) {
-        let content = layout::content_area(self.viewport(), self.windows.len());
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
             // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
@@ -363,7 +374,7 @@ impl Session {
                 self.relayout_all();
             }
             Command::ToggleSidebar => {
-                // Task 12 implements this. Stub keeps build green.
+                self.toggle_sidebar();
             }
             Command::Detach => eff.detach = true,
         }
@@ -376,7 +387,7 @@ impl Session {
             return;
         };
         let focused = win.focused;
-        let content = layout::content_area(self.viewport(), self.windows.len());
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         let Some((_, rect)) = layout::pane_rects(&win.root, content)
             .into_iter()
             .find(|(id, _)| *id == focused)
@@ -425,8 +436,7 @@ impl Session {
     }
 
     fn new_window(&mut self, eff: &mut CommandEffect) {
-        let new_count = self.windows.len() + 1;
-        let content = layout::content_area(self.viewport(), new_count);
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         let (id, rx) = match self.spawn_pane(content) {
             Ok(v) => v,
             Err(_) => return,
@@ -523,7 +533,7 @@ impl Session {
     /// the active window is zoomed, this is just the focused pane at the full
     /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
-        let content = layout::content_area(self.viewport(), self.windows.len());
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         match self.windows.get(self.active_window) {
             Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
@@ -802,7 +812,7 @@ impl Session {
     /// active one). If that window is gone or the path no longer leads to a split,
     /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
     fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
-        let content = layout::content_area(self.viewport(), self.windows.len());
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         let Some(win) = self.windows.get_mut(window) else {
             return;
         };
@@ -1520,5 +1530,36 @@ mod tests {
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
         let entries = session.agent_entries();
         assert_eq!(entries[0].session_name, "test");
+    }
+
+    #[tokio::test]
+    async fn toggle_sidebar_flips_visible() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        assert!(!session.sidebar_visible, "default hidden");
+        session.toggle_sidebar();
+        assert!(session.sidebar_visible);
+        session.toggle_sidebar();
+        assert!(!session.sidebar_visible);
+    }
+
+    #[tokio::test]
+    async fn toggle_sidebar_resizes_panes_via_relayout_all() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        let initial_cols = session.panes.get(&pane_id).unwrap().screen.cols();
+        session.toggle_sidebar();
+        let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
+        assert_eq!(after_cols, initial_cols - 16);
+        session.toggle_sidebar();
+        assert_eq!(session.panes.get(&pane_id).unwrap().screen.cols(), initial_cols);
+    }
+
+    #[tokio::test]
+    async fn command_toggle_sidebar_via_apply_command() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        let _eff = session.apply_command(crate::config::Command::ToggleSidebar);
+        assert!(session.sidebar_visible);
+        let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
+        // initial cols from helper is 80; sidebar shrinks by 16
+        assert_eq!(after_cols, 80 - 16);
     }
 }
