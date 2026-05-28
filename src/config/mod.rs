@@ -19,6 +19,7 @@ pub enum Command {
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
     ToggleZoom,          // C-a 0: fullscreen the focused pane (toggle)
+    ToggleSidebar,       // C-a s: show/hide agent-awareness sidebar
     Detach,
 }
 
@@ -407,28 +408,44 @@ mod tests {
     #[test]
     fn config_default_theme_is_latte() {
         let c = Config::default();
-        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
+        assert_eq!(
+            c.theme,
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+        );
     }
 
     #[test]
     fn toml_with_theme_flavor_macchiato_parses() {
-        let c = Config::from_toml_str(r#"[theme]
+        let c = Config::from_toml_str(
+            r#"[theme]
 flavor = "macchiato"
-"#);
-        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Macchiato));
+"#,
+        );
+        assert_eq!(
+            c.theme,
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::Macchiato)
+        );
     }
 
     #[test]
     fn toml_with_unknown_flavor_falls_back_to_latte() {
-        let c = Config::from_toml_str(r#"[theme]
+        let c = Config::from_toml_str(
+            r#"[theme]
 flavor = "cappuccino"
-"#);
-        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
+"#,
+        );
+        assert_eq!(
+            c.theme,
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+        );
     }
 
     #[test]
     fn toml_without_theme_section_falls_back_to_latte() {
         let c = Config::from_toml_str("prefix = \"C-a\"\n");
-        assert_eq!(c.theme, crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte));
+        assert_eq!(
+            c.theme,
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+        );
     }
 }

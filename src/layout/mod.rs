@@ -79,6 +79,12 @@ pub enum Hit {
     Pane(PaneId),
     Divider(SplitPath),
     Tab(usize),
+    /// Click on a row inside the agent-awareness sidebar.
+    /// `window_index` is 0-based to match `Session.active_window`.
+    SidebarEntry {
+        window_index: usize,
+        pane_id: PaneId,
+    },
     None,
 }
 
@@ -102,6 +108,69 @@ pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
         }
     } else {
         viewport
+    }
+}
+
+/// Width in cols of the agent-awareness sidebar when visible. Includes
+/// the 1-col left-edge vertical separator.
+pub const SIDEBAR_COLS: u16 = 16;
+
+/// Minimum content-area width to keep the sidebar visible. If the
+/// viewport is narrower than SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS,
+/// `compute_regions` silently suppresses the sidebar (returns None)
+/// even when sidebar_visible is true.
+pub const SIDEBAR_MIN_CONTENT_COLS: u16 = 20;
+
+/// Viewport partitioning consumed by both the compositor (render) and
+/// Session::hit (click dispatch). Unifies the previously-separate
+/// `tab_row()` + `content_area()` helpers and carves off the sidebar
+/// when visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Regions {
+    /// Pane content area: viewport MINUS the bottom tab/status row,
+    /// MINUS the sidebar columns on the right (when visible).
+    pub content_area: Rect,
+    /// y-coordinate of the always-present bottom tab/status row.
+    /// Spans the FULL viewport width — sidebar does NOT shorten it.
+    pub tab_status_row: u16,
+    /// Sidebar region when visible AND viewport is wide enough. None
+    /// otherwise — including when the `sidebar_visible` flag is true
+    /// but `viewport.w < SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS`.
+    pub sidebar: Option<Rect>,
+}
+
+/// Compute the viewport partition. Single function the compositor and
+/// hit-test both call — no API takes `(cols, rows, sidebar_visible)`
+/// elsewhere.
+pub fn compute_regions(viewport: Rect, sidebar_visible: bool) -> Regions {
+    let tab_status_row = viewport.y + viewport.h.saturating_sub(1);
+    let content_h = viewport.h.saturating_sub(1);
+
+    let effective_visible =
+        sidebar_visible && viewport.w >= SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS;
+
+    let (content_w, sidebar) = if effective_visible {
+        let content_w = viewport.w - SIDEBAR_COLS;
+        let sidebar_rect = Rect {
+            x: viewport.x + content_w,
+            y: viewport.y,
+            w: SIDEBAR_COLS,
+            h: content_h,
+        };
+        (content_w, Some(sidebar_rect))
+    } else {
+        (viewport.w, None)
+    };
+
+    Regions {
+        content_area: Rect {
+            x: viewport.x,
+            y: viewport.y,
+            w: content_w,
+            h: content_h,
+        },
+        tab_status_row,
+        sidebar,
     }
 }
 
@@ -428,6 +497,49 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// What `Session::hit` passes to `sidebar_rows` — just the click-target
+/// ids. Layout-local so this module doesn't import `session::AgentEntry`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarRowInput {
+    pub window_index: usize, // 0-based
+    pub pane_id: PaneId,
+}
+
+/// One entry's position within the sidebar region. The y coordinate is
+/// in viewport coords (not sidebar-relative), so hit-test comparisons
+/// can be done against the raw mouse row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarRow {
+    pub y: u16,
+    pub window_index: usize,
+    pub pane_id: PaneId,
+}
+
+/// Compute per-row click targets for the visible sidebar entries.
+/// Layout is fixed at the top of `sidebar`:
+///   row 0 (rect.y + 0) — "AGENTS" header (NOT a click target)
+///   row 1 (rect.y + 1) — horizontal '─' separator
+///   row 2..N — one row per entry from `entries`, truncated to fit
+///              within `rect.h`
+///
+/// Used by both `Compositor::draw_sidebar` (to know where to write each
+/// row) and `Session::hit` (to translate a click to a SidebarEntry).
+pub fn sidebar_rows(rect: Rect, entries: &[SidebarRowInput]) -> Vec<SidebarRow> {
+    let mut out = Vec::with_capacity(entries.len());
+    if rect.h < 3 {
+        return out;
+    }
+    let max_entries = (rect.h - 2) as usize;
+    for (i, e) in entries.iter().take(max_entries).enumerate() {
+        out.push(SidebarRow {
+            y: rect.y + 2 + i as u16,
+            window_index: e.window_index,
+            pane_id: e.pane_id,
+        });
+    }
+    out
+}
+
 /// Resolve a 0-based x within the tab row to the window index whose `TabRegion`
 /// contains it, or `None` if the click landed in the gap/prefix.
 pub fn tab_hit(tabs: &[TabRegion], x: u16) -> Option<usize> {
@@ -436,9 +548,43 @@ pub fn tab_hit(tabs: &[TabRegion], x: u16) -> Option<usize> {
         .map(|t| t.window)
 }
 
-/// Hit-test a 1-based SGR mouse coordinate against the active window's geometry.
-/// Tab row is checked first, then dividers (a click exactly on a divider means
-/// "resize"), then panes. Returns `Hit::None` for clicks outside everything.
+/// Hit-test within an already-computed content area. Does NOT handle
+/// the tab/status row, sidebar region, or any other chrome — those are
+/// dispatched by `Session::hit` upstream. Tests divider rects first,
+/// then pane rects. Returns `Hit::None` when the click misses everything.
+///
+/// Use this from `Session::hit` after `compute_regions` produces a
+/// `content_area`. Do NOT pass `viewport` here — `hit_test` is the
+/// wrapper for callers that haven't switched to the new API yet.
+pub fn hit_within_content(node: &Node, content_area: Rect, col: u16, row: u16) -> Hit {
+    if col == 0 || row == 0 {
+        return Hit::None;
+    }
+    let x = col - 1;
+    let y = row - 1;
+
+    if !content_area.contains(x, y) {
+        return Hit::None;
+    }
+
+    for d in dividers(node, content_area) {
+        if d.rect.contains(x, y) {
+            return Hit::Divider(d.path);
+        }
+    }
+    for (id, r) in pane_rects(node, content_area) {
+        if r.contains(x, y) {
+            return Hit::Pane(id);
+        }
+    }
+    Hit::None
+}
+
+/// Backward-compatible hit-test that takes the full viewport. Computes
+/// `Regions` internally and delegates content hits to `hit_within_content`.
+/// Tab-row and sidebar dispatch are NOT handled here — callers that need
+/// them should use `compute_regions` and call `hit_within_content`
+/// directly (see `Session::hit`).
 pub fn hit_test(
     node: &Node,
     viewport: Rect,
@@ -447,7 +593,6 @@ pub fn hit_test(
     col: u16,
     row: u16,
 ) -> Hit {
-    // SGR coordinates are 1-based; 0 is invalid. Convert to 0-based.
     if col == 0 || row == 0 {
         return Hit::None;
     }
@@ -464,17 +609,7 @@ pub fn hit_test(
     }
 
     let content = content_area(viewport, window_count);
-    for d in dividers(node, content) {
-        if d.rect.contains(x, y) {
-            return Hit::Divider(d.path);
-        }
-    }
-    for (id, r) in pane_rects(node, content) {
-        if r.contains(x, y) {
-            return Hit::Pane(id);
-        }
-    }
-    Hit::None
+    hit_within_content(node, content, col, row)
 }
 
 #[cfg(test)]
@@ -1136,5 +1271,180 @@ mod tests {
             h: 0,
         };
         assert!(!empty.contains(0, 0)); // zero-size contains nothing
+    }
+
+    #[test]
+    fn compute_regions_gives_full_width_when_sidebar_hidden() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let r = compute_regions(vp, false);
+        assert_eq!(r.content_area.w, 80);
+        assert_eq!(r.content_area.h, 23);
+        assert_eq!(r.tab_status_row, 23);
+        assert_eq!(r.sidebar, None);
+    }
+
+    #[test]
+    fn compute_regions_reserves_sidebar_width_when_visible() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.content_area.w, 80 - SIDEBAR_COLS);
+        assert_eq!(r.content_area.h, 23);
+        assert_eq!(r.tab_status_row, 23);
+        let sb = r.sidebar.expect("sidebar present");
+        assert_eq!(sb.x, 80 - SIDEBAR_COLS);
+        assert_eq!(sb.w, SIDEBAR_COLS);
+        assert_eq!(sb.h, 23);
+    }
+
+    #[test]
+    fn compute_regions_suppresses_sidebar_below_threshold() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 30,
+            h: 24,
+        };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.sidebar, None);
+        assert_eq!(r.content_area.w, 30, "content should keep full width");
+    }
+
+    #[test]
+    fn compute_regions_does_not_panic_on_zero_width() {
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.content_area.w, 0);
+        assert_eq!(r.content_area.h, 0);
+        assert_eq!(r.tab_status_row, 0);
+        assert_eq!(r.sidebar, None);
+    }
+
+    #[test]
+    fn sidebar_rows_assigns_one_row_per_entry_below_header_and_separator() {
+        let rect = Rect {
+            x: 64,
+            y: 0,
+            w: 16,
+            h: 10,
+        };
+        let entries = vec![
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 5,
+            },
+        ];
+        let rows = sidebar_rows(rect, &entries);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].y, 2,
+            "first entry at row 2 (after header+separator)"
+        );
+        assert_eq!(rows[1].y, 3);
+        assert_eq!(rows[0].window_index, 0);
+        assert_eq!(rows[1].pane_id, 5);
+    }
+
+    #[test]
+    fn sidebar_rows_truncates_when_rect_too_short() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 4,
+        };
+        let entries = vec![
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 2,
+            },
+            SidebarRowInput {
+                window_index: 2,
+                pane_id: 3,
+            },
+            SidebarRowInput {
+                window_index: 3,
+                pane_id: 4,
+            },
+        ];
+        let rows = sidebar_rows(rect, &entries);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn sidebar_rows_returns_empty_when_rect_too_short_for_chrome() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 2,
+        };
+        let entries = vec![SidebarRowInput {
+            window_index: 0,
+            pane_id: 1,
+        }];
+        assert!(sidebar_rows(rect, &entries).is_empty());
+    }
+
+    #[test]
+    fn hit_within_content_returns_pane_for_pane_click() {
+        let tree = Node::Leaf(7);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let hit = hit_within_content(&tree, content, 5, 5);
+        assert_eq!(hit, Hit::Pane(7));
+    }
+
+    #[test]
+    fn hit_within_content_returns_none_outside_content() {
+        let tree = Node::Leaf(7);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let hit = hit_within_content(&tree, content, 5, 12);
+        assert_eq!(hit, Hit::None);
+    }
+
+    #[test]
+    fn hit_test_backward_compat_wrapper_still_works() {
+        let tree = Node::Leaf(1);
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let tabs = vec![];
+        let hit = hit_test(&tree, vp, 1, &tabs, 5, 5);
+        assert_eq!(hit, Hit::Pane(1));
     }
 }

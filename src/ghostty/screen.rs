@@ -154,6 +154,38 @@ impl GhosttyScreen {
         }
     }
 
+    /// Return the last `rows` rows of the screen as a single flat string
+    /// with `'\n'` row separators. Plain text only — styling is dropped.
+    /// Returns an empty string if `rows == 0`. If `rows` exceeds the
+    /// screen height, returns all rows.
+    ///
+    /// Trailing whitespace on each row is stripped (cells past the last
+    /// non-space character are dropped before joining). Used by the
+    /// agent-state classifier; not for rendering.
+    pub fn tail_text(&self, rows: u16) -> String {
+        if rows == 0 || self.rows == 0 {
+            return String::new();
+        }
+        let take = rows.min(self.rows);
+        let start_y = self.rows - take;
+        let mut out = String::with_capacity((take as usize) * (self.cols as usize + 1));
+        for y in start_y..self.rows {
+            let mut line = String::with_capacity(self.cols as usize);
+            for x in 0..self.cols {
+                line.push(self.cell(x, y));
+            }
+            // Strip trailing whitespace per row.
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            out.push_str(&line);
+            if y + 1 < self.rows {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// The character AND its style at (x, y). A single grid-ref lookup feeds both the
     /// codepoint and the cell style, so this is the path the compositor blits through
     /// (color/attributes preserved). Out-of-range or any FFI failure degrades to a
@@ -473,5 +505,44 @@ mod tests {
             s.take_pty_writes().is_empty(),
             "DECSET 1004 (disable) must not produce a PTY reply"
         );
+    }
+
+    #[test]
+    fn tail_text_returns_last_n_rows_in_order() {
+        let mut s = GhosttyScreen::new(20, 5);
+        s.feed(b"row1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
+        let tail = s.tail_text(3);
+        assert!(tail.contains("row3"), "tail: {tail:?}");
+        assert!(tail.contains("row4"), "tail: {tail:?}");
+        assert!(tail.contains("row5"), "tail: {tail:?}");
+        assert!(!tail.contains("row2"), "tail: {tail:?}");
+        assert!(!tail.contains("row1"), "tail: {tail:?}");
+    }
+
+    #[test]
+    fn tail_text_clamps_to_screen_height() {
+        let mut s = GhosttyScreen::new(20, 3);
+        s.feed(b"a\r\nb\r\nc");
+        let tail = s.tail_text(10);
+        assert!(tail.contains("a"), "tail: {tail:?}");
+        assert!(tail.contains("b"), "tail: {tail:?}");
+        assert!(tail.contains("c"), "tail: {tail:?}");
+    }
+
+    #[test]
+    fn tail_text_zero_rows_returns_empty() {
+        let mut s = GhosttyScreen::new(20, 5);
+        s.feed(b"hello");
+        assert_eq!(s.tail_text(0), "");
+    }
+
+    #[test]
+    fn tail_text_trims_trailing_blanks_per_row() {
+        let mut s = GhosttyScreen::new(20, 2);
+        s.feed(b"hi");
+        let tail = s.tail_text(2);
+        for line in tail.lines() {
+            assert_eq!(line, line.trim_end(), "line should be trimmed: {line:?}");
+        }
     }
 }

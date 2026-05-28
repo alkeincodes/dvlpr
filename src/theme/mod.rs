@@ -3,8 +3,8 @@
 //! role mapping the compositor consumes. See
 //! `docs/superpowers/specs/2026-05-28-status-bar-theming-design.md`.
 
-use std::str::FromStr;
 use crate::compositor::Color;
+use std::str::FromStr;
 
 /// One of catppuccin's four flavors. `Default` is `Latte` (the light flavor),
 /// chosen per the design spec.
@@ -202,6 +202,9 @@ pub struct Theme {
     pub active_tab_bold: bool,
     pub inactive_tab_fg: Color,
     pub inactive_tab_bg: Color,
+    pub agent_idle_fg: Color,
+    pub agent_working_fg: Color,
+    pub agent_blocked_fg: Color,
 }
 
 impl Theme {
@@ -239,6 +242,9 @@ impl Theme {
             active_tab_bold: true,
             inactive_tab_fg: p.text,
             inactive_tab_bg: p.surface0,
+            agent_idle_fg: p.green,
+            agent_working_fg: p.yellow,
+            agent_blocked_fg: p.red,
         }
     }
 }
@@ -319,7 +325,12 @@ mod tests {
 
     #[test]
     fn active_tab_is_bold_in_every_flavor() {
-        for f in [Flavor::Latte, Flavor::Frappe, Flavor::Macchiato, Flavor::Mocha] {
+        for f in [
+            Flavor::Latte,
+            Flavor::Frappe,
+            Flavor::Macchiato,
+            Flavor::Mocha,
+        ] {
             assert!(Theme::from_flavor(f).active_tab_bold, "{f:?}");
         }
     }
@@ -336,6 +347,9 @@ mod tests {
         assert_eq!(t.session_fg, LATTE.crust);
         assert_eq!(t.active_tab_fg, LATTE.text); // <-- text, NOT crust (contrast-driven split)
         assert_eq!(t.inactive_tab_fg, LATTE.text);
+        assert_eq!(t.agent_idle_fg, LATTE.green);
+        assert_eq!(t.agent_working_fg, LATTE.yellow);
+        assert_eq!(t.agent_blocked_fg, LATTE.red);
     }
 
     #[test]
@@ -348,6 +362,9 @@ mod tests {
         assert_eq!(t.session_fg, FRAPPE.crust);
         assert_eq!(t.active_tab_fg, FRAPPE.crust); // dark-flavor branch
         assert_eq!(t.inactive_tab_fg, FRAPPE.text);
+        assert_eq!(t.agent_idle_fg, FRAPPE.green);
+        assert_eq!(t.agent_working_fg, FRAPPE.yellow);
+        assert_eq!(t.agent_blocked_fg, FRAPPE.red);
     }
 
     #[test]
@@ -360,6 +377,9 @@ mod tests {
         assert_eq!(t.session_fg, MACCHIATO.crust);
         assert_eq!(t.active_tab_fg, MACCHIATO.crust);
         assert_eq!(t.inactive_tab_fg, MACCHIATO.text);
+        assert_eq!(t.agent_idle_fg, MACCHIATO.green);
+        assert_eq!(t.agent_working_fg, MACCHIATO.yellow);
+        assert_eq!(t.agent_blocked_fg, MACCHIATO.red);
     }
 
     #[test]
@@ -372,5 +392,8 @@ mod tests {
         assert_eq!(t.session_fg, MOCHA.crust);
         assert_eq!(t.active_tab_fg, MOCHA.crust);
         assert_eq!(t.inactive_tab_fg, MOCHA.text);
+        assert_eq!(t.agent_idle_fg, MOCHA.green);
+        assert_eq!(t.agent_working_fg, MOCHA.yellow);
+        assert_eq!(t.agent_blocked_fg, MOCHA.red);
     }
 }

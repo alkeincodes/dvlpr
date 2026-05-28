@@ -313,6 +313,8 @@ fn resolve_key(config: &Config, key: Key, out: &mut Vec<InputEvent>) {
     if let Key::Char(b) = key {
         if b == b'0' {
             out.push(InputEvent::Command(crate::config::Command::ToggleZoom));
+        } else if b == b's' {
+            out.push(InputEvent::Command(crate::config::Command::ToggleSidebar));
         } else if (b'1'..=b'9').contains(&b) {
             out.push(InputEvent::Command(crate::config::Command::SelectWindow(
                 (b - b'0') as usize,
@@ -399,6 +401,14 @@ mod tests {
         let mut out = Vec::new();
         resolve_key(&Config::default(), Key::Char(b'0'), &mut out);
         assert_eq!(out, vec![InputEvent::Command(Command::ToggleZoom)]);
+    }
+
+    #[test]
+    fn prefix_then_s_toggles_sidebar() {
+        assert_eq!(
+            parse_all(&[0x01, b's']),
+            vec![InputEvent::Command(Command::ToggleSidebar)]
+        );
     }
 
     #[test]

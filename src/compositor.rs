@@ -127,6 +127,8 @@ impl Compositor {
         zoomed: bool,
         theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
+        sidebar_visible: bool,
+        agent_entries: &[crate::session::AgentEntry],
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -136,8 +138,8 @@ impl Compositor {
         let rows = viewport.h;
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
 
-        let window_count = tab_names.len();
-        let content = layout::content_area(viewport, window_count);
+        let regions = layout::compute_regions(viewport, sidebar_visible);
+        let content = regions.content_area;
         let rects = if zoomed {
             vec![(focused, content)]
         } else {
@@ -160,9 +162,24 @@ impl Compositor {
         }
 
         // Status/tab bar (always present): session prefix at the left, then tabs.
-        if let Some(ty) = layout::tab_row(viewport, window_count) {
-            let regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
-            draw_tabs(&mut buf, cols, ty, session_name, &regions, active_window, theme);
+        {
+            let ty = regions.tab_status_row;
+            let tab_regions =
+                layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
+            draw_tabs(
+                &mut buf,
+                cols,
+                ty,
+                session_name,
+                &tab_regions,
+                active_window,
+                theme,
+            );
+        }
+
+        // Sidebar (if visible).
+        if let Some(sb) = regions.sidebar {
+            draw_sidebar(&mut buf, cols, sb, theme, agent_entries);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -210,6 +227,8 @@ impl Compositor {
             zoomed,
             theme,
             panes,
+            false,
+            &[],
         ))
     }
 }
@@ -444,7 +463,11 @@ fn draw_divider(
                 (SplitDir::Horizontal, false) => '─',
                 (SplitDir::Horizontal, true) => '━',
             };
-            let style = if heavy { heavy_style } else { CellStyle::default() };
+            let style = if heavy {
+                heavy_style
+            } else {
+                CellStyle::default()
+            };
             let idx = y as usize * cols as usize + x as usize;
             if idx < buf.len() {
                 // Chrome (dividers) overwrites any pane style underneath.
@@ -495,7 +518,10 @@ fn draw_tabs(
     for x in 0..cols as usize {
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch: ' ', style: bar_style };
+            buf[idx] = StyledCell {
+                ch: ' ',
+                style: bar_style,
+            };
         }
     }
 
@@ -511,7 +537,10 @@ fn draw_tabs(
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch, style: session_style };
+            buf[idx] = StyledCell {
+                ch,
+                style: session_style,
+            };
         }
     }
     // (The two-space gap after the session prefix is left untouched — it keeps
@@ -547,6 +576,108 @@ fn draw_tabs(
         }
     }
 }
+
+fn state_color(theme: &crate::theme::Theme, state: crate::detect::AgentState) -> Color {
+    match state {
+        crate::detect::AgentState::Idle => theme.agent_idle_fg,
+        crate::detect::AgentState::Working => theme.agent_working_fg,
+        crate::detect::AgentState::Blocked => theme.agent_blocked_fg,
+    }
+}
+
+/// Fill the sidebar region with the AGENTS header, a separator, and
+/// one row per agent entry. Layout per the spec:
+///   column 0 (rect.x)        — vertical '│' separator (entire height)
+///   columns 1..15            — 15-cell content area
+///   row 0 of sidebar         — "AGENTS" centered in the content area
+///   row 1 of sidebar         — horizontal '─' rule across the 15 cols
+///   row 2..N                 — entries: " W<n>:claude  ●"
+///                              (n is 1-based for display)
+/// Empty state: rows 2 and 3 read "(no claude" / " panes)" in
+/// theme.inactive_tab_fg (theme-consistent; not visually muted).
+fn draw_sidebar(
+    buf: &mut [StyledCell],
+    cols: u16,
+    rect: layout::Rect,
+    theme: &crate::theme::Theme,
+    entries: &[crate::session::AgentEntry],
+) {
+    let sep_style = CellStyle::default();
+    let header_style = CellStyle::default();
+    let entry_style = CellStyle::default();
+    let placeholder_style = CellStyle {
+        fg: theme.inactive_tab_fg,
+        ..CellStyle::default()
+    };
+
+    for y in rect.y..rect.y + rect.h {
+        let idx = (y as usize) * (cols as usize) + (rect.x as usize);
+        if idx < buf.len() {
+            buf[idx] = StyledCell {
+                ch: '│',
+                style: sep_style,
+            };
+        }
+    }
+
+    let write_into_row = |buf: &mut [StyledCell], y: u16, text: &str, style: CellStyle| {
+        let start_col = rect.x + 1;
+        let end_col = rect.x + SIDEBAR_LABEL_COLS_END;
+        let mut col = start_col;
+        for ch in text.chars() {
+            if col >= end_col {
+                break;
+            }
+            let idx = (y as usize) * (cols as usize) + (col as usize);
+            if idx < buf.len() {
+                buf[idx] = StyledCell { ch, style };
+            }
+            col += 1;
+        }
+    };
+
+    if rect.h >= 1 {
+        write_into_row(buf, rect.y, "    AGENTS     ", header_style);
+    }
+
+    if rect.h >= 2 {
+        write_into_row(buf, rect.y + 1, "───────────────", header_style);
+    }
+
+    if entries.is_empty() {
+        if rect.h >= 3 {
+            write_into_row(buf, rect.y + 2, " (no claude   ", placeholder_style);
+        }
+        if rect.h >= 4 {
+            write_into_row(buf, rect.y + 3, "  panes)      ", placeholder_style);
+        }
+        return;
+    }
+
+    let max_entries = if rect.h >= 2 {
+        (rect.h - 2) as usize
+    } else {
+        0
+    };
+    for (i, entry) in entries.iter().take(max_entries).enumerate() {
+        let y = rect.y + 2 + i as u16;
+        let label = format!(" W{}:claude", entry.window_index + 1);
+        write_into_row(buf, y, &label, entry_style);
+        let dot_col = rect.x + 13;
+        let dot_idx = (y as usize) * (cols as usize) + (dot_col as usize);
+        if dot_idx < buf.len() {
+            buf[dot_idx] = StyledCell {
+                ch: '●',
+                style: CellStyle {
+                    fg: state_color(theme, entry.state),
+                    ..CellStyle::default()
+                },
+            };
+        }
+    }
+}
+
+const SIDEBAR_LABEL_COLS_END: u16 = 16;
 
 #[cfg(test)]
 mod tests {
@@ -691,13 +822,22 @@ mod tests {
 
         // Focused rect immediately to the right of the divider, spanning both
         // rows: every cell of the divider is heavy with the active accent fg.
-        let focused = Rect { x: 3, y: 0, w: 2, h: 2 };
+        let focused = Rect {
+            x: 3,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
         draw_divider(&mut buf, cols, &d, Some(focused), &theme);
         assert_eq!(buf[at(0, 2)].ch, '┃');
         assert_eq!(buf[at(1, 2)].ch, '┃');
         assert_eq!(buf[at(0, 2)].style.fg, Color::Rgb(99, 99, 99));
         assert_eq!(buf[at(1, 2)].style.fg, Color::Rgb(99, 99, 99));
-        assert_eq!(buf[at(0, 2)].style.bg, Color::Default, "heavy divider has no bg");
+        assert_eq!(
+            buf[at(0, 2)].style.bg,
+            Color::Default,
+            "heavy divider has no bg"
+        );
         assert!(!buf[at(0, 2)].style.bold, "heavy divider is not bold");
     }
 
@@ -714,11 +854,21 @@ mod tests {
         // Vertical divider 1 col wide x 9 tall at x=2. Three slabs to its left:
         // top y=0..3, middle y=3..6, bottom y=6..9. Focus = middle slab.
         let d = Divider {
-            rect: Rect { x: 2, y: 0, w: 1, h: 9 },
+            rect: Rect {
+                x: 2,
+                y: 0,
+                w: 1,
+                h: 9,
+            },
             path: vec![],
             dir: SplitDir::Vertical,
         };
-        let focused_middle = Rect { x: 0, y: 3, w: 2, h: 3 };
+        let focused_middle = Rect {
+            x: 0,
+            y: 3,
+            w: 2,
+            h: 3,
+        };
         let theme = crate::theme::Theme {
             active_tab_bg: Color::Rgb(99, 99, 99),
             ..crate::theme::Theme::default()
@@ -729,15 +879,31 @@ mod tests {
 
         for y in 0..3 {
             assert_eq!(buf[at(y, 2)].ch, '│', "y={y} (top slab) should be light");
-            assert_eq!(buf[at(y, 2)].style, CellStyle::default(), "y={y} default style");
+            assert_eq!(
+                buf[at(y, 2)].style,
+                CellStyle::default(),
+                "y={y} default style"
+            );
         }
         for y in 3..6 {
-            assert_eq!(buf[at(y, 2)].ch, '┃', "y={y} (focused middle) should be heavy");
-            assert_eq!(buf[at(y, 2)].style.fg, Color::Rgb(99, 99, 99), "y={y} carries accent");
+            assert_eq!(
+                buf[at(y, 2)].ch,
+                '┃',
+                "y={y} (focused middle) should be heavy"
+            );
+            assert_eq!(
+                buf[at(y, 2)].style.fg,
+                Color::Rgb(99, 99, 99),
+                "y={y} carries accent"
+            );
         }
         for y in 6..9 {
             assert_eq!(buf[at(y, 2)].ch, '│', "y={y} (bottom slab) should be light");
-            assert_eq!(buf[at(y, 2)].style, CellStyle::default(), "y={y} default style");
+            assert_eq!(
+                buf[at(y, 2)].style,
+                CellStyle::default(),
+                "y={y} default style"
+            );
         }
     }
 
@@ -757,6 +923,9 @@ mod tests {
             active_tab_bold: true,
             inactive_tab_fg: Color::Rgb(6, 6, 6),
             inactive_tab_bg: Color::Rgb(7, 7, 7),
+            agent_idle_fg: Color::Rgb(8, 8, 8),
+            agent_working_fg: Color::Rgb(9, 9, 9),
+            agent_blocked_fg: Color::Rgb(10, 10, 10),
         };
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;
@@ -787,8 +956,14 @@ mod tests {
         for r in [&regions[0], &regions[2]] {
             for x in r.x_start..=r.x_end {
                 let i = x as usize;
-                assert_eq!(buf[i].style.bg, theme.inactive_tab_bg, "inactive bg at x={x}");
-                assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "inactive fg at x={x}");
+                assert_eq!(
+                    buf[i].style.bg, theme.inactive_tab_bg,
+                    "inactive bg at x={x}"
+                );
+                assert_eq!(
+                    buf[i].style.fg, theme.inactive_tab_fg,
+                    "inactive fg at x={x}"
+                );
                 assert!(!buf[i].style.bold, "inactive is not bold at x={x}");
             }
         }
@@ -797,7 +972,10 @@ mod tests {
         for x in (last + 1)..cols {
             let i = x as usize;
             assert_eq!(buf[i].style.bg, theme.bar_bg, "right-edge fill at x={x}");
-            assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "right-edge fg at x={x}");
+            assert_eq!(
+                buf[i].style.fg, theme.inactive_tab_fg,
+                "right-edge fg at x={x}"
+            );
         }
     }
 
@@ -807,7 +985,15 @@ mod tests {
         let mut buf = vec![StyledCell::default(); 20 * 2];
         let regions = layout::tab_layout("s", &["a".to_string(), "b".to_string()], 0, false, cols);
         // Tab row is the last row (y = 1).
-        draw_tabs(&mut buf, cols, 1, "s", &regions, 0, &crate::theme::Theme::default());
+        draw_tabs(
+            &mut buf,
+            cols,
+            1,
+            "s",
+            &regions,
+            0,
+            &crate::theme::Theme::default(),
+        );
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
         let row: String = (0..cols)
             .map(|x| buf[cols as usize + x as usize].ch)
@@ -848,11 +1034,20 @@ mod tests {
         // Themed bar: the rendered bytes include SGR escapes for the row-fill
         // and the session prefix. Assert structure rather than exact bytes so
         // palette tweaks don't churn this test.
-        assert!(s.starts_with("\x1b[2J\x1b[H\x1b[0m"), "frame must start with clear+home+reset, got: {s:?}");
+        assert!(
+            s.starts_with("\x1b[2J\x1b[H\x1b[0m"),
+            "frame must start with clear+home+reset, got: {s:?}"
+        );
         assert!(s.contains("ab "), "frame must contain the pane row content");
         let plain = strip_csi(&s);
-        assert!(plain.contains("s  "), "frame must contain the session prefix + two-space gap, plain={plain:?}");
-        assert!(s.ends_with("\x1b[1;2H"), "frame must end with the cursor CUP");
+        assert!(
+            plain.contains("s  "),
+            "frame must contain the session prefix + two-space gap, plain={plain:?}"
+        );
+        assert!(
+            s.ends_with("\x1b[1;2H"),
+            "frame must end with the cursor CUP"
+        );
     }
 
     #[test]
@@ -893,7 +1088,10 @@ mod tests {
         // raw bytes. Strip CSI escapes first, then the original ordered check
         // still works.
         let plain = strip_csi(&s);
-        assert!(plain.contains("LLL┃RRR"), "ordered divider content present in stripped frame; got: {plain:?}");
+        assert!(
+            plain.contains("LLL┃RRR"),
+            "ordered divider content present in stripped frame; got: {plain:?}"
+        );
     }
 
     #[test]
@@ -909,7 +1107,17 @@ mod tests {
         };
         // Two windows -> the bottom row has session prefix + tab labels.
         let names = vec!["one".to_string(), "two".to_string()];
-        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &crate::theme::Theme::default(), &[(1, &pane)]);
+        let out = c.render(
+            vp,
+            &tree,
+            "s",
+            &names,
+            1,
+            1,
+            false,
+            &crate::theme::Theme::default(),
+            &[(1, &pane)],
+        );
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("1:one")); // inactive window 0 (1-based, no marker)
         assert!(s.contains("2:two*")); // active window 1 marked with '*'
@@ -1156,5 +1364,94 @@ mod tests {
                 "cursor must stay in-range"
             );
         }
+    }
+
+    #[test]
+    fn draw_sidebar_writes_agents_header() {
+        let cols: u16 = 16;
+        let rows: u16 = 6;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        let row0: String = (0..cols).map(|x| buf[x as usize].ch).collect();
+        assert!(row0.contains("AGENTS"), "row0: {row0:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_colors_dot_by_state_from_theme() {
+        let cols: u16 = 16;
+        let rows: u16 = 6;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        let theme = crate::theme::Theme::default();
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "test".into(),
+            window_index: 0,
+            pane_id: 1,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Working,
+        }];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        let dot_idx = (2 * cols as usize) + 13;
+        assert_eq!(buf[dot_idx].ch, '●');
+        assert_eq!(buf[dot_idx].style.fg, theme.agent_working_fg);
+    }
+
+    #[test]
+    fn draw_sidebar_dot_colors_change_with_flavor() {
+        let cols: u16 = 16;
+        let rect = layout::Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: 6,
+        };
+        let mut buf_latte = vec![StyledCell::default(); (cols as usize) * 6];
+        let mut buf_mocha = vec![StyledCell::default(); (cols as usize) * 6];
+        let latte = crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte);
+        let mocha = crate::theme::Theme::from_flavor(crate::theme::Flavor::Mocha);
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "test".into(),
+            window_index: 0,
+            pane_id: 1,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Idle,
+        }];
+        draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries);
+        draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries);
+        let dot_idx = (2 * cols as usize) + 13;
+        assert_ne!(buf_latte[dot_idx].style.fg, buf_mocha[dot_idx].style.fg);
+    }
+
+    #[test]
+    fn draw_sidebar_empty_state_uses_inactive_tab_fg() {
+        let cols: u16 = 16;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * 6];
+        let rect = layout::Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: 6,
+        };
+        let theme = crate::theme::Theme::default();
+        draw_sidebar(&mut buf, cols, rect, &theme, &[]);
+        let row2: String = (1..cols)
+            .map(|x| buf[(2 * cols as usize) + x as usize].ch)
+            .collect();
+        assert!(row2.contains("no claude"), "row2: {row2:?}");
+        let paren_idx = (2 * cols as usize) + 1;
+        assert_eq!(buf[paren_idx].style.fg, theme.inactive_tab_fg);
     }
 }
