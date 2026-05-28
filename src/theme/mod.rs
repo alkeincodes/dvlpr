@@ -3,6 +3,8 @@
 //! role mapping the compositor consumes. See
 //! `docs/superpowers/specs/2026-05-28-status-bar-theming-design.md`.
 
+use std::str::FromStr;
+
 /// One of catppuccin's four flavors. `Default` is `Latte` (the light flavor),
 /// chosen per the design spec.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -22,7 +24,7 @@ impl Flavor {
     }
 }
 
-impl std::str::FromStr for Flavor {
+impl FromStr for Flavor {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -46,7 +48,6 @@ mod tests {
 
     #[test]
     fn flavor_from_str_parses_each_name() {
-        use std::str::FromStr;
         assert_eq!(Flavor::from_str("latte"), Ok(Flavor::Latte));
         assert_eq!(Flavor::from_str("frappe"), Ok(Flavor::Frappe));
         assert_eq!(Flavor::from_str("macchiato"), Ok(Flavor::Macchiato));
@@ -55,7 +56,6 @@ mod tests {
 
     #[test]
     fn flavor_from_str_rejects_unknown_and_wrong_case() {
-        use std::str::FromStr;
         assert!(Flavor::from_str("").is_err());
         assert!(Flavor::from_str("Latte").is_err()); // case-sensitive
         assert!(Flavor::from_str("MOCHA").is_err());
