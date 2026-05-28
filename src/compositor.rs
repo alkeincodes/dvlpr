@@ -550,6 +550,11 @@ fn draw_tabs(
     // peach bg + bold; inactive tabs get the theme's inactive_tab_bg (now
     // Color::Default — the cell stays default-styled). The single-space gaps
     // between tabs are not overwritten and retain bar_bg from the row-fill.
+    //
+    // For active tabs the TabRegion chip includes one pad cell on each side of
+    // the label (ACTIVE_PAD_X = 1). We fill the full x_start..=x_end range
+    // with the chip style first, then overlay the label characters at the
+    // appropriate inset so pad cells retain the active background color.
     for region in regions.iter() {
         let style = if region.window == active_window {
             CellStyle {
@@ -565,8 +570,24 @@ fn draw_tabs(
                 ..CellStyle::default()
             }
         };
+        // Fill the entire chip range with the region style (space chars).
+        for x in region.x_start..=region.x_end {
+            if x >= cols {
+                break;
+            }
+            let idx = ty as usize * cols as usize + x as usize;
+            if idx < buf.len() {
+                buf[idx] = StyledCell { ch: ' ', style };
+            }
+        }
+        // Overlay label characters. The label starts at the inset offset:
+        // chip_w = x_end - x_start + 1; label_len = label chars;
+        // pad = (chip_w - label_len) / 2 (rounds down — left-favored center).
+        let chip_w = (region.x_end - region.x_start + 1) as usize;
+        let label_len = region.label.chars().count();
+        let pad = chip_w.saturating_sub(label_len) / 2;
         for (j, ch) in region.label.chars().enumerate() {
-            let x = region.x_start as usize + j;
+            let x = region.x_start as usize + pad + j;
             if x >= cols as usize {
                 break;
             }

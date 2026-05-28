@@ -441,6 +441,10 @@ pub fn split_area_at(node: &Node, area: Rect, path: &[Side]) -> Option<(Rect, Sp
 
 const TAB_NAME_MAX: usize = 12;
 
+/// Cells of background-colored padding on each side of the active tab's
+/// label. Inactive tabs get no padding (no painted bg ⇒ no visible chip).
+const ACTIVE_PAD_X: u16 = 1;
+
 /// Lay out window tabs after a (separately-drawn) session-name prefix. Each label
 /// is `<1-based-idx>:<name>`, with a trailing `*` on the active window and an extra
 /// `Z` when the active window is zoomed. Names are truncated to TAB_NAME_MAX,
@@ -459,7 +463,6 @@ pub fn tab_layout(
     width: u16,
 ) -> Vec<TabRegion> {
     let mut out = Vec::new();
-    // Prefix occupies "<session>  " (name + two spaces); tabs start after it.
     let prefix = session_name.chars().count() as u16 + 2;
     let mut x: u16 = prefix;
     for (i, name) in names.iter().enumerate() {
@@ -473,15 +476,17 @@ pub fn tab_layout(
                 label.push('Z');
             }
         }
-        let len = label.chars().count() as u16;
-        let x_end = x.saturating_add(len.saturating_sub(1)).min(width - 1);
+        let label_len = label.chars().count() as u16;
+        let pad = if i == active { ACTIVE_PAD_X } else { 0 };
+        let chip_w = label_len + 2 * pad;
+        let x_end = x.saturating_add(chip_w.saturating_sub(1)).min(width - 1);
         out.push(TabRegion {
             window: i,
             x_start: x,
             x_end,
             label,
         });
-        x = x.saturating_add(len).saturating_add(1); // one-space separator
+        x = x.saturating_add(chip_w).saturating_add(1); // one-space separator
     }
     out
 }
@@ -1446,5 +1451,94 @@ mod tests {
         let tabs = vec![];
         let hit = hit_test(&tree, vp, 1, &tabs, 5, 5);
         assert_eq!(hit, Hit::Pane(1));
+    }
+
+    #[test]
+    fn tab_layout_active_chip_reserves_padding_x() {
+        let names = vec![
+            "zsh".to_string(),
+            "vim".to_string(),
+            "git".to_string(),
+        ];
+        // active = 1, not zoomed. Labels: "1:zsh", "2:vim*", "3:git".
+        let regions = tab_layout("default", &names, 1, false, 80);
+        assert_eq!(regions.len(), 3);
+
+        // Region 0 (inactive "1:zsh", label 5 chars): width = 5,
+        // so x_end - x_start = 4.
+        let r0 = &regions[0];
+        assert_eq!(r0.label, "1:zsh");
+        assert_eq!(r0.x_end - r0.x_start, 4);
+
+        // Region 1 (active "2:vim*", label 6 chars): width = 6 + 2*1 = 8,
+        // so x_end - x_start = 7.
+        let r1 = &regions[1];
+        assert_eq!(r1.label, "2:vim*");
+        assert_eq!(r1.x_end - r1.x_start, 7);
+
+        // Region 2 (inactive "3:git", label 5 chars): width 5,
+        // x_end - x_start = 4.
+        let r2 = &regions[2];
+        assert_eq!(r2.label, "3:git");
+        assert_eq!(r2.x_end - r2.x_start, 4);
+    }
+
+    #[test]
+    fn tab_hit_resolves_active_pad_cells_to_the_tab() {
+        let names = vec!["zsh".to_string(), "vim".to_string()];
+        // active = 1, label "2:vim*" with pad ⇒ chip 8 cells wide.
+        let regions = tab_layout("default", &names, 1, false, 80);
+        let active = &regions[1];
+
+        // Both pad cells (x_start and x_end) MUST resolve to the active tab.
+        assert_eq!(tab_hit(&regions, active.x_start), Some(1), "left pad");
+        assert_eq!(tab_hit(&regions, active.x_end), Some(1), "right pad");
+
+        // The label range is hittable too (sanity).
+        assert_eq!(tab_hit(&regions, active.x_start + 1), Some(1));
+        assert_eq!(tab_hit(&regions, active.x_end - 1), Some(1));
+    }
+
+    #[test]
+    fn tab_hit_returns_none_for_inter_tab_gap() {
+        let names = vec!["zsh".to_string(), "vim".to_string()];
+        // active = 0, label "1:zsh*" with pad ⇒ chip 8 cells wide.
+        // Gap cell is at regions[0].x_end + 1, BEFORE regions[1].x_start.
+        let regions = tab_layout("default", &names, 0, false, 80);
+        let gap_x = regions[0].x_end + 1;
+        assert!(
+            gap_x < regions[1].x_start,
+            "expected a transparent gap cell between regions"
+        );
+        assert_eq!(tab_hit(&regions, gap_x), None);
+    }
+
+    #[test]
+    fn tab_layout_clips_active_chip_at_viewport_right_edge() {
+        // Choose a width that ends INSIDE the active chip's natural width.
+        // session "x" (1 char) + 2 = prefix 3.
+        // names: "aa" (inactive, label "1:aa" = 4 chars), "bb" (active, label
+        // "2:bb*" = 5 chars, chip width 5 + 2 = 7).
+        //   r0: x_start = 3, x_end = 3 + 3 = 6, inactive width 4 ⇒ x_end - x_start = 3.
+        //   gap: x = 7
+        //   r1: x_start = 8, natural x_end = 8 + 6 = 14, clipped to width - 1.
+        // Picking width = 12 means r1.x_end = 11 (clipped from 14).
+        let names = vec!["aa".to_string(), "bb".to_string()];
+        let regions = tab_layout("x", &names, 1, false, 12);
+        assert_eq!(regions.len(), 2);
+        let r1 = &regions[1];
+        assert_eq!(r1.x_start, 8);
+        assert_eq!(r1.x_end, 11, "clipped to width - 1");
+    }
+
+    #[test]
+    fn tab_layout_zoomed_active_label_includes_z_suffix_in_chip() {
+        let names = vec!["zsh".to_string(), "vim".to_string()];
+        // active = 1, zoomed = true ⇒ label "2:vim*Z" (7 chars).
+        let regions = tab_layout("default", &names, 1, true, 80);
+        let r1 = &regions[1];
+        assert_eq!(r1.label, "2:vim*Z");
+        // Chip width = 7 + 2 = 9 cells ⇒ x_end - x_start = 8.
+        assert_eq!(r1.x_end - r1.x_start, 8);
     }
 }
