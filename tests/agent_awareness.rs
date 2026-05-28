@@ -57,7 +57,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     let dot_idx = (2 * grid.cols as usize) + 77;
     assert_eq!(
         grid.cells[dot_idx].style.fg, theme.agent_working_fg,
-        "dot should be theme.agent_working_fg (Latte yellow #df8e1d)"
+        "dot should be theme.agent_working_fg (the default flavor's yellow)"
     );
 
     // 4. Feed blocked marker; immediate transition.

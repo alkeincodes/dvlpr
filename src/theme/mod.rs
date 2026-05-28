@@ -338,10 +338,9 @@ mod tests {
     fn theme_default_is_one_dark() {
         let t = Theme::default();
         assert_eq!(t, Theme::from_flavor(Flavor::OneDark));
-        // Spot-check one role so a future refactor of Default that drifts
-        // away from OneDark fails this test instead of silently shipping
-        // a different default flavor.
-        assert_eq!(t.active_tab_bg, ONE_DARK.peach);
+        // Pin the active orange chip color to a hardcoded RGB so a silent
+        // edit to ONE_DARK.peach also breaks this test.
+        assert_eq!(t.active_tab_bg, Color::Rgb(0xd1, 0x9a, 0x66));
     }
 
     #[test]
