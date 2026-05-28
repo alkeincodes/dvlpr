@@ -496,8 +496,12 @@ fn cell_borders_focused(dir: SplitDir, x: u16, y: u16, focused: Rect) -> bool {
     }
 }
 
-/// Draw the session-name prefix at the row's left, then each tab region's label at
-/// its `x_start` (the same x-ranges hit-testing uses). The prefix is not clickable.
+/// Draw the session-name prefix at the row's left, then each tab region's label
+/// at its `x_start`. Backgrounds are only painted when the corresponding theme
+/// role is non-default — so when `bar_bg` / `session_bg` / `inactive_tab_bg`
+/// are `Color::Default` the corresponding cells stay default-styled and the
+/// host terminal background shows through. The active tab paints its full
+/// `x_start..=x_end` range (including the 1-cell pads tab_layout reserves).
 fn draw_tabs(
     buf: &mut [StyledCell],
     cols: u16,
@@ -507,25 +511,24 @@ fn draw_tabs(
     active_window: usize,
     theme: &crate::theme::Theme,
 ) {
-    // Step 1 — row fill: paint the whole bar row with bar_bg so gaps and the
-    // right edge carry the bar color. Subsequent segment writes overwrite the
-    // specific cells they occupy.
-    let bar_style = CellStyle {
-        bg: theme.bar_bg,
-        fg: theme.inactive_tab_fg,
-        ..CellStyle::default()
-    };
-    for x in 0..cols as usize {
-        let idx = ty as usize * cols as usize + x;
-        if idx < buf.len() {
-            buf[idx] = StyledCell {
-                ch: ' ',
-                style: bar_style,
-            };
+    // Step 1 — row fill: only paint if bar_bg is opaque. When it's Color::Default
+    // (the shipping flavors), cells stay as StyledCell::default() and the host
+    // terminal bg shows through.
+    if theme.bar_bg != Color::Default {
+        let bar_style = CellStyle {
+            bg: theme.bar_bg,
+            fg: theme.inactive_tab_fg,
+            ..CellStyle::default()
+        };
+        for x in 0..cols as usize {
+            let idx = ty as usize * cols as usize + x;
+            if idx < buf.len() {
+                buf[idx] = StyledCell { ch: ' ', style: bar_style };
+            }
         }
     }
 
-    // Step 2 — session prefix segment (mauve / contrast fg).
+    // Step 2 — session prefix. fg always applied; bg only if session_bg != Default.
     let session_style = CellStyle {
         bg: theme.session_bg,
         fg: theme.session_fg,
@@ -537,41 +540,57 @@ fn draw_tabs(
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell {
-                ch,
-                style: session_style,
-            };
+            buf[idx] = StyledCell { ch, style: session_style };
         }
     }
-    // (The two-space gap after the session prefix is left untouched — it keeps
-    // the bar_bg from the row-fill step.)
 
-    // Step 3 — tab segments. Active tab (region.window == active_window) gets
-    // peach bg + bold; inactive tabs get surface0 bg. The single-space gaps
-    // between tabs are not overwritten and retain bar_bg from the row-fill.
+    // Step 3 — tabs.
     for region in regions.iter() {
-        let style = if region.window == active_window {
-            CellStyle {
+        let is_active = region.window == active_window;
+        if is_active {
+            let style = CellStyle {
                 bg: theme.active_tab_bg,
                 fg: theme.active_tab_fg,
                 bold: theme.active_tab_bold,
                 ..CellStyle::default()
+            };
+            // Paint the full chip range (pad cells get a space; label chars
+            // overwrite the middle cells).
+            for x in region.x_start..=region.x_end {
+                let idx = ty as usize * cols as usize + x as usize;
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch: ' ', style };
+                }
+            }
+            // Write label characters starting at x_start + ACTIVE_PAD_X (= 1).
+            // Bound by x_end to honor narrow-terminal clipping: never write
+            // past the chip's right edge.
+            let label_x = region.x_start.saturating_add(1);
+            for (j, ch) in region.label.chars().enumerate() {
+                let x = label_x.saturating_add(j as u16);
+                if x > region.x_end {
+                    break;
+                }
+                let idx = ty as usize * cols as usize + x as usize;
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch, style };
+                }
             }
         } else {
-            CellStyle {
+            let style = CellStyle {
                 bg: theme.inactive_tab_bg,
                 fg: theme.inactive_tab_fg,
                 ..CellStyle::default()
-            }
-        };
-        for (j, ch) in region.label.chars().enumerate() {
-            let x = region.x_start as usize + j;
-            if x >= cols as usize {
-                break;
-            }
-            let idx = ty as usize * cols as usize + x;
-            if idx < buf.len() {
-                buf[idx] = StyledCell { ch, style };
+            };
+            for (j, ch) in region.label.chars().enumerate() {
+                let x = region.x_start as usize + j;
+                if x >= cols as usize {
+                    break;
+                }
+                let idx = ty as usize * cols as usize + x;
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch, style };
+                }
             }
         }
     }
@@ -910,72 +929,54 @@ mod tests {
     #[test]
     #[allow(clippy::needless_range_loop)]
     fn draw_tabs_paints_themed_blocks() {
-        // 30-column bar row. Three windows: active = index 1 ("vim"). Sentinel
-        // colors per role so the assertions are unambiguous.
+        // 30-column bar. Three windows; active = 1 ("vim*").
+        // Sentinel colors so assertions are unambiguous.
         let cols: u16 = 30;
         let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
-            bar_bg: Color::Rgb(1, 1, 1),
-            session_fg: Color::Rgb(2, 2, 2),
-            session_bg: Color::Rgb(3, 3, 3),
-            active_tab_fg: Color::Rgb(4, 4, 4),
-            active_tab_bg: Color::Rgb(5, 5, 5),
+            bar_bg:          Color::Default,
+            session_bg:      Color::Default,
+            session_fg:      Color::Rgb(2, 2, 2),
+            active_tab_fg:   Color::Rgb(4, 4, 4),
+            active_tab_bg:   Color::Rgb(5, 5, 5),
             active_tab_bold: true,
+            inactive_tab_bg: Color::Default,
             inactive_tab_fg: Color::Rgb(6, 6, 6),
-            inactive_tab_bg: Color::Rgb(7, 7, 7),
-            agent_idle_fg: Color::Rgb(8, 8, 8),
-            agent_working_fg: Color::Rgb(9, 9, 9),
-            agent_blocked_fg: Color::Rgb(10, 10, 10),
+            agent_idle_fg:    Color::Rgb(7, 7, 7),
+            agent_working_fg: Color::Rgb(8, 8, 8),
+            agent_blocked_fg: Color::Rgb(9, 9, 9),
         };
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;
         let regions = layout::tab_layout("work", &names, active_window, false, cols);
         draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme);
 
-        // Session prefix "work" occupies x=0..=3.
-        for x in 0..4 {
-            assert_eq!(buf[x].style.bg, theme.session_bg, "session bg at x={x}");
-            assert_eq!(buf[x].style.fg, theme.session_fg, "session fg at x={x}");
+        // Active region (window 1, "2:vim*") spans the full chip range.
+        let r1 = &regions[1];
+        for x in r1.x_start..=r1.x_end {
+            let cell = buf[x as usize];
+            assert_eq!(cell.style.bg, theme.active_tab_bg, "active bg at x={x}");
+            assert_eq!(cell.style.fg, theme.active_tab_fg, "active fg at x={x}");
+            assert!(cell.style.bold, "active bold at x={x}");
         }
-        // Two-space gap (x=4..=5) retains bar_bg and inactive_tab_fg from
-        // the row-fill step (fg is set so future overlay characters in gap
-        // cells have a sensible color rather than the terminal default).
-        for x in 4..6 {
-            assert_eq!(buf[x].style.bg, theme.bar_bg, "gap bg at x={x}");
-            assert_eq!(buf[x].style.fg, theme.inactive_tab_fg, "gap fg at x={x}");
-        }
-        // Active tab (window 1, "2:vim*") starts at the second region's x_start.
-        let active_region = &regions[1];
-        for x in active_region.x_start..=active_region.x_end {
-            let i = x as usize;
-            assert_eq!(buf[i].style.bg, theme.active_tab_bg, "active bg at x={x}");
-            assert_eq!(buf[i].style.fg, theme.active_tab_fg, "active fg at x={x}");
-            assert!(buf[i].style.bold, "active is bold at x={x}");
-        }
-        // Inactive tabs (regions 0 and 2) carry the inactive bg/fg and are NOT bold.
-        for r in [&regions[0], &regions[2]] {
+        // Pad cells specifically: left pad at x_start carries a space char.
+        assert_eq!(buf[r1.x_start as usize].ch, ' ');
+        assert_eq!(buf[r1.x_end as usize].ch, ' ');
+
+        // Inactive regions have NO bg paint — cells carry inactive_tab_fg
+        // but bg stays Color::Default.
+        for r in regions.iter().filter(|r| r.window != active_window) {
             for x in r.x_start..=r.x_end {
-                let i = x as usize;
-                assert_eq!(
-                    buf[i].style.bg, theme.inactive_tab_bg,
-                    "inactive bg at x={x}"
-                );
-                assert_eq!(
-                    buf[i].style.fg, theme.inactive_tab_fg,
-                    "inactive fg at x={x}"
-                );
-                assert!(!buf[i].style.bold, "inactive is not bold at x={x}");
+                let cell = buf[x as usize];
+                assert_eq!(cell.style.bg, Color::Default, "inactive bg at x={x}");
+                assert_eq!(cell.style.fg, theme.inactive_tab_fg, "inactive fg at x={x}");
             }
         }
-        // The right-edge fill: every cell beyond the last region carries bar_bg.
+
+        // Inter-tab gaps and bar row beyond the last tab: cells stay default.
         let last = regions.last().unwrap().x_end;
         for x in (last + 1)..cols {
-            let i = x as usize;
-            assert_eq!(buf[i].style.bg, theme.bar_bg, "right-edge fill at x={x}");
-            assert_eq!(
-                buf[i].style.fg, theme.inactive_tab_fg,
-                "right-edge fg at x={x}"
-            );
+            assert_eq!(buf[x as usize], StyledCell::default(), "gap/right tail at x={x}");
         }
     }
 
@@ -1453,5 +1454,244 @@ mod tests {
         assert!(row2.contains("no claude"), "row2: {row2:?}");
         let paren_idx = (2 * cols as usize) + 1;
         assert_eq!(buf[paren_idx].style.fg, theme.inactive_tab_fg);
+    }
+
+    #[test]
+    fn draw_tabs_skips_row_fill_when_bar_bg_default() {
+        let cols: u16 = 20;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            bar_bg: Color::Default,
+            ..crate::theme::Theme::default()
+        };
+        let names = vec!["a".to_string()];
+        let regions = layout::tab_layout("s", &names, 0, false, cols);
+        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme);
+
+        // The cell BEFORE the active chip (after the 2-cell prefix gap) must
+        // remain default — no row fill should have touched it.
+        assert_eq!(buf[2], StyledCell::default(), "prefix gap stays default");
+        // Cells far past the last tab also stay default.
+        for x in (cols - 3)..cols {
+            assert_eq!(buf[x as usize], StyledCell::default(), "right tail at x={x}");
+        }
+    }
+
+    #[test]
+    fn draw_tabs_writes_session_prefix_as_plain_text() {
+        let cols: u16 = 20;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            bar_bg:     Color::Default,
+            session_bg: Color::Default,
+            session_fg: Color::Rgb(11, 22, 33),
+            ..crate::theme::Theme::default()
+        };
+        let names: Vec<String> = vec![];
+        let regions = layout::tab_layout("session", &names, 0, false, cols);
+        draw_tabs(&mut buf, cols, 0, "session", &regions, 0, &theme);
+
+        // Session prefix cells carry the session_fg but bg is Color::Default.
+        for (x, ch) in "session".chars().enumerate() {
+            assert_eq!(buf[x].ch, ch, "label char at x={x}");
+            assert_eq!(buf[x].style.fg, theme.session_fg, "session_fg at x={x}");
+            assert_eq!(buf[x].style.bg, Color::Default, "no session bg at x={x}");
+        }
+    }
+
+    #[test]
+    fn draw_tabs_inactive_tab_has_no_bg() {
+        let cols: u16 = 20;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            inactive_tab_bg: Color::Default,
+            inactive_tab_fg: Color::Rgb(44, 55, 66),
+            bar_bg: Color::Default,
+            session_bg: Color::Default,
+            ..crate::theme::Theme::default()
+        };
+        // Two tabs, active = 0 so we can inspect tab 1's inactive cells.
+        let names = vec!["zsh".to_string(), "vim".to_string()];
+        let regions = layout::tab_layout("s", &names, 0, false, cols);
+        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme);
+
+        let inactive = &regions[1];
+        for x in inactive.x_start..=inactive.x_end {
+            let cell = buf[x as usize];
+            assert_eq!(cell.style.bg, Color::Default, "no inactive bg at x={x}");
+            assert_eq!(cell.style.fg, theme.inactive_tab_fg, "inactive fg at x={x}");
+        }
+
+        // The cell at inactive.x_end + 1 (if within bounds) must stay default.
+        if (inactive.x_end + 1) < cols {
+            let gap_x = (inactive.x_end + 1) as usize;
+            assert_eq!(buf[gap_x], StyledCell::default(), "trailing gap stays default");
+        }
+    }
+
+    #[test]
+    fn draw_tabs_never_writes_past_x_end_for_clipped_active_chip() {
+        // Synthetic case: hand-craft a TabRegion whose x_end is well below
+        // the buffer's right edge, so any cells at x > x_end MUST remain
+        // untouched if draw_tabs respects x_end.
+        let cols: u16 = 30;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            active_tab_bg: Color::Rgb(99, 99, 99),
+            ..crate::theme::Theme::default()
+        };
+        let regions = vec![layout::TabRegion {
+            window: 0,
+            x_start: 3,
+            x_end: 8, // chip occupies 6 cells; cells 9..30 must stay default
+            label: "1:zsh*".to_string(),
+        }];
+        draw_tabs(&mut buf, cols, 0, "x", &regions, 0, &theme);
+
+        for x in 9..cols {
+            assert_eq!(
+                buf[x as usize], StyledCell::default(),
+                "x={x} is past x_end and must be untouched"
+            );
+        }
+        // Real-clip path: produce a region from tab_layout where the chip
+        // overflows. Choose width so chip_w would exceed remaining width.
+        // session "s" (1) + 2 = prefix 3. Label "1:zzzzz*" (active) ⇒
+        // label_len 8, chip_w 10. Width = 8 ⇒ chip clips at width - 1 = 7.
+        let names = vec!["zzzzz".to_string()];
+        let regions2 = layout::tab_layout("s", &names, 0, false, 8);
+        assert_eq!(regions2.len(), 1);
+        assert_eq!(regions2[0].x_end, 7, "x_end clipped to width - 1");
+    }
+
+    #[test]
+    fn draw_tabs_paints_z_suffix_inside_active_bg() {
+        let cols: u16 = 40;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme {
+            active_tab_bg: Color::Rgb(99, 99, 99),
+            active_tab_fg: Color::Rgb(11, 11, 11),
+            active_tab_bold: true,
+            ..crate::theme::Theme::default()
+        };
+        let names = vec!["zsh".to_string(), "vim".to_string()];
+        // zoomed = true ⇒ active label "2:vim*Z" (7 chars), chip 9 cells wide.
+        let regions = layout::tab_layout("default", &names, 1, true, cols);
+        let r1 = &regions[1];
+        draw_tabs(&mut buf, cols, 0, "default", &regions, 1, &theme);
+
+        // The 'Z' character lands at x_start + 1 (left pad) + 6 (label offset)
+        // = x_start + 7, which equals x_end - 1.
+        let z_x = r1.x_end - 1;
+        assert_eq!(buf[z_x as usize].ch, 'Z');
+        assert_eq!(buf[z_x as usize].style.bg, theme.active_tab_bg);
+        assert!(buf[z_x as usize].style.bold);
+        // The right pad cell at x_end carries a space with the active style.
+        assert_eq!(buf[r1.x_end as usize].ch, ' ');
+        assert_eq!(buf[r1.x_end as usize].style.bg, theme.active_tab_bg);
+    }
+
+    #[test]
+    fn serialize_full_zero_tabs_emits_zero_bg_sgrs() {
+        // Stronger pin than counting: render with NO tabs (just a session
+        // prefix). All theme bg roles are Color::Default; nothing should
+        // ever paint a bg. The byte stream MUST contain zero "48;" SGR
+        // codes. If a future refactor accidentally re-introduces a row
+        // fill or session-prefix bg paint, this test fails immediately.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default(); // OneDark — transparent bgs
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names: Vec<String> = vec![];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 0, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.matches("48;").count(),
+            0,
+            "no bg SGR anywhere when every bg role is Color::Default and there is no active tab"
+        );
+        // The session-prefix label still emits fg SGRs.
+        assert!(text.contains("38;"), "session prefix fg SGR present");
+    }
+
+    #[test]
+    fn serialize_full_active_chip_emits_exactly_one_bg_sgr() {
+        // Render with one active tab. The active chip paints `1 + label + 1`
+        // contiguous cells with the same pen — the serializer collapses them
+        // into ONE "48;" SGR transition. Any other bg paint (row fill,
+        // inactive label, gap) would push the count above 1; an accidentally
+        // dropped active bg would push it to 0. Both fail this assertion.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names = vec!["zsh".to_string(), "vim".to_string()];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 1, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.matches("48;").count(),
+            1,
+            "exactly one bg SGR transition for the single active chip; \
+             gap and inactive tab must not paint bg"
+        );
+        assert!(text.contains("38;"), "fg SGRs are emitted for labels");
+    }
+
+    #[test]
+    fn serialize_full_inter_tab_gap_resets_to_default_pen() {
+        // Stronger pin for the inter-tab gap claim: render with one inactive
+        // ("1:zsh") followed by one active ("2:vim*"). In the byte stream,
+        // between the inactive label and the active chip, the serializer
+        // MUST emit a bare `\x1b[0m` (the pen reset at the gap cell) AND
+        // MUST NOT emit any `48;` (no accidental bg paint in the gap). A
+        // regression that styled the gap with fg-only inactive bytes would
+        // skip the reset and this test would fail.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names = vec!["zsh".to_string(), "vim".to_string()];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 1, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        let inactive_pos = text.find("1:zsh").expect("inactive label in output");
+        let active_pos = text.find("2:vim*").expect("active label in output");
+        assert!(
+            inactive_pos < active_pos,
+            "inactive label appears before active label"
+        );
+        // The bytes from end-of-inactive-label to start-of-"2:vim*" include
+        // the gap pen-reset, the gap space cell, the active chip's SGR
+        // (which legitimately contains `48;`), and the chip's left pad
+        // space. Trim off the active SGR + left pad by finding the LAST
+        // `\x1b[` before "2:vim*" — that's the active chip's SGR opener.
+        // The remaining "gap" slice is just the gap-cell bytes.
+        let span_to_active = &text[inactive_pos + "1:zsh".len()..active_pos];
+        let active_sgr_start = span_to_active
+            .rfind("\x1b[")
+            .expect("active chip SGR present before its label");
+        let gap = &span_to_active[..active_sgr_start];
+        assert!(
+            gap.contains("\x1b[0m"),
+            "gap between inactive label and active chip must reset pen: gap = {gap:?}"
+        );
+        assert!(
+            !gap.contains("48;"),
+            "gap must not emit any bg SGR: gap = {gap:?}"
+        );
     }
 }

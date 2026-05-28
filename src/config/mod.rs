@@ -195,7 +195,7 @@ struct RawKeys {
 }
 
 /// Raw `[theme]` table. Only `flavor` exists in v1; missing/unknown falls back
-/// to Latte (logged) in `from_toml_str`.
+/// to the default flavor (logged) in `from_toml_str`.
 #[derive(Default, Deserialize)]
 struct RawTheme {
     flavor: Option<String>,
@@ -216,8 +216,8 @@ fn spec_or_default(raw: &Option<String>, field: &str, default: KeySpec) -> KeySp
     }
 }
 
-/// Parse the optional flavor string, falling back to Latte (and logging) on
-/// absence or an unknown value.
+/// Parse the optional flavor string, falling back to `Theme::default()` (and
+/// logging) on absence or an unknown value.
 fn flavor_or_default(raw: &Option<String>) -> crate::theme::Theme {
     match raw {
         None => crate::theme::Theme::default(),
@@ -423,11 +423,11 @@ mod tests {
     }
 
     #[test]
-    fn config_default_theme_is_latte() {
+    fn config_default_theme_is_one_dark() {
         let c = Config::default();
         assert_eq!(
             c.theme,
-            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::OneDark)
         );
     }
 
@@ -445,7 +445,7 @@ flavor = "macchiato"
     }
 
     #[test]
-    fn toml_with_unknown_flavor_falls_back_to_latte() {
+    fn toml_with_unknown_flavor_falls_back_to_one_dark() {
         let c = Config::from_toml_str(
             r#"[theme]
 flavor = "cappuccino"
@@ -453,16 +453,29 @@ flavor = "cappuccino"
         );
         assert_eq!(
             c.theme,
-            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::OneDark)
         );
     }
 
     #[test]
-    fn toml_without_theme_section_falls_back_to_latte() {
+    fn toml_without_theme_section_falls_back_to_one_dark() {
         let c = Config::from_toml_str("prefix = \"C-a\"\n");
         assert_eq!(
             c.theme,
-            crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte)
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::OneDark)
+        );
+    }
+
+    #[test]
+    fn toml_with_theme_flavor_one_dark_parses() {
+        let c = Config::from_toml_str(
+            r#"[theme]
+flavor = "one-dark"
+"#,
+        );
+        assert_eq!(
+            c.theme,
+            crate::theme::Theme::from_flavor(crate::theme::Flavor::OneDark)
         );
     }
 }
