@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::compositor::{Compositor, PaneCells};
 use crate::config::Command;
+use crate::detect;
 use crate::ghostty::screen::GhosttyScreen;
 use crate::input::{MouseEvent, MouseKind};
 use crate::layout::{self, Node, PaneId, Rect, SplitDir, SplitPath};
@@ -21,6 +22,22 @@ use crate::pane::{PaneOutput, PaneRuntime};
 struct Pane {
     runtime: PaneRuntime,
     screen: GhosttyScreen,
+    /// Foreground pid we last successfully resolved an agent for. None
+    /// until the first successful resolve. Cache key: when this differs
+    /// from the current foreground pid, the cached `agent` is stale.
+    /// INVARIANT: agent_id_pid == Some(p) implies `agent` came from
+    /// successfully resolving the friendly name of pid p.
+    agent_id_pid: Option<i32>,
+    /// The cached agent classification of this pane's foreground process.
+    /// None = not a known agent (no classification).
+    agent: Option<detect::Agent>,
+    /// The pane's currently displayed agent state (after stabilization).
+    /// Idle is the default and applies to non-agent panes too.
+    agent_state: detect::AgentState,
+    /// Counter for the idle stabilizer: consecutive idle samples since
+    /// the pane last classified as non-Idle. Resets to 0 on any non-Idle
+    /// classification; clamped at 2.
+    idle_streak: u8,
 }
 
 struct Window {
@@ -42,6 +59,11 @@ pub struct Session {
     rows: u16,
     command: Vec<String>,
     cwd: String,
+    /// True when the user has toggled the agent-awareness sidebar visible.
+    /// Default: false (hidden). Toggled by Command::ToggleSidebar.
+    /// `layout::compute_regions` may still suppress the sidebar's visual
+    /// presence if the viewport is too narrow (see SIDEBAR_MIN_CONTENT_COLS).
+    sidebar_visible: bool,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -96,6 +118,7 @@ impl Session {
             rows,
             command,
             cwd,
+            sidebar_visible: false,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -130,7 +153,17 @@ impl Session {
         let screen = GhosttyScreen::new(w, h);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
-        self.panes.insert(id, Pane { runtime, screen });
+        self.panes.insert(
+            id,
+            Pane {
+                runtime,
+                screen,
+                agent_id_pid: None,
+                agent: None,
+                agent_state: detect::AgentState::Idle,
+                idle_streak: 0,
+            },
+        );
         Ok((id, rx))
     }
 
