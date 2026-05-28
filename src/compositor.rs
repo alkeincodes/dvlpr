@@ -471,34 +471,68 @@ fn draw_tabs(
     ty: u16,
     session_name: &str,
     regions: &[layout::TabRegion],
-    _active_window: usize,
-    _theme: &crate::theme::Theme,
+    active_window: usize,
+    theme: &crate::theme::Theme,
 ) {
+    // Step 1 — row fill: paint the whole bar row with bar_bg so gaps and the
+    // right edge carry the bar color. Subsequent segment writes overwrite the
+    // specific cells they occupy.
+    let bar_style = CellStyle {
+        bg: theme.bar_bg,
+        fg: theme.inactive_tab_fg,
+        ..CellStyle::default()
+    };
+    for x in 0..cols as usize {
+        let idx = ty as usize * cols as usize + x;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch: ' ', style: bar_style };
+        }
+    }
+
+    // Step 2 — session prefix segment (mauve / contrast fg).
+    let session_style = CellStyle {
+        bg: theme.session_bg,
+        fg: theme.session_fg,
+        ..CellStyle::default()
+    };
     for (x, ch) in session_name.chars().enumerate() {
         if x >= cols as usize {
             break;
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell {
-                ch,
-                style: CellStyle::default(),
-            };
+            buf[idx] = StyledCell { ch, style: session_style };
         }
     }
-    // (the two-space gap is left blank; regions' x_start already accounts for it)
-    for region in regions {
-        for (i, ch) in region.label.chars().enumerate() {
-            let x = region.x_start as usize + i;
+    // (The two-space gap after the session prefix is left untouched — it keeps
+    // the bar_bg from the row-fill step.)
+
+    // Step 3 — tab segments. Active tab (region.window == active_window) gets
+    // peach bg + bold; inactive tabs get surface0 bg. The single-space gaps
+    // between tabs are not overwritten and retain bar_bg from the row-fill.
+    for region in regions.iter() {
+        let style = if region.window == active_window {
+            CellStyle {
+                bg: theme.active_tab_bg,
+                fg: theme.active_tab_fg,
+                bold: theme.active_tab_bold,
+                ..CellStyle::default()
+            }
+        } else {
+            CellStyle {
+                bg: theme.inactive_tab_bg,
+                fg: theme.inactive_tab_fg,
+                ..CellStyle::default()
+            }
+        };
+        for (j, ch) in region.label.chars().enumerate() {
+            let x = region.x_start as usize + j;
             if x >= cols as usize {
                 break;
             }
             let idx = ty as usize * cols as usize + x;
             if idx < buf.len() {
-                buf[idx] = StyledCell {
-                    ch,
-                    style: CellStyle::default(),
-                };
+                buf[idx] = StyledCell { ch, style };
             }
         }
     }
@@ -651,6 +685,61 @@ mod tests {
     }
 
     #[test]
+    fn draw_tabs_paints_themed_blocks() {
+        // 30-column bar row. Three windows: active = index 1 ("vim"). Sentinel
+        // colors per role so the assertions are unambiguous.
+        let cols: u16 = 30;
+        let mut buf = vec![StyledCell::default(); cols as usize * 1];
+        let theme = crate::theme::Theme {
+            bar_bg: Color::Rgb(1, 1, 1),
+            session_fg: Color::Rgb(2, 2, 2),
+            session_bg: Color::Rgb(3, 3, 3),
+            active_tab_fg: Color::Rgb(4, 4, 4),
+            active_tab_bg: Color::Rgb(5, 5, 5),
+            active_tab_bold: true,
+            inactive_tab_fg: Color::Rgb(6, 6, 6),
+            inactive_tab_bg: Color::Rgb(7, 7, 7),
+        };
+        let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
+        let active_window = 1;
+        let regions = layout::tab_layout("work", &names, active_window, false, cols);
+        draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme);
+
+        // Session prefix "work" occupies x=0..=3.
+        for x in 0..4 {
+            assert_eq!(buf[x].style.bg, theme.session_bg, "session bg at x={x}");
+            assert_eq!(buf[x].style.fg, theme.session_fg, "session fg at x={x}");
+        }
+        // Two-space gap (x=4..=5) retains bar_bg from the row-fill step.
+        for x in 4..6 {
+            assert_eq!(buf[x].style.bg, theme.bar_bg, "gap bg at x={x}");
+        }
+        // Active tab (window 1, "2:vim*") starts at the second region's x_start.
+        let active_region = &regions[1];
+        for x in active_region.x_start..=active_region.x_end {
+            let i = x as usize;
+            assert_eq!(buf[i].style.bg, theme.active_tab_bg, "active bg at x={x}");
+            assert_eq!(buf[i].style.fg, theme.active_tab_fg, "active fg at x={x}");
+            assert!(buf[i].style.bold, "active is bold at x={x}");
+        }
+        // Inactive tabs (regions 0 and 2) carry the inactive bg/fg and are NOT bold.
+        for r in [&regions[0], &regions[2]] {
+            for x in r.x_start..=r.x_end {
+                let i = x as usize;
+                assert_eq!(buf[i].style.bg, theme.inactive_tab_bg, "inactive bg at x={x}");
+                assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "inactive fg at x={x}");
+                assert!(!buf[i].style.bold, "inactive is not bold at x={x}");
+            }
+        }
+        // The right-edge fill: every cell beyond the last region carries bar_bg.
+        let last = regions.last().unwrap().x_end;
+        for x in (last + 1)..cols {
+            let i = x as usize;
+            assert_eq!(buf[i].style.bg, theme.bar_bg, "right-edge fill at x={x}");
+        }
+    }
+
+    #[test]
     fn draw_tabs_writes_labels_at_their_ranges() {
         let cols: u16 = 20;
         let mut buf = vec![StyledCell::default(); 20 * 2];
@@ -694,10 +783,13 @@ mod tests {
             &[(1, &pane)],
         );
         let s = String::from_utf8(out).unwrap();
-        // Content area is h=1; pane row 0 ("ab ") fills it.
-        // Bar row (y=1): "s  " (prefix at x=0, two blank spaces for the gap).
-        // Cursor: pane rect {x:0,y:0,w:3,h:1}, pane cursor (1,0) -> global (1,0) -> "\x1b[1;2H".
-        assert_eq!(s, "\x1b[2J\x1b[H\x1b[0mab \r\ns  \x1b[1;2H");
+        // Themed bar: the rendered bytes include SGR escapes for the row-fill
+        // and the session prefix. Assert structure rather than exact bytes so
+        // palette tweaks don't churn this test.
+        assert!(s.starts_with("\x1b[2J\x1b[H\x1b[0m"), "frame must start with clear+home+reset, got: {s:?}");
+        assert!(s.contains("ab "), "frame must contain the pane row content");
+        assert!(s.contains("s"), "frame must contain the session prefix");
+        assert!(s.ends_with("\x1b[1;2H"), "frame must end with the cursor CUP");
     }
 
     #[test]
