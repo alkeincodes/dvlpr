@@ -74,14 +74,52 @@ either `dvlpr kill -t <name>` or close the last pane to shut the session
 down via the existing `Closed` flow, then start fresh with `dvlpr <name>`
 so the new daemon picks up the new default.
 
+### Note for zsh users
+
+`Option-←` / `Option-→` arrive at the foreground CLI as `^[[1;3D` /
+`^[[1;3C` (the `modifyOtherKeys` encoding). Claude code's input handler
+understands this natively, but zsh's default keymaps don't bind it —
+the prompt will insert `;3D` / `;3C` literally instead of jumping by
+word. Bind them in `~/.zshrc`:
+
+```zsh
+bindkey "^[[1;3D" backward-word           # Option+Left
+bindkey "^[[1;3C" forward-word            # Option+Right
+bindkey "^[[1;3A" up-line-or-history      # Option+Up
+bindkey "^[[1;3B" down-line-or-history    # Option+Down
+```
+
 ### Warp note
 
-Warp does not expose a keybind action that sends arbitrary bytes to the
+Warp's keybinding system has no action that sends raw bytes to the
 foreground process, so the macOS `Cmd+Backspace` / `Cmd+←` / `Cmd+→`
-shortcuts cannot be made to reach `claude`/`codex` while running inside
-dvlpr — use the `Ctrl-`-prefixed equivalents above. A future slice will
-add a copy mode (with `OSC 52` clipboard yank) to address text selection
-from the back buffer.
+shortcuts can't be made to reach `claude`/`codex` from inside dvlpr by
+configuring Warp alone — use the `Ctrl-`-prefixed equivalents above. A
+future slice will add a copy mode (with `OSC 52` clipboard yank) to
+address text selection from the back buffer.
+
+To get Cmd-key support while staying on Warp, install
+[Karabiner-Elements](https://karabiner-elements.pqrs.org/) and add an
+app-scoped complex modification that rewrites `Cmd+Backspace` →
+`Ctrl+U`, `Cmd+←` → `Ctrl+A`, `Cmd+→` → `Ctrl+E`, and (optionally)
+`Option+Backspace` → `Ctrl+W` while Warp (bundle ID
+`dev.warp.Warp-Stable`) is the frontmost app. Karabiner rewrites the
+keystroke before Warp sees it, so the synthesized control byte reaches
+dvlpr through Warp's normal forwarding path. Outside Warp the keys
+keep their native macOS behavior.
+
+For a pure host-terminal fix without Karabiner, switch to
+[Ghostty](https://ghostty.org/) and add three lines to
+`~/.config/ghostty/config`:
+
+```
+keybind = cmd+backspace=text:\x15
+keybind = cmd+left=text:\x01
+keybind = cmd+right=text:\x05
+```
+
+Ghostty also implements `modifyOtherKeys` natively (Warp does not), so
+the `bindkey` lines above are not strictly needed in a Ghostty session.
 
 ## License
 
