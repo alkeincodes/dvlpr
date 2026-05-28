@@ -651,6 +651,100 @@ impl Session {
         changed
     }
 
+    /// Run one agent-detection pass over every pane (not just focused —
+    /// background Claude panes count for the sidebar). Returns true if
+    /// any pane's `agent_state` flipped this tick.
+    ///
+    /// `resolve_name` matches the `Fn(i32) -> Option<String>` shape that
+    /// `refresh_window_names` uses, so tests can inject a deterministic
+    /// resolver.
+    pub fn refresh_agent_states(
+        &mut self,
+        resolve_name: impl Fn(i32) -> Option<String>,
+    ) -> bool {
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            let prev_state = pane.agent_state;
+
+            // Step 1: Identify foreground (cached, with reset on change,
+            // retry on resolver failure).
+            let pid_opt = pane.runtime.foreground_pid();
+            match pid_opt {
+                None => {
+                    if pane.agent_id_pid.is_some()
+                        || pane.agent.is_some()
+                        || pane.agent_state != detect::AgentState::Idle
+                        || pane.idle_streak != 0
+                    {
+                        pane.agent_id_pid = None;
+                        pane.agent = None;
+                        pane.agent_state = detect::AgentState::Idle;
+                        pane.idle_streak = 0;
+                    }
+                }
+                Some(pid) => {
+                    if Some(pid) != pane.agent_id_pid {
+                        // Invalidate cache key FIRST, then reset state,
+                        // then attempt resolve. Only commit cache key on
+                        // successful resolve so a transient procinfo
+                        // failure doesn't poison the cache against a
+                        // returning pid.
+                        pane.agent_id_pid = None;
+                        pane.agent = None;
+                        pane.agent_state = detect::AgentState::Idle;
+                        pane.idle_streak = 0;
+
+                        if let Some(name) = resolve_name(pid) {
+                            pane.agent = detect::agent_for(&name);
+                            pane.agent_id_pid = Some(pid);
+                        }
+                    }
+                }
+            }
+
+            // Step 2: Skip non-agents (carry forward Idle).
+            let agent = match pane.agent {
+                Some(a) => a,
+                None => {
+                    if pane.agent_state != prev_state {
+                        changed = true;
+                    }
+                    continue;
+                }
+            };
+
+            // Step 3: Sample tail (20 rows).
+            let tail = pane.screen.tail_text(20);
+
+            // Step 4: Classify.
+            let candidate = detect::classify(agent, &tail);
+
+            // Step 5: Stabilize.
+            match candidate {
+                detect::AgentState::Working | detect::AgentState::Blocked => {
+                    pane.agent_state = candidate;
+                    pane.idle_streak = 0;
+                }
+                detect::AgentState::Idle => {
+                    if pane.agent_state != detect::AgentState::Idle {
+                        pane.idle_streak = pane.idle_streak.saturating_add(1);
+                        if pane.idle_streak >= 2 {
+                            pane.agent_state = detect::AgentState::Idle;
+                            pane.idle_streak = 2;
+                        }
+                    } else {
+                        pane.idle_streak = pane.idle_streak.min(2).max(2);
+                    }
+                }
+            }
+
+            if pane.agent_state != prev_state {
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Recompute the dragged split's ratio from the pointer position and relayout.
     /// Operates on the explicit `window` the drag started in (not necessarily the
     /// active one). If that window is gone or the path no longer leads to a split,
@@ -689,6 +783,116 @@ mod tests {
     use crate::input::{MouseEvent, MouseKind};
     use crate::layout::SplitPath;
     use std::time::Duration;
+
+    async fn build_session_with_one_pane() -> (
+        Session,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::pane::PaneOutput>,
+    ) {
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let (session, pane_id, rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            80,
+            10,
+            crate::theme::Theme::default(),
+        )
+        .expect("Session::new");
+        (session, pane_id, rx)
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_marks_pane_working_after_busy_sample() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(changed, "first refresh should flip pane state");
+        let pane = session.panes.get(&pane_id).expect("pane present");
+        assert_eq!(pane.agent, Some(detect::Agent::Claude));
+        assert_eq!(pane.agent_state, detect::AgentState::Working);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_marks_pane_blocked_after_blocked_sample() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(changed);
+        let pane = session.panes.get(&pane_id).expect("pane present");
+        assert_eq!(pane.agent_state, detect::AgentState::Blocked);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_does_not_flip_to_idle_on_single_idle_sample() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        session.feed(pane_id, b"\x1b[2J\x1b[H");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert_eq!(pane.agent_state, detect::AgentState::Working);
+        assert_eq!(pane.idle_streak, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_flips_to_idle_on_two_consecutive_idle_samples() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        session.feed(pane_id, b"\x1b[2J\x1b[H");
+        session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=1
+        session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=2 → Idle
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert_eq!(pane.agent_state, detect::AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_working_to_blocked_is_immediate() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        session.feed(pane_id, b"\x1b[2J\x1b[HDo you want to proceed?\nYes / No\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert_eq!(pane.agent_state, detect::AgentState::Blocked);
+        assert_eq!(pane.idle_streak, 0, "non-idle transitions reset streak");
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_returns_false_when_nothing_changed() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(!changed);
+        let _ = pane_id;
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_ignores_non_agent_panes() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        let changed = session.refresh_agent_states(|_pid| Some("zsh".to_string()));
+        assert!(!changed);
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert!(pane.agent.is_none());
+        assert_eq!(pane.agent_state, detect::AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_retries_resolver_on_transient_failure() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        let changed = session.refresh_agent_states(|_pid| None);
+        assert!(!changed);
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert!(pane.agent.is_none());
+        assert!(pane.agent_id_pid.is_none(), "cache key NOT poisoned");
+
+        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(changed);
+        let pane = session.panes.get(&pane_id).unwrap();
+        assert_eq!(pane.agent_state, detect::AgentState::Working);
+    }
 
     #[tokio::test]
     async fn session_renders_pane_output_as_full_frame() {
