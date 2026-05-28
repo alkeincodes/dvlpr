@@ -129,6 +129,7 @@ impl Compositor {
         panes: &[(PaneId, &dyn PaneCells)],
         sidebar_visible: bool,
         agent_entries: &[crate::session::AgentEntry],
+        menu: Option<&crate::menu::MenuState>,
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -182,6 +183,13 @@ impl Compositor {
             draw_sidebar(&mut buf, cols, sb, theme, agent_entries);
         }
 
+        // Menu overlay — painted last so it covers panes / dividers / tabs /
+        // sidebar in its footprint. The rect is clipped to content_area
+        // inside draw_menu so the bar/sidebar are never overwritten.
+        if let Some(m) = menu {
+            draw_menu(&mut buf, cols, m, crate::menu::PANE_MENU_ITEMS, theme, content);
+        }
+
         // Cursor at the focused pane's cursor, mapped to global coordinates.
         let cursor = match focused_rect {
             Some(fr) => {
@@ -229,6 +237,7 @@ impl Compositor {
             panes,
             false,
             &[],
+            None,
         ))
     }
 }

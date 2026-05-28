@@ -81,6 +81,10 @@ pub struct Session {
     /// `layout::compute_regions` may still suppress the sidebar's visual
     /// presence if the viewport is too narrow (see SIDEBAR_MIN_CONTENT_COLS).
     sidebar_visible: bool,
+    /// The open context menu, if any. At most one across the whole session
+    /// and all attached clients. See
+    /// `docs/superpowers/specs/2026-05-29-pane-right-click-menu-design.md`.
+    menu: Option<crate::menu::MenuState>,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -136,6 +140,7 @@ impl Session {
             command,
             cwd,
             sidebar_visible: false,
+            menu: None,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -204,6 +209,40 @@ impl Session {
         self.relayout_all();
     }
 
+    /// True if the context menu is currently open. Exposed for
+    /// `src/server/mod.rs::FrameSnapshot` construction so the `menu` field
+    /// itself stays encapsulated.
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
+    }
+
+    /// Menu keyboard event intercept. Returns `true` if the event was
+    /// consumed by the menu (caller skips its normal dispatch). Returns
+    /// `false` otherwise. Task 9 fills this in; current stub passes
+    /// through.
+    pub fn try_consume_menu_event(&mut self, _ev: &crate::input::InputEvent) -> bool {
+        false
+    }
+
+    /// Mouse dispatch when a menu is open. Task 8 fills this in.
+    #[allow(dead_code)]
+    fn handle_menu_mouse(&mut self, _ev: crate::input::MouseEvent) {
+        // stub
+    }
+
+    /// Auto-close the menu if its anchored pane is gone, or the anchor is
+    /// outside the current content area. Called at the bottom of every
+    /// menu-affecting mutator. Task 10 fills this in.
+    #[allow(dead_code)]
+    fn reconcile_menu(&mut self) {
+        // stub
+    }
+
+    #[cfg(test)]
+    pub fn set_menu_for_test(&mut self, menu: Option<crate::menu::MenuState>) {
+        self.menu = menu;
+    }
+
     /// Resize every pane's PTY + screen to the rect the current geometry assigns
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
@@ -267,6 +306,7 @@ impl Session {
             &refs,
             self.sidebar_visible,
             &agent_entries,
+            self.menu.as_ref(),
         )
     }
 
@@ -1788,5 +1828,26 @@ mod tests {
             pane_id,
         });
         assert_eq!(session.active_window_index(), active_before);
+    }
+
+    use crate::menu::{MenuKind, MenuState};
+
+    #[tokio::test]
+    async fn session_menu_starts_as_none() {
+        let (session, _pane_id, _rx) = build_session_with_one_pane().await;
+        assert_eq!(session.menu_open(), false);
+    }
+
+    #[tokio::test]
+    async fn session_menu_open_accessor_returns_menu_is_some() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        assert!(session.menu_open());
+        session.set_menu_for_test(None);
+        assert!(!session.menu_open());
     }
 }
