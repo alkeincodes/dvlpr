@@ -47,6 +47,23 @@ struct Window {
     zoomed: bool,
 }
 
+/// One sidebar row's data. Public so `Compositor::draw_sidebar` can
+/// receive a slice; consumed by `Session::hit` which maps it down to
+/// `layout::SidebarRowInput` for hit-testing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEntry {
+    /// Current session's name. Single-session v1 puts the same value
+    /// on every entry; field exists for cross-session forward-compat.
+    pub session_name: String,
+    /// 0-based, matches `Session.windows[..]` slot and
+    /// `Session.active_window`. The user-visible label renders 1-based
+    /// (`W<window_index + 1>:claude`).
+    pub window_index: usize,
+    pub pane_id: crate::layout::PaneId,
+    pub agent: crate::detect::Agent,
+    pub state: crate::detect::AgentState,
+}
+
 pub struct Session {
     session_name: String,
     windows: Vec<Window>,
@@ -745,6 +762,29 @@ impl Session {
         changed
     }
 
+    /// Return one `AgentEntry` per Claude pane in the session, in stable
+    /// order (by window index, then by pane order within the window's
+    /// layout tree). Drives the sidebar render and click dispatch.
+    pub fn agent_entries(&self) -> Vec<AgentEntry> {
+        let mut out = Vec::new();
+        for (wi, win) in self.windows.iter().enumerate() {
+            for pane_id in layout::all_panes(&win.root) {
+                if let Some(pane) = self.panes.get(&pane_id) {
+                    if let Some(agent) = pane.agent {
+                        out.push(AgentEntry {
+                            session_name: self.session_name.clone(),
+                            window_index: wi,
+                            pane_id,
+                            agent,
+                            state: pane.agent_state,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Recompute the dragged split's ratio from the pointer position and relayout.
     /// Operates on the explicit `window` the drag started in (not necessarily the
     /// active one). If that window is gone or the path no longer leads to a split,
@@ -1433,5 +1473,40 @@ mod tests {
         for rt in session.shutdown() {
             rt.close();
         }
+    }
+
+    #[tokio::test]
+    async fn agent_entries_lists_only_claude_panes_in_window_order() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        assert!(session.agent_entries().is_empty());
+
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pane_id, pane_id);
+        assert_eq!(entries[0].window_index, 0);
+        assert_eq!(entries[0].agent, detect::Agent::Claude);
+        assert_eq!(entries[0].state, detect::AgentState::Working);
+    }
+
+    #[tokio::test]
+    async fn agent_entries_uses_zero_based_window_index() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        let entries = session.agent_entries();
+        assert_eq!(entries[0].window_index, 0);
+        assert_ne!(entries[0].window_index, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_entries_includes_session_name_on_every_entry() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        let entries = session.agent_entries();
+        assert_eq!(entries[0].session_name, "test");
     }
 }
