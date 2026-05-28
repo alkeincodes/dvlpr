@@ -14,6 +14,27 @@ pub enum Flavor {
     Mocha,
 }
 
+impl Flavor {
+    /// True for light flavors. Drives per-flavor fg selection in `Theme::from_flavor`
+    /// (see the design spec's "Role → color mapping" section).
+    pub fn is_light(self) -> bool {
+        matches!(self, Flavor::Latte)
+    }
+}
+
+impl std::str::FromStr for Flavor {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "latte" => Ok(Flavor::Latte),
+            "frappe" => Ok(Flavor::Frappe),
+            "macchiato" => Ok(Flavor::Macchiato),
+            "mocha" => Ok(Flavor::Mocha),
+            _ => Err(format!("unknown flavor: {s:?}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21,5 +42,31 @@ mod tests {
     #[test]
     fn flavor_default_is_latte() {
         assert_eq!(Flavor::default(), Flavor::Latte);
+    }
+
+    #[test]
+    fn flavor_from_str_parses_each_name() {
+        use std::str::FromStr;
+        assert_eq!(Flavor::from_str("latte"), Ok(Flavor::Latte));
+        assert_eq!(Flavor::from_str("frappe"), Ok(Flavor::Frappe));
+        assert_eq!(Flavor::from_str("macchiato"), Ok(Flavor::Macchiato));
+        assert_eq!(Flavor::from_str("mocha"), Ok(Flavor::Mocha));
+    }
+
+    #[test]
+    fn flavor_from_str_rejects_unknown_and_wrong_case() {
+        use std::str::FromStr;
+        assert!(Flavor::from_str("").is_err());
+        assert!(Flavor::from_str("Latte").is_err()); // case-sensitive
+        assert!(Flavor::from_str("MOCHA").is_err());
+        assert!(Flavor::from_str("cappuccino").is_err());
+    }
+
+    #[test]
+    fn is_light_is_true_only_for_latte() {
+        assert!(Flavor::Latte.is_light());
+        assert!(!Flavor::Frappe.is_light());
+        assert!(!Flavor::Macchiato.is_light());
+        assert!(!Flavor::Mocha.is_light());
     }
 }
