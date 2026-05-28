@@ -25,7 +25,10 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     let (mut session, pane_id, _rx) = Session::new(
         "test".to_string(),
         vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
-        std::env::current_dir().unwrap().to_string_lossy().to_string(),
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
         80,
         24,
         Theme::default(),
@@ -53,18 +56,19 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     // grid.cols = 80 (full viewport width).
     let dot_idx = (2 * grid.cols as usize) + 77;
     assert_eq!(
-        grid.cells[dot_idx].style.fg,
-        theme.agent_working_fg,
+        grid.cells[dot_idx].style.fg, theme.agent_working_fg,
         "dot should be theme.agent_working_fg (Latte yellow #df8e1d)"
     );
 
     // 4. Feed blocked marker; immediate transition.
-    session.feed(pane_id, b"\x1b[2J\x1b[20;1HDo you want to proceed?\nYes / No\n");
+    session.feed(
+        pane_id,
+        b"\x1b[2J\x1b[20;1HDo you want to proceed?\nYes / No\n",
+    );
     let _ = session.refresh_agent_states(|_pid| Some("claude".to_string()));
     let grid = session.compose();
     assert_eq!(
-        grid.cells[dot_idx].style.fg,
-        theme.agent_blocked_fg,
+        grid.cells[dot_idx].style.fg, theme.agent_blocked_fg,
         "blocked should flip immediately"
     );
 
@@ -73,15 +77,13 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     let _ = session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=1
     let grid = session.compose();
     assert_eq!(
-        grid.cells[dot_idx].style.fg,
-        theme.agent_blocked_fg,
+        grid.cells[dot_idx].style.fg, theme.agent_blocked_fg,
         "single idle sample should NOT flip"
     );
     let _ = session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=2 → idle
     let grid = session.compose();
     assert_eq!(
-        grid.cells[dot_idx].style.fg,
-        theme.agent_idle_fg,
+        grid.cells[dot_idx].style.fg, theme.agent_idle_fg,
         "two consecutive idle samples → Idle"
     );
 

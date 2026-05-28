@@ -139,12 +139,7 @@ fn content_above_prompt_box(tail: &str) -> &str {
         let trimmed = line.trim();
         if trimmed.chars().filter(|c| *c == '─').count() >= 4
             && trimmed.chars().all(|c| {
-                c == '─'
-                    || c.is_whitespace()
-                    || c == '┌'
-                    || c == '┐'
-                    || c == '╭'
-                    || c == '╮'
+                c == '─' || c.is_whitespace() || c == '┌' || c == '┐' || c == '╭' || c == '╮'
             })
         {
             let byte_offset: usize = lines[..i].iter().map(|l| l.len() + 1).sum();

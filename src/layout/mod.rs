@@ -81,7 +81,10 @@ pub enum Hit {
     Tab(usize),
     /// Click on a row inside the agent-awareness sidebar.
     /// `window_index` is 0-based to match `Session.active_window`.
-    SidebarEntry { window_index: usize, pane_id: PaneId },
+    SidebarEntry {
+        window_index: usize,
+        pane_id: PaneId,
+    },
     None,
 }
 
@@ -553,12 +556,7 @@ pub fn tab_hit(tabs: &[TabRegion], x: u16) -> Option<usize> {
 /// Use this from `Session::hit` after `compute_regions` produces a
 /// `content_area`. Do NOT pass `viewport` here — `hit_test` is the
 /// wrapper for callers that haven't switched to the new API yet.
-pub fn hit_within_content(
-    node: &Node,
-    content_area: Rect,
-    col: u16,
-    row: u16,
-) -> Hit {
+pub fn hit_within_content(node: &Node, content_area: Rect, col: u16, row: u16) -> Hit {
     if col == 0 || row == 0 {
         return Hit::None;
     }
@@ -1277,7 +1275,12 @@ mod tests {
 
     #[test]
     fn compute_regions_gives_full_width_when_sidebar_hidden() {
-        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         let r = compute_regions(vp, false);
         assert_eq!(r.content_area.w, 80);
         assert_eq!(r.content_area.h, 23);
@@ -1287,7 +1290,12 @@ mod tests {
 
     #[test]
     fn compute_regions_reserves_sidebar_width_when_visible() {
-        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 24,
+        };
         let r = compute_regions(vp, true);
         assert_eq!(r.content_area.w, 80 - SIDEBAR_COLS);
         assert_eq!(r.content_area.h, 23);
@@ -1300,7 +1308,12 @@ mod tests {
 
     #[test]
     fn compute_regions_suppresses_sidebar_below_threshold() {
-        let vp = Rect { x: 0, y: 0, w: 30, h: 24 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 30,
+            h: 24,
+        };
         let r = compute_regions(vp, true);
         assert_eq!(r.sidebar, None);
         assert_eq!(r.content_area.w, 30, "content should keep full width");
@@ -1308,7 +1321,12 @@ mod tests {
 
     #[test]
     fn compute_regions_does_not_panic_on_zero_width() {
-        let vp = Rect { x: 0, y: 0, w: 0, h: 0 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
         let r = compute_regions(vp, true);
         assert_eq!(r.content_area.w, 0);
         assert_eq!(r.content_area.h, 0);
@@ -1318,14 +1336,28 @@ mod tests {
 
     #[test]
     fn sidebar_rows_assigns_one_row_per_entry_below_header_and_separator() {
-        let rect = Rect { x: 64, y: 0, w: 16, h: 10 };
+        let rect = Rect {
+            x: 64,
+            y: 0,
+            w: 16,
+            h: 10,
+        };
         let entries = vec![
-            SidebarRowInput { window_index: 0, pane_id: 1 },
-            SidebarRowInput { window_index: 1, pane_id: 5 },
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 5,
+            },
         ];
         let rows = sidebar_rows(rect, &entries);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].y, 2, "first entry at row 2 (after header+separator)");
+        assert_eq!(
+            rows[0].y, 2,
+            "first entry at row 2 (after header+separator)"
+        );
         assert_eq!(rows[1].y, 3);
         assert_eq!(rows[0].window_index, 0);
         assert_eq!(rows[1].pane_id, 5);
@@ -1333,12 +1365,29 @@ mod tests {
 
     #[test]
     fn sidebar_rows_truncates_when_rect_too_short() {
-        let rect = Rect { x: 0, y: 0, w: 16, h: 4 };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 4,
+        };
         let entries = vec![
-            SidebarRowInput { window_index: 0, pane_id: 1 },
-            SidebarRowInput { window_index: 1, pane_id: 2 },
-            SidebarRowInput { window_index: 2, pane_id: 3 },
-            SidebarRowInput { window_index: 3, pane_id: 4 },
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 2,
+            },
+            SidebarRowInput {
+                window_index: 2,
+                pane_id: 3,
+            },
+            SidebarRowInput {
+                window_index: 3,
+                pane_id: 4,
+            },
         ];
         let rows = sidebar_rows(rect, &entries);
         assert_eq!(rows.len(), 2);
@@ -1346,15 +1395,28 @@ mod tests {
 
     #[test]
     fn sidebar_rows_returns_empty_when_rect_too_short_for_chrome() {
-        let rect = Rect { x: 0, y: 0, w: 16, h: 2 };
-        let entries = vec![SidebarRowInput { window_index: 0, pane_id: 1 }];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 2,
+        };
+        let entries = vec![SidebarRowInput {
+            window_index: 0,
+            pane_id: 1,
+        }];
         assert!(sidebar_rows(rect, &entries).is_empty());
     }
 
     #[test]
     fn hit_within_content_returns_pane_for_pane_click() {
         let tree = Node::Leaf(7);
-        let content = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
         let hit = hit_within_content(&tree, content, 5, 5);
         assert_eq!(hit, Hit::Pane(7));
     }
@@ -1362,7 +1424,12 @@ mod tests {
     #[test]
     fn hit_within_content_returns_none_outside_content() {
         let tree = Node::Leaf(7);
-        let content = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
         let hit = hit_within_content(&tree, content, 5, 12);
         assert_eq!(hit, Hit::None);
     }
@@ -1370,7 +1437,12 @@ mod tests {
     #[test]
     fn hit_test_backward_compat_wrapper_still_works() {
         let tree = Node::Leaf(1);
-        let vp = Rect { x: 0, y: 0, w: 20, h: 10 };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
         let tabs = vec![];
         let hit = hit_test(&tree, vp, 1, &tabs, 5, 5);
         assert_eq!(hit, Hit::Pane(1));

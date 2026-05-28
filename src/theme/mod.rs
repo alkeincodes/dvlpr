@@ -3,8 +3,8 @@
 //! role mapping the compositor consumes. See
 //! `docs/superpowers/specs/2026-05-28-status-bar-theming-design.md`.
 
-use std::str::FromStr;
 use crate::compositor::Color;
+use std::str::FromStr;
 
 /// One of catppuccin's four flavors. `Default` is `Latte` (the light flavor),
 /// chosen per the design spec.
@@ -325,7 +325,12 @@ mod tests {
 
     #[test]
     fn active_tab_is_bold_in_every_flavor() {
-        for f in [Flavor::Latte, Flavor::Frappe, Flavor::Macchiato, Flavor::Mocha] {
+        for f in [
+            Flavor::Latte,
+            Flavor::Frappe,
+            Flavor::Macchiato,
+            Flavor::Mocha,
+        ] {
             assert!(Theme::from_flavor(f).active_tab_bold, "{f:?}");
         }
     }
