@@ -79,6 +79,9 @@ pub enum Hit {
     Pane(PaneId),
     Divider(SplitPath),
     Tab(usize),
+    /// Click on a row inside the agent-awareness sidebar.
+    /// `window_index` is 0-based to match `Session.active_window`.
+    SidebarEntry { window_index: usize, pane_id: PaneId },
     None,
 }
 
@@ -489,6 +492,49 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
+}
+
+/// What `Session::hit` passes to `sidebar_rows` — just the click-target
+/// ids. Layout-local so this module doesn't import `session::AgentEntry`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarRowInput {
+    pub window_index: usize, // 0-based
+    pub pane_id: PaneId,
+}
+
+/// One entry's position within the sidebar region. The y coordinate is
+/// in viewport coords (not sidebar-relative), so hit-test comparisons
+/// can be done against the raw mouse row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarRow {
+    pub y: u16,
+    pub window_index: usize,
+    pub pane_id: PaneId,
+}
+
+/// Compute per-row click targets for the visible sidebar entries.
+/// Layout is fixed at the top of `sidebar`:
+///   row 0 (rect.y + 0) — "AGENTS" header (NOT a click target)
+///   row 1 (rect.y + 1) — horizontal '─' separator
+///   row 2..N — one row per entry from `entries`, truncated to fit
+///              within `rect.h`
+///
+/// Used by both `Compositor::draw_sidebar` (to know where to write each
+/// row) and `Session::hit` (to translate a click to a SidebarEntry).
+pub fn sidebar_rows(rect: Rect, entries: &[SidebarRowInput]) -> Vec<SidebarRow> {
+    let mut out = Vec::with_capacity(entries.len());
+    if rect.h < 3 {
+        return out;
+    }
+    let max_entries = (rect.h - 2) as usize;
+    for (i, e) in entries.iter().take(max_entries).enumerate() {
+        out.push(SidebarRow {
+            y: rect.y + 2 + i as u16,
+            window_index: e.window_index,
+            pane_id: e.pane_id,
+        });
+    }
+    out
 }
 
 /// Resolve a 0-based x within the tab row to the window index whose `TabRegion`
@@ -1240,5 +1286,40 @@ mod tests {
         assert_eq!(r.content_area.h, 0);
         assert_eq!(r.tab_status_row, 0);
         assert_eq!(r.sidebar, None);
+    }
+
+    #[test]
+    fn sidebar_rows_assigns_one_row_per_entry_below_header_and_separator() {
+        let rect = Rect { x: 64, y: 0, w: 16, h: 10 };
+        let entries = vec![
+            SidebarRowInput { window_index: 0, pane_id: 1 },
+            SidebarRowInput { window_index: 1, pane_id: 5 },
+        ];
+        let rows = sidebar_rows(rect, &entries);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].y, 2, "first entry at row 2 (after header+separator)");
+        assert_eq!(rows[1].y, 3);
+        assert_eq!(rows[0].window_index, 0);
+        assert_eq!(rows[1].pane_id, 5);
+    }
+
+    #[test]
+    fn sidebar_rows_truncates_when_rect_too_short() {
+        let rect = Rect { x: 0, y: 0, w: 16, h: 4 };
+        let entries = vec![
+            SidebarRowInput { window_index: 0, pane_id: 1 },
+            SidebarRowInput { window_index: 1, pane_id: 2 },
+            SidebarRowInput { window_index: 2, pane_id: 3 },
+            SidebarRowInput { window_index: 3, pane_id: 4 },
+        ];
+        let rows = sidebar_rows(rect, &entries);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn sidebar_rows_returns_empty_when_rect_too_short_for_chrome() {
+        let rect = Rect { x: 0, y: 0, w: 16, h: 2 };
+        let entries = vec![SidebarRowInput { window_index: 0, pane_id: 1 }];
+        assert!(sidebar_rows(rect, &entries).is_empty());
     }
 }

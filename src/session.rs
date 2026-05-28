@@ -561,6 +561,12 @@ impl Session {
                         *drag = None;
                     }
                     layout::Hit::Divider(path) => *drag = Some((self.active_window, path)),
+                    layout::Hit::SidebarEntry { .. } => {
+                        // Task 13 wires up the real handler. For now,
+                        // a click on the sidebar is a no-op so the build
+                        // stays green.
+                        *drag = None;
+                    }
                     layout::Hit::None => *drag = None,
                 }
             }
