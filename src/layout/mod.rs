@@ -105,6 +105,69 @@ pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
     }
 }
 
+/// Width in cols of the agent-awareness sidebar when visible. Includes
+/// the 1-col left-edge vertical separator.
+pub const SIDEBAR_COLS: u16 = 16;
+
+/// Minimum content-area width to keep the sidebar visible. If the
+/// viewport is narrower than SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS,
+/// `compute_regions` silently suppresses the sidebar (returns None)
+/// even when sidebar_visible is true.
+pub const SIDEBAR_MIN_CONTENT_COLS: u16 = 20;
+
+/// Viewport partitioning consumed by both the compositor (render) and
+/// Session::hit (click dispatch). Unifies the previously-separate
+/// `tab_row()` + `content_area()` helpers and carves off the sidebar
+/// when visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Regions {
+    /// Pane content area: viewport MINUS the bottom tab/status row,
+    /// MINUS the sidebar columns on the right (when visible).
+    pub content_area: Rect,
+    /// y-coordinate of the always-present bottom tab/status row.
+    /// Spans the FULL viewport width — sidebar does NOT shorten it.
+    pub tab_status_row: u16,
+    /// Sidebar region when visible AND viewport is wide enough. None
+    /// otherwise — including when the `sidebar_visible` flag is true
+    /// but `viewport.w < SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS`.
+    pub sidebar: Option<Rect>,
+}
+
+/// Compute the viewport partition. Single function the compositor and
+/// hit-test both call — no API takes `(cols, rows, sidebar_visible)`
+/// elsewhere.
+pub fn compute_regions(viewport: Rect, sidebar_visible: bool) -> Regions {
+    let tab_status_row = viewport.y + viewport.h.saturating_sub(1);
+    let content_h = viewport.h.saturating_sub(1);
+
+    let effective_visible =
+        sidebar_visible && viewport.w >= SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS;
+
+    let (content_w, sidebar) = if effective_visible {
+        let content_w = viewport.w - SIDEBAR_COLS;
+        let sidebar_rect = Rect {
+            x: viewport.x + content_w,
+            y: viewport.y,
+            w: SIDEBAR_COLS,
+            h: content_h,
+        };
+        (content_w, Some(sidebar_rect))
+    } else {
+        (viewport.w, None)
+    };
+
+    Regions {
+        content_area: Rect {
+            x: viewport.x,
+            y: viewport.y,
+            w: content_w,
+            h: content_h,
+        },
+        tab_status_row,
+        sidebar,
+    }
+}
+
 /// Compute the rect for every leaf pane within `area`, in left-to-right /
 /// top-to-bottom tree order.
 pub fn pane_rects(node: &Node, area: Rect) -> Vec<(PaneId, Rect)> {
@@ -1136,5 +1199,46 @@ mod tests {
             h: 0,
         };
         assert!(!empty.contains(0, 0)); // zero-size contains nothing
+    }
+
+    #[test]
+    fn compute_regions_gives_full_width_when_sidebar_hidden() {
+        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let r = compute_regions(vp, false);
+        assert_eq!(r.content_area.w, 80);
+        assert_eq!(r.content_area.h, 23);
+        assert_eq!(r.tab_status_row, 23);
+        assert_eq!(r.sidebar, None);
+    }
+
+    #[test]
+    fn compute_regions_reserves_sidebar_width_when_visible() {
+        let vp = Rect { x: 0, y: 0, w: 80, h: 24 };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.content_area.w, 80 - SIDEBAR_COLS);
+        assert_eq!(r.content_area.h, 23);
+        assert_eq!(r.tab_status_row, 23);
+        let sb = r.sidebar.expect("sidebar present");
+        assert_eq!(sb.x, 80 - SIDEBAR_COLS);
+        assert_eq!(sb.w, SIDEBAR_COLS);
+        assert_eq!(sb.h, 23);
+    }
+
+    #[test]
+    fn compute_regions_suppresses_sidebar_below_threshold() {
+        let vp = Rect { x: 0, y: 0, w: 30, h: 24 };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.sidebar, None);
+        assert_eq!(r.content_area.w, 30, "content should keep full width");
+    }
+
+    #[test]
+    fn compute_regions_does_not_panic_on_zero_width() {
+        let vp = Rect { x: 0, y: 0, w: 0, h: 0 };
+        let r = compute_regions(vp, true);
+        assert_eq!(r.content_area.w, 0);
+        assert_eq!(r.content_area.h, 0);
+        assert_eq!(r.tab_status_row, 0);
+        assert_eq!(r.sidebar, None);
     }
 }
