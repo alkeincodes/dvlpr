@@ -1,13 +1,13 @@
-//! Catppuccin status-bar theme: a `Flavor` enum (Latte/Frappe/Macchiato/Mocha),
-//! four const `Palette` tables of the official catppuccin colors, and a `Theme`
-//! role mapping the compositor consumes. See
-//! `docs/superpowers/specs/2026-05-28-status-bar-theming-design.md`.
+//! Status-bar theme: a `Flavor` enum (Latte/Frappe/Macchiato/Mocha + OneDark),
+//! const `Palette` tables (catppuccin + Atom's One Dark), and a `Theme` role
+//! mapping the compositor consumes. See the design spec at
+//! `docs/superpowers/specs/2026-05-28-status-bar-one-dark-design.md`.
 
 use crate::compositor::Color;
 use std::str::FromStr;
 
-/// One of catppuccin's four flavors. `Default` is `Latte` (the light flavor),
-/// chosen per the design spec.
+/// One of the supported theme flavors. `Default` is `Latte` (the light
+/// catppuccin flavor), chosen per the design spec.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Flavor {
     #[default]
@@ -15,6 +15,7 @@ pub enum Flavor {
     Frappe,
     Macchiato,
     Mocha,
+    OneDark,
 }
 
 impl Flavor {
@@ -33,6 +34,7 @@ impl FromStr for Flavor {
             "frappe" => Ok(Flavor::Frappe),
             "macchiato" => Ok(Flavor::Macchiato),
             "mocha" => Ok(Flavor::Mocha),
+            "one-dark" => Ok(Flavor::OneDark),
             _ => Err(format!("unknown flavor: {s:?}")),
         }
     }
@@ -188,6 +190,35 @@ pub const MOCHA: Palette = Palette {
     crust: Color::Rgb(0x11, 0x11, 0x1b),
 };
 
+pub const ONE_DARK: Palette = Palette {
+    rosewater: Color::Rgb(0xe0, 0x6c, 0x75), // reuses red — no canonical rosewater
+    flamingo:  Color::Rgb(0xe0, 0x6c, 0x75),
+    pink:      Color::Rgb(0xc6, 0x78, 0xdd),
+    mauve:     Color::Rgb(0xc6, 0x78, 0xdd), // magenta — drives session_fg
+    red:       Color::Rgb(0xe0, 0x6c, 0x75),
+    maroon:    Color::Rgb(0xbe, 0x5a, 0x65),
+    peach:     Color::Rgb(0xd1, 0x9a, 0x66), // orange — drives active_tab_bg
+    yellow:    Color::Rgb(0xe5, 0xc0, 0x7b),
+    green:     Color::Rgb(0x98, 0xc3, 0x79),
+    teal:      Color::Rgb(0x56, 0xb6, 0xc2),
+    sky:       Color::Rgb(0x56, 0xb6, 0xc2),
+    sapphire:  Color::Rgb(0x61, 0xaf, 0xef),
+    blue:      Color::Rgb(0x61, 0xaf, 0xef),
+    lavender:  Color::Rgb(0xc6, 0x78, 0xdd),
+    text:      Color::Rgb(0xab, 0xb2, 0xbf), // fg — drives inactive_tab_fg
+    subtext1:  Color::Rgb(0x9a, 0xa0, 0xae),
+    subtext0:  Color::Rgb(0x82, 0x88, 0x97),
+    overlay2:  Color::Rgb(0x6e, 0x74, 0x82),
+    overlay1:  Color::Rgb(0x5c, 0x63, 0x70),
+    overlay0:  Color::Rgb(0x4b, 0x52, 0x5d),
+    surface2:  Color::Rgb(0x4b, 0x52, 0x5d),
+    surface1:  Color::Rgb(0x44, 0x49, 0x55),
+    surface0:  Color::Rgb(0x3e, 0x44, 0x51), // bg-lighter
+    base:      Color::Rgb(0x28, 0x2c, 0x34), // bg
+    mantle:    Color::Rgb(0x24, 0x27, 0x2e),
+    crust:     Color::Rgb(0x21, 0x25, 0x2b), // bg-darker — drives active_tab_fg
+};
+
 /// Renderer-facing role mapping. The compositor reads these fields directly to
 /// style status-bar cells and the heavy divider glyph. Constructed once per
 /// session via `from_flavor` and stored immutably; the hot render path never
@@ -216,10 +247,11 @@ impl Theme {
     /// section for the rationale.
     pub fn from_flavor(flavor: Flavor) -> Self {
         let p: &Palette = match flavor {
-            Flavor::Latte => &LATTE,
-            Flavor::Frappe => &FRAPPE,
+            Flavor::Latte     => &LATTE,
+            Flavor::Frappe    => &FRAPPE,
             Flavor::Macchiato => &MACCHIATO,
-            Flavor::Mocha => &MOCHA,
+            Flavor::Mocha     => &MOCHA,
+            Flavor::OneDark   => &ONE_DARK,
         };
         let (session_fg, active_tab_fg) = if flavor.is_light() {
             // Latte: `crust` is the darkest surface shade (#dce0e8, still a
@@ -395,5 +427,35 @@ mod tests {
         assert_eq!(t.agent_idle_fg, MOCHA.green);
         assert_eq!(t.agent_working_fg, MOCHA.yellow);
         assert_eq!(t.agent_blocked_fg, MOCHA.red);
+    }
+
+    #[test]
+    fn flavor_from_str_parses_one_dark() {
+        assert_eq!(Flavor::from_str("one-dark"), Ok(Flavor::OneDark));
+    }
+
+    #[test]
+    fn flavor_from_str_rejects_one_dark_wrong_spellings() {
+        assert!(Flavor::from_str("OneDark").is_err());
+        assert!(Flavor::from_str("onedark").is_err());
+        assert!(Flavor::from_str("ONE-DARK").is_err());
+        assert!(Flavor::from_str("one_dark").is_err());
+    }
+
+    #[test]
+    fn is_light_is_false_for_one_dark() {
+        assert!(!Flavor::OneDark.is_light());
+    }
+
+    #[test]
+    fn one_dark_palette_spot_check() {
+        assert_eq!(ONE_DARK.mauve, Color::Rgb(0xc6, 0x78, 0xdd));
+        assert_eq!(ONE_DARK.peach, Color::Rgb(0xd1, 0x9a, 0x66));
+        assert_eq!(ONE_DARK.text, Color::Rgb(0xab, 0xb2, 0xbf));
+        assert_eq!(ONE_DARK.crust, Color::Rgb(0x21, 0x25, 0x2b));
+        assert_eq!(ONE_DARK.surface0, Color::Rgb(0x3e, 0x44, 0x51));
+        assert_eq!(ONE_DARK.green, Color::Rgb(0x98, 0xc3, 0x79));
+        assert_eq!(ONE_DARK.yellow, Color::Rgb(0xe5, 0xc0, 0x7b));
+        assert_eq!(ONE_DARK.red, Color::Rgb(0xe0, 0x6c, 0x75));
     }
 }
