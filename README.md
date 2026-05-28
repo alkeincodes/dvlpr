@@ -67,6 +67,13 @@ running in a dvlpr pane, these all work as plain pane bytes:
 If you previously used `Ctrl-A` as the dvlpr prefix and want to keep that
 binding, add `prefix = "C-a"` to `~/.config/dvlpr/config.toml`.
 
+**Upgrading from a prior release:** a running daemon caches its config at
+startup, so an existing session keeps the old default prefix until that
+daemon exits — `Config::load()` is not re-run on attach. After upgrading,
+either `dvlpr kill -t <name>` or close the last pane to shut the session
+down via the existing `Closed` flow, then start fresh with `dvlpr <name>`
+so the new daemon picks up the new default.
+
 ### Warp note
 
 Warp does not expose a keybind action that sends arbitrary bytes to the
