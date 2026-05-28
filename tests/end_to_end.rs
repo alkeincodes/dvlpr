@@ -157,8 +157,8 @@ async fn focus_in_bytes_are_not_forwarded_to_the_pane() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let pre_size = std::fs::metadata(&pane_log).map(|m| m.len()).unwrap_or(0);
     assert!(
-        pre_size >= 1,
-        "sanity: pane should have received the 'a' byte before we test the no-leak property; \
+        pre_size >= 2,
+        "sanity: pane should have received `a\\n` (2 bytes) before we test the no-leak property; \
          file size = {pre_size}"
     );
 
@@ -181,6 +181,27 @@ async fn focus_in_bytes_are_not_forwarded_to_the_pane() {
         "FocusIn bytes must not be forwarded to the pane PTY: \
          pre-size {pre_size}, post-size {post_size} (delta = {} byte(s))",
         post_size.saturating_sub(pre_size)
+    );
+
+    // Cooked-mode false-negative guard: a leaked `\x1b[I` would sit in the PTY
+    // line-discipline buffer without a newline, so cat wouldn't read it, so the
+    // file wouldn't grow within 250ms — making the no-leak assertion above
+    // pass for the wrong reason. Send a `\n` now to force cooked mode to flush
+    // whatever is buffered:
+    //   - parser works:   buffer is just `\n`        → cat reads 1 byte
+    //   - parser broken:  buffer is `\x1b[I\n` (4)   → cat reads 4 bytes
+    // So `flush_size - post_size == 1` is the only correct outcome.
+    write_msg(&mut w, &ClientMsg::Input(b"\n".to_vec()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let flush_size = std::fs::metadata(&pane_log).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        flush_size - post_size,
+        1,
+        "PTY line-discipline flush should deliver exactly one newline; \
+         got {} extra byte(s) — focus bytes leaked into the cooked-mode buffer",
+        flush_size - post_size
     );
 
     drop(r);
