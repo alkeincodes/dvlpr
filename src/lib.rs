@@ -6,6 +6,7 @@ pub mod detect;
 pub mod ghostty;
 pub mod input;
 pub mod layout;
+pub mod menu;
 pub mod pane;
 pub mod procinfo;
 pub mod protocol;
