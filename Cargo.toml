@@ -19,10 +19,14 @@ portable-pty = "0.9"
 crossterm = "0.29"
 bincode = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
