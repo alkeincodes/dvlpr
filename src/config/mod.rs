@@ -211,7 +211,6 @@ fn spec_or_default(raw: &Option<String>, field: &str, default: KeySpec) -> KeySp
 /// Parse the optional flavor string, falling back to Latte (and logging) on
 /// absence or an unknown value.
 fn flavor_or_default(raw: &Option<String>) -> crate::theme::Theme {
-    use std::str::FromStr;
     match raw {
         None => crate::theme::Theme::default(),
         Some(s) => match crate::theme::Flavor::from_str(s) {
