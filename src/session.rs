@@ -362,6 +362,9 @@ impl Session {
                 }
                 self.relayout_all();
             }
+            Command::ToggleSidebar => {
+                // Task 12 implements this. Stub keeps build green.
+            }
             Command::Detach => eff.detach = true,
         }
         eff

@@ -19,6 +19,7 @@ pub enum Command {
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
     ToggleZoom,          // C-a 0: fullscreen the focused pane (toggle)
+    ToggleSidebar,       // C-a s: show/hide agent-awareness sidebar
     Detach,
 }
 
