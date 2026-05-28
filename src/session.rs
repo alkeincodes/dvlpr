@@ -564,27 +564,8 @@ impl Session {
         match ev.kind {
             MouseKind::Press => {
                 let hit = self.hit(ev.col, ev.row);
-                match hit {
-                    layout::Hit::Pane(id) => {
-                        self.focus(id);
-                        *drag = None;
-                    }
-                    layout::Hit::Tab(idx) => {
-                        if idx < self.windows.len() {
-                            self.unzoom_active();
-                            self.active_window = idx;
-                        }
-                        *drag = None;
-                    }
-                    layout::Hit::Divider(path) => *drag = Some((self.active_window, path)),
-                    layout::Hit::SidebarEntry { .. } => {
-                        // Task 13 wires up the real handler. For now,
-                        // a click on the sidebar is a no-op so the build
-                        // stays green.
-                        *drag = None;
-                    }
-                    layout::Hit::None => *drag = None,
-                }
+                let new_drag = self.handle_hit(hit);
+                *drag = new_drag.map(|path| (self.active_window, path));
             }
             MouseKind::Drag => {
                 if let Some((wi, path)) = drag.clone() {
@@ -595,51 +576,125 @@ impl Session {
         }
     }
 
-    /// Hit-test a 1-based pointer against the active window's geometry.
-    fn hit(&self, col: u16, row: u16) -> layout::Hit {
-        let Some(win) = self.windows.get(self.active_window) else {
+    pub(crate) fn hit(&self, col: u16, row: u16) -> layout::Hit {
+        if col == 0 || row == 0 {
             return layout::Hit::None;
-        };
-        let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let tabs = layout::tab_layout(
-            &self.session_name,
-            &names,
-            self.active_window,
-            win.zoomed,
-            self.cols,
-        );
-        if win.zoomed {
-            if col == 0 || row == 0 {
+        }
+        let x = col - 1;
+        let y = row - 1;
+
+        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible);
+
+        // 1. Sidebar FIRST — works in both zoomed and non-zoomed branches.
+        if let Some(sb) = regions.sidebar {
+            if sb.contains(x, y) {
+                let entries = self.agent_entries();
+                let inputs: Vec<_> = entries
+                    .iter()
+                    .map(|e| layout::SidebarRowInput {
+                        window_index: e.window_index,
+                        pane_id: e.pane_id,
+                    })
+                    .collect();
+                for r in layout::sidebar_rows(sb, &inputs) {
+                    if r.y == y {
+                        return layout::Hit::SidebarEntry {
+                            window_index: r.window_index,
+                            pane_id: r.pane_id,
+                        };
+                    }
+                }
                 return layout::Hit::None;
             }
-            let (x, y) = (col - 1, row - 1);
-            if let Some(ty) = layout::tab_row(self.viewport(), self.windows.len()) {
-                if y == ty {
-                    return match layout::tab_hit(&tabs, x) {
-                        Some(w) => layout::Hit::Tab(w),
-                        None => layout::Hit::None,
-                    };
-                }
-            }
-            let content = layout::content_area(self.viewport(), self.windows.len());
-            if content.contains(x, y) {
+        }
+
+        // 2. Tab/status row. Uses FULL viewport width (self.cols) because
+        // the bottom bar spans full width even when sidebar is visible.
+        if y == regions.tab_status_row {
+            let tab_names: Vec<String> =
+                self.windows.iter().map(|w| w.name.clone()).collect();
+            let win_zoomed = self
+                .windows
+                .get(self.active_window)
+                .is_some_and(|w| w.zoomed);
+            let tabs = layout::tab_layout(
+                &self.session_name,
+                &tab_names,
+                self.active_window,
+                win_zoomed,
+                self.cols,
+            );
+            return match layout::tab_hit(&tabs, x) {
+                Some(w) => layout::Hit::Tab(w),
+                None => layout::Hit::None,
+            };
+        }
+
+        // 3. Content area: dispatch by active window's zoom state.
+        let win = match self.windows.get(self.active_window) {
+            Some(w) => w,
+            None => return layout::Hit::None,
+        };
+        if win.zoomed {
+            if regions.content_area.contains(x, y) {
                 return layout::Hit::Pane(win.focused);
             }
             return layout::Hit::None;
         }
-        layout::hit_test(
-            &win.root,
-            self.viewport(),
-            self.windows.len(),
-            &tabs,
-            col,
-            row,
-        )
+        layout::hit_within_content(&win.root, regions.content_area, col, row)
     }
 
     #[cfg(test)]
     pub fn hit_for_test(&self, col: u16, row: u16) -> layout::Hit {
         self.hit(col, row)
+    }
+
+    /// Dispatch a `Hit` (from `Session::hit`) into Session state
+    /// mutations. Shared by `handle_mouse` (production click path) and
+    /// tests (which call this directly with a synthesized `Hit`).
+    /// Returns whether a divider drag should be initiated for this hit
+    /// — Some(SplitPath) for a Divider hit, None otherwise.
+    pub(crate) fn handle_hit(
+        &mut self,
+        hit: layout::Hit,
+    ) -> Option<layout::SplitPath> {
+        match hit {
+            layout::Hit::Pane(id) => {
+                self.focus(id);
+                None
+            }
+            layout::Hit::Tab(idx) => {
+                if idx < self.windows.len() {
+                    self.unzoom_active();
+                    self.active_window = idx;
+                }
+                None
+            }
+            layout::Hit::Divider(path) => Some(path),
+            layout::Hit::SidebarEntry { window_index, pane_id } => {
+                // 1. Validate destination window exists.
+                let Some(dest_win) = self.windows.get(window_index) else {
+                    return None;
+                };
+                // 2. Validate pane belongs to destination window's tree.
+                if !layout::all_panes(&dest_win.root).contains(&pane_id) {
+                    return None;
+                }
+                // 3. Unzoom currently active window.
+                self.unzoom_active();
+                // 4. Switch active.
+                self.active_window = window_index;
+                // 5. Focus the destination pane; clear destination zoom.
+                if let Some(win) = self.windows.get_mut(window_index) {
+                    win.focused = pane_id;
+                    win.zoomed = false;
+                }
+                // 6. Cascade layout (zoom may have changed).
+                self.relayout_all();
+                None
+            }
+            layout::Hit::None => None,
+        }
     }
 
     #[cfg(test)]
@@ -1561,5 +1616,69 @@ mod tests {
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
         // initial cols from helper is 80; sidebar shrinks by 16
         assert_eq!(after_cols, 80 - 16);
+    }
+
+    #[tokio::test]
+    async fn session_hit_returns_sidebar_entry_when_click_lands_in_sidebar_region() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.toggle_sidebar();
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+
+        // Sidebar starts at col 65 (cols 64..80, 1-based 65..80).
+        // First entry at sidebar row 2 (0-based) = row 3 1-based.
+        let hit = session.hit(70, 3);
+        match hit {
+            layout::Hit::SidebarEntry { window_index, pane_id: hit_pane } => {
+                assert_eq!(window_index, 0);
+                assert_eq!(hit_pane, pane_id);
+            }
+            other => panic!("expected SidebarEntry, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_hit_returns_none_for_sidebar_header_or_separator_click() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.toggle_sidebar();
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+
+        let hit = session.hit(70, 1);  // header row
+        assert_eq!(hit, layout::Hit::None);
+        let hit = session.hit(70, 2);  // separator row
+        assert_eq!(hit, layout::Hit::None);
+    }
+
+    #[tokio::test]
+    async fn handle_hit_sidebar_entry_switches_window_and_focuses_pane() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        let hit = layout::Hit::SidebarEntry { window_index: 0, pane_id };
+        session.handle_hit(hit);
+        assert_eq!(session.active_window_index(), 0);
+        assert_eq!(session.focused_pane(), pane_id);
+    }
+
+    #[tokio::test]
+    async fn handle_hit_sidebar_entry_ignores_stale_pane_id() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let bogus_pane = 99_999_999;
+        let active_before = session.active_window_index();
+        session.handle_hit(layout::Hit::SidebarEntry {
+            window_index: 0,
+            pane_id: bogus_pane,
+        });
+        assert_eq!(session.active_window_index(), active_before);
+    }
+
+    #[tokio::test]
+    async fn handle_hit_sidebar_entry_ignores_out_of_range_window_index() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        let active_before = session.active_window_index();
+        session.handle_hit(layout::Hit::SidebarEntry {
+            window_index: 99,
+            pane_id,
+        });
+        assert_eq!(session.active_window_index(), active_before);
     }
 }
