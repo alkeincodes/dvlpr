@@ -599,10 +599,12 @@ mod tests {
         s.chars().map(sc).collect()
     }
 
-    /// Strip all ANSI/CSI escape sequences from `s`, leaving only printable
-    /// characters. Used in tests that assert structural content of rendered
-    /// frames without being coupled to exact SGR byte sequences.
-    fn strip_sgr(s: &str) -> String {
+    /// Strip all ANSI CSI escape sequences from `s`, leaving only printable
+    /// characters. A CSI sequence is `ESC [` followed by any number of parameter
+    /// bytes (0x30-0x3F) and intermediate bytes (0x20-0x2F), terminated by a final
+    /// byte in the range 0x40-0x7E. Used in tests that assert structural content
+    /// of rendered frames without being coupled to exact SGR byte sequences.
+    fn strip_csi(s: &str) -> String {
         let bytes = s.as_bytes();
         let mut out = String::with_capacity(s.len());
         let mut i = 0;
@@ -840,7 +842,7 @@ mod tests {
         // palette tweaks don't churn this test.
         assert!(s.starts_with("\x1b[2J\x1b[H\x1b[0m"), "frame must start with clear+home+reset, got: {s:?}");
         assert!(s.contains("ab "), "frame must contain the pane row content");
-        let plain = strip_sgr(&s);
+        let plain = strip_csi(&s);
         assert!(plain.contains("s  "), "frame must contain the session prefix + two-space gap, plain={plain:?}");
         assert!(s.ends_with("\x1b[1;2H"), "frame must end with the cursor CUP");
     }
@@ -878,13 +880,12 @@ mod tests {
         );
         let s = String::from_utf8(out).unwrap();
         // content h=1: avail=6, first_w=3 (x0..2), divider x3, right x4..6.
-        // The heavy divider now carries an fg SGR escape between the left
-        // pane's "LLL" and the "┃" glyph, so the contiguous "LLL┃RRR"
-        // substring no longer holds. Assert the three components separately;
-        // divider style is covered by draw_divider_fills_with_light_or_heavy_glyph.
-        assert!(s.contains("LLL"), "left pane content present");
-        assert!(s.contains("┃"), "heavy divider glyph present");
-        assert!(s.contains("RRR"), "right pane content present");
+        // The heavy divider now carries an fg SGR escape between "LLL" and
+        // "┃", so the contiguous "LLL┃RRR" substring no longer holds in the
+        // raw bytes. Strip CSI escapes first, then the original ordered check
+        // still works.
+        let plain = strip_csi(&s);
+        assert!(plain.contains("LLL┃RRR"), "ordered divider content present in stripped frame; got: {plain:?}");
     }
 
     #[test]
