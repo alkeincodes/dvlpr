@@ -750,6 +750,9 @@ mod tests {
             active_tab_bold: true,
             inactive_tab_fg: Color::Rgb(6, 6, 6),
             inactive_tab_bg: Color::Rgb(7, 7, 7),
+            agent_idle_fg: Color::Rgb(8, 8, 8),
+            agent_working_fg: Color::Rgb(9, 9, 9),
+            agent_blocked_fg: Color::Rgb(10, 10, 10),
         };
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;
