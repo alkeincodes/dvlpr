@@ -22,6 +22,27 @@ use crate::protocol::{
 };
 use crate::session::Session;
 
+/// Per-frame payload published on the central loop's watch channel.
+/// Carries the composed grid plus the menu-open bit so each per-client
+/// writer can edge-trigger `\x1b[?1003h` / `\x1b[?1003l` framing. The
+/// type is purely internal — never serialized over the wire.
+#[derive(Clone, Debug)]
+pub struct FrameSnapshot {
+    pub grid: Grid,
+    pub menu_open: bool,
+}
+
+/// Compute the `?1003h` / `?1003l` prefix bytes for a single per-writer
+/// edge transition. Extracted so the writer's body stays a thin
+/// orchestration shell and the edge logic is unit-testable in isolation.
+fn one_oh_three_edge_prefix(last: bool, next: bool) -> &'static [u8] {
+    match (last, next) {
+        (false, true)  => b"\x1b[?1003h",
+        (true,  false) => b"\x1b[?1003l",
+        _              => b"",
+    }
+}
+
 /// How a daemon should start: where to listen and what to run in the pane.
 pub struct ServerConfig {
     pub socket_path: PathBuf,
@@ -102,7 +123,7 @@ enum Event {
 /// (awaited only at full-server teardown for a deterministic `Closed` flush).
 struct ClientState {
     control: mpsc::UnboundedSender<Control>,
-    grid_tx: watch::Sender<Arc<Grid>>,
+    grid_tx: watch::Sender<Arc<FrameSnapshot>>,
     writer: JoinHandle<()>,
     parser: InputParser,
     /// The divider being dragged, as `(window index at press, path)`.
@@ -193,11 +214,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         session.resize(cols, rows);
                         // Make the very first frame show real process names.
                         session.refresh_window_names(crate::procinfo::process_name);
-                        let grid = Arc::new(session.compose());
+                        let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
                         for st in clients.values() {
-                            let _ = st.grid_tx.send(grid.clone());
+                            let _ = st.grid_tx.send(snapshot.clone());
                         }
-                        let (grid_tx, grid_rx) = watch::channel(grid.clone());
+                        let (grid_tx, grid_rx) = watch::channel(snapshot.clone());
                         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
                         let writer = spawn_writer(id, cols, rows, write_half, grid_rx, control_rx, ev_tx.clone());
                         clients.insert(
@@ -310,9 +331,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     );
                 }
                 if dirty && !clients.is_empty() {
-                    let grid = Arc::new(session.compose());
+                    let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
                     for st in clients.values() {
-                        let _ = st.grid_tx.send(grid.clone());
+                        let _ = st.grid_tx.send(snapshot.clone());
                     }
                     dirty = false;
                 }
@@ -560,20 +581,23 @@ fn spawn_writer(
     cols: u16,
     rows: u16,
     mut write_half: tokio::net::unix::OwnedWriteHalf,
-    mut grid_rx: watch::Receiver<Arc<Grid>>,
+    mut grid_rx: watch::Receiver<Arc<FrameSnapshot>>,
     mut control: mpsc::UnboundedReceiver<Control>,
     ev_tx: mpsc::UnboundedSender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut view = (cols.max(1), rows.max(1));
-        let mut last_src: Arc<Grid> = grid_rx.borrow_and_update().clone();
+        let first: Arc<FrameSnapshot> = grid_rx.borrow_and_update().clone();
+        let mut last_src: Arc<Grid> = Arc::new(first.grid.clone());
         let mut last_fitted = fit(last_src.as_ref(), view.0, view.1);
+        let first_prefix: &[u8] = if first.menu_open { b"\x1b[?1003h" } else { b"" };
+        let first_body = serialize_full(&last_fitted);
+        let mut first_data = Vec::with_capacity(first_prefix.len() + first_body.len());
+        first_data.extend_from_slice(first_prefix);
+        first_data.extend_from_slice(&first_body);
         if write_msg(
             &mut write_half,
-            &ServerMsg::Frame {
-                data: serialize_full(&last_fitted),
-                full: true,
-            },
+            &ServerMsg::Frame { data: first_data, full: true },
         )
         .await
         .is_err()
@@ -581,30 +605,35 @@ fn spawn_writer(
             let _ = ev_tx.send(Event::ClientGone(id));
             return;
         }
+        let mut last_menu_open: bool = first.menu_open;
         loop {
             tokio::select! {
                 biased;
                 ctrl = control.recv() => match ctrl {
                     Some(Control::Detach) => {
+                        let _ = write_msg(
+                            &mut write_half,
+                            &ServerMsg::Frame { data: b"\x1b[?1003l".to_vec(), full: false },
+                        )
+                        .await;
                         let _ = write_msg(&mut write_half, &ServerMsg::Detach).await;
                         return;
                     }
                     Some(Control::Closed(reason)) => {
+                        let _ = write_msg(
+                            &mut write_half,
+                            &ServerMsg::Frame { data: b"\x1b[?1003l".to_vec(), full: false },
+                        )
+                        .await;
                         let _ = write_msg(&mut write_half, &ServerMsg::Closed { reason }).await;
                         return;
                     }
                     Some(Control::Resize(c, r)) => {
-                        // Re-fit the CURRENT source grid to the new view and repaint now,
-                        // without waiting for the next publish (a non-foreground resize
-                        // does not mark the session dirty).
                         view = (c.max(1), r.max(1));
                         last_fitted = fit(last_src.as_ref(), view.0, view.1);
                         if write_msg(
                             &mut write_half,
-                            &ServerMsg::Frame {
-                                data: serialize_full(&last_fitted),
-                                full: true,
-                            },
+                            &ServerMsg::Frame { data: serialize_full(&last_fitted), full: true },
                         )
                         .await
                         .is_err()
@@ -616,26 +645,31 @@ fn spawn_writer(
                     None => return,
                 },
                 changed = grid_rx.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    let next_src: Arc<Grid> = grid_rx.borrow_and_update().clone();
-                    // A source-dims change shifts every client's margins/clip region, so
-                    // force a full frame; otherwise diff the fitted grids.
+                    if changed.is_err() { return; }
+                    let next: Arc<FrameSnapshot> = grid_rx.borrow_and_update().clone();
+                    let next_src = Arc::new(next.grid.clone());
                     let resized = next_src.dims() != last_src.dims();
                     let fitted = fit(next_src.as_ref(), view.0, view.1);
-                    let data = if resized {
+                    let prefix: &[u8] = one_oh_three_edge_prefix(last_menu_open, next.menu_open);
+                    last_menu_open = next.menu_open;
+                    let body = if resized {
                         serialize_full(&fitted)
                     } else {
                         diff_rows(&last_fitted, &fitted)
                     };
-                    if !data.is_empty()
-                        && write_msg(&mut write_half, &ServerMsg::Frame { data, full: resized })
+                    if prefix.is_empty() && body.is_empty() {
+                        // Nothing to send.
+                    } else {
+                        let mut data = Vec::with_capacity(prefix.len() + body.len());
+                        data.extend_from_slice(prefix);
+                        data.extend_from_slice(&body);
+                        if write_msg(&mut write_half, &ServerMsg::Frame { data, full: resized })
                             .await
                             .is_err()
-                    {
-                        let _ = ev_tx.send(Event::ClientGone(id));
-                        return;
+                        {
+                            let _ = ev_tx.send(Event::ClientGone(id));
+                            return;
+                        }
                     }
                     last_src = next_src;
                     last_fitted = fitted;
@@ -776,5 +810,41 @@ mod tests {
             "socket path should be <runtime>/okname.sock, got {:?}",
             cfg.socket_path
         );
+    }
+
+    use crate::compositor::Grid;
+
+    #[test]
+    fn frame_snapshot_carries_menu_open_bit_alongside_grid() {
+        let g = Grid {
+            cols: 10,
+            rows: 5,
+            cells: vec![],
+            cursor: (0, 0),
+        };
+        let s = FrameSnapshot { grid: g.clone(), menu_open: false };
+        assert_eq!(s.menu_open, false);
+        let s2 = FrameSnapshot { grid: g, menu_open: true };
+        assert_eq!(s2.menu_open, true);
+    }
+
+    #[test]
+    fn one_oh_three_edge_prefix_emits_h_on_false_to_true_transition() {
+        assert_eq!(one_oh_three_edge_prefix(false, true), b"\x1b[?1003h");
+    }
+
+    #[test]
+    fn one_oh_three_edge_prefix_emits_l_on_true_to_false_transition() {
+        assert_eq!(one_oh_three_edge_prefix(true, false), b"\x1b[?1003l");
+    }
+
+    #[test]
+    fn one_oh_three_edge_prefix_emits_empty_when_unchanged_false() {
+        assert_eq!(one_oh_three_edge_prefix(false, false), b"");
+    }
+
+    #[test]
+    fn one_oh_three_edge_prefix_emits_empty_when_unchanged_true() {
+        assert_eq!(one_oh_three_edge_prefix(true, true), b"");
     }
 }

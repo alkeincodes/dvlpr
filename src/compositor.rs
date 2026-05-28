@@ -88,7 +88,7 @@ impl Default for StyledCell {
 
 /// A composed full-viewport snapshot: the styled cell grid plus the global cursor
 /// position.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Grid {
     pub cols: u16,
     pub rows: u16,
