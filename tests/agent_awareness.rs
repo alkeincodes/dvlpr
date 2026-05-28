@@ -89,7 +89,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
 
     // 6. Click on the sidebar entry via the PUBLIC handle_mouse API.
     let mut drag: Option<(usize, SplitPath)> = None;
-    session.handle_mouse(
+    let _ = session.handle_mouse(
         MouseEvent {
             button: 0,
             col: 70,

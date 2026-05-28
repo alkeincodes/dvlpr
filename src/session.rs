@@ -224,10 +224,51 @@ impl Session {
         false
     }
 
-    /// Mouse dispatch when a menu is open. Task 8 fills this in.
-    #[allow(dead_code)]
-    fn handle_menu_mouse(&mut self, _ev: crate::input::MouseEvent) {
-        // stub
+    /// Mouse dispatch when a menu is open.
+    fn handle_menu_mouse(&mut self, ev: crate::input::MouseEvent) -> CommandEffect {
+        use crate::input::MouseKind;
+        use crate::menu::{menu_hit, MenuHit, MenuKind, MenuState};
+
+        let Some(menu) = self.menu.clone() else { return CommandEffect::default() };
+        let items = menu.items();
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0) as u16;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let hit = menu_hit(&menu, items.len(), label_w, content, ev.col, ev.row);
+
+        match ev.kind {
+            MouseKind::Press if ev.button == 0 => match hit {
+                MenuHit::Item(i) => {
+                    let cmd = items[i].command;
+                    self.menu = None;
+                    return self.apply_command(cmd);
+                }
+                MenuHit::Border => {}
+                MenuHit::Outside => {
+                    self.menu = None;
+                }
+            },
+            MouseKind::Press if ev.button == 2 => {
+                self.menu = None;
+                let new_hit = self.hit(ev.col, ev.row);
+                if let layout::Hit::Pane(id) = new_hit {
+                    self.focus(id);
+                    self.menu = Some(MenuState {
+                        kind: MenuKind::Pane { pane_id: id },
+                        anchor: (ev.col, ev.row),
+                        highlighted: 0,
+                    });
+                }
+            }
+            MouseKind::Drag => {
+                if let MenuHit::Item(i) = hit {
+                    if let Some(m) = self.menu.as_mut() {
+                        m.highlighted = i;
+                    }
+                }
+            }
+            _ => {}
+        }
+        CommandEffect::default()
     }
 
     /// Auto-close the menu if its anchored pane is gone, or the anchor is
@@ -595,12 +636,45 @@ impl Session {
         }
     }
 
-    /// Apply a mouse event: press hit-tests (focus pane / switch tab / begin
-    /// divider drag), drag adjusts the dragged divider, release ends the drag.
-    /// `drag` is the issuing client's per-connection drag state, recorded as
-    /// `(window index at press, path)` so a drag is applied to the window it
-    /// started in even if the active window changes mid-drag.
-    pub fn handle_mouse(&mut self, ev: MouseEvent, drag: &mut Option<(usize, SplitPath)>) {
+    /// Apply a mouse event.
+    ///
+    /// When `self.menu` is open, all events route to `handle_menu_mouse`.
+    ///
+    /// When `self.menu` is closed, a `Press` with `button == 2` is the
+    /// right-click branch: if `drag.is_some()` it is dropped (mid-drag
+    /// guard); otherwise it hit-tests, and if the hit is `Hit::Pane(_)` the
+    /// menu opens and the pane gains focus. All other right-button hits
+    /// drop silently — they do NOT fall through to `handle_hit`.
+    ///
+    /// Left-button presses, drags, and releases run the existing
+    /// `handle_hit` / `resize_divider` paths unchanged.
+    pub fn handle_mouse(
+        &mut self,
+        ev: MouseEvent,
+        drag: &mut Option<(usize, SplitPath)>,
+    ) -> CommandEffect {
+        use crate::menu::{MenuKind, MenuState};
+
+        if self.menu.is_some() {
+            return self.handle_menu_mouse(ev);
+        }
+        if let MouseKind::Press = ev.kind {
+            if ev.button == 2 {
+                if drag.is_some() {
+                    return CommandEffect::default();
+                }
+                let hit = self.hit(ev.col, ev.row);
+                if let Some(id) = should_open_pane_menu(hit) {
+                    self.focus(id);
+                    self.menu = Some(MenuState {
+                        kind: MenuKind::Pane { pane_id: id },
+                        anchor: (ev.col, ev.row),
+                        highlighted: 0,
+                    });
+                }
+                return CommandEffect::default();
+            }
+        }
         match ev.kind {
             MouseKind::Press => {
                 let hit = self.hit(ev.col, ev.row);
@@ -614,6 +688,7 @@ impl Session {
             }
             MouseKind::Release => *drag = None,
         }
+        CommandEffect::default()
     }
 
     pub(crate) fn hit(&self, col: u16, row: u16) -> layout::Hit {
@@ -963,6 +1038,57 @@ impl Session {
         };
         layout::set_ratio(&mut win.root, path, ratio); // clamps to [0.05, 0.95]
         self.relayout_all();
+    }
+
+    #[cfg(test)]
+    pub fn window_pane_ids(&self, idx: usize) -> Vec<PaneId> {
+        layout::all_panes(&self.windows[idx].root)
+    }
+
+    #[cfg(test)]
+    pub fn focus_for_test(&mut self, id: PaneId) {
+        self.focus(id);
+    }
+
+    #[cfg(test)]
+    pub fn active_window_for_test(&self) -> usize {
+        self.active_window
+    }
+
+    #[cfg(test)]
+    pub fn content_area_for_test(&self) -> layout::Rect {
+        layout::compute_regions(self.viewport(), self.sidebar_visible).content_area
+    }
+
+    #[cfg(test)]
+    pub fn menu_anchor_for_test(&self) -> Option<(u16, u16)> {
+        self.menu.as_ref().map(|m| m.anchor)
+    }
+
+    #[cfg(test)]
+    pub fn menu_pane_for_test(&self) -> Option<PaneId> {
+        self.menu.as_ref().map(|m| match m.kind {
+            crate::menu::MenuKind::Pane { pane_id } => pane_id,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn menu_highlighted_for_test(&self) -> Option<usize> {
+        self.menu.as_ref().map(|m| m.highlighted)
+    }
+}
+
+/// Pure decision function: does the closed-menu right-click branch open
+/// a pane menu for this hit? Returns `Some(pane_id)` only for
+/// `Hit::Pane(_)`; every other hit (Tab, Divider, SidebarEntry, None)
+/// returns `None`. Extracted so the four-variant drop rule is
+/// unit-testable without requiring a real `Hit::SidebarEntry` (which
+/// depends on detected agent state).
+pub fn should_open_pane_menu(hit: layout::Hit) -> Option<layout::PaneId> {
+    if let layout::Hit::Pane(id) = hit {
+        Some(id)
+    } else {
+        None
     }
 }
 
@@ -1352,7 +1478,7 @@ mod tests {
 
         // Click column 1 (left pane = the original `first`). 1-based coords.
         let mut drag: Option<(usize, SplitPath)> = None;
-        session.handle_mouse(
+        let _ = session.handle_mouse(
             MouseEvent {
                 button: 0,
                 col: 1,
@@ -1387,7 +1513,7 @@ mod tests {
         // The root divider sits at the middle column. Press on it, then drag left.
         let mut drag: Option<(usize, SplitPath)> = None;
         // avail = 41 - 1 = 40; ratio 0.5 => first_w 20 => divider at x 20 => col 21.
-        session.handle_mouse(
+        let _ = session.handle_mouse(
             MouseEvent {
                 button: 0,
                 col: 21,
@@ -1403,7 +1529,7 @@ mod tests {
             "press on the root divider records a drag"
         );
         // Drag to column 11 (x 10): first pane should shrink to ~10 cells.
-        session.handle_mouse(
+        let _ = session.handle_mouse(
             MouseEvent {
                 button: 0,
                 col: 11,
@@ -1418,7 +1544,7 @@ mod tests {
             "left pane shrank after dragging the divider left (was 20, now {left_w})"
         );
         // Release clears the drag.
-        session.handle_mouse(
+        let _ = session.handle_mouse(
             MouseEvent {
                 button: 0,
                 col: 11,
@@ -1849,5 +1975,238 @@ mod tests {
         assert!(session.menu_open());
         session.set_menu_for_test(None);
         assert!(!session.menu_open());
+    }
+
+    fn right_press(col: u16, row: u16) -> MouseEvent {
+        MouseEvent { button: 2, col, row, kind: MouseKind::Press }
+    }
+    fn left_press(col: u16, row: u16) -> MouseEvent {
+        MouseEvent { button: 0, col, row, kind: MouseKind::Press }
+    }
+
+    #[tokio::test]
+    async fn right_click_on_pane_opens_menu_and_focuses_that_pane() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let panes = session.window_pane_ids(0);
+        let second = *panes.last().unwrap();
+        let first = panes[0];
+        session.focus_for_test(first);
+        assert_eq!(session.window_focused_ids()[0], first);
+
+        let mut drag: Option<(usize, layout::SplitPath)> = None;
+        let _ = session.handle_mouse(right_press(60, 5), &mut drag);
+
+        assert!(session.menu_open());
+        assert_eq!(session.window_focused_ids()[0], second);
+    }
+
+    #[tokio::test]
+    async fn right_click_on_none_is_noop() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(0, 0), &mut drag);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn right_click_on_tab_does_not_switch_tab_v1() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::NewWindow);
+        assert_eq!(session.active_window_for_test(), 1);
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(5, 10), &mut drag);
+        assert!(!session.menu_open());
+        assert_eq!(session.active_window_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn right_click_during_divider_drag_is_dropped() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let mut drag: Option<(usize, layout::SplitPath)> = Some((0usize, Vec::new()));
+        let _ = session.handle_mouse(right_press(10, 5), &mut drag);
+        assert!(!session.menu_open(), "menu must not open during a drag");
+        assert!(drag.is_some(), "drag state must persist");
+    }
+
+    #[tokio::test]
+    async fn left_click_on_item_dispatches_command_and_closes() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        let first = panes[0];
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: first },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let menu_rect = crate::menu::menu_rect(
+            (10, 5),
+            session.content_area_for_test(),
+            4,
+            18,
+        );
+        let click_col = (menu_rect.x + 5) + 1;
+        let click_row = (menu_rect.y + 1) + 1;
+        let mut drag = None;
+        let _ = session.handle_mouse(left_press(click_col, click_row), &mut drag);
+        assert!(!session.menu_open(), "menu closes on item click");
+        assert_eq!(session.window_pane_ids(0).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn left_click_outside_menu_closes_without_dispatch() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        let first = panes[0];
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: first },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let mut drag = None;
+        let _ = session.handle_mouse(left_press(70, 20), &mut drag);
+        assert!(!session.menu_open());
+        assert_eq!(session.window_pane_ids(0).len(), 1);
+        assert!(drag.is_none());
+    }
+
+    #[tokio::test]
+    async fn right_click_on_divider_does_not_initiate_drag_v1() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(40, 5), &mut drag);
+        assert!(!session.menu_open());
+        assert!(drag.is_none(), "right-click on divider must not start a drag");
+    }
+
+    #[tokio::test]
+    async fn right_click_on_sidebar_entry_does_not_open_menu_v1() {
+        let hit = layout::Hit::SidebarEntry { window_index: 0, pane_id: 99 };
+        assert_eq!(crate::session::should_open_pane_menu(hit), None);
+
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.toggle_sidebar(); // col 75 lands in the sidebar region
+        let pre_focus = session.window_focused_ids();
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(75, 5), &mut drag);
+        assert!(!session.menu_open());
+        assert_eq!(session.window_focused_ids(), pre_focus);
+    }
+
+    #[test]
+    fn should_open_pane_menu_returns_some_for_pane_hit() {
+        let hit = layout::Hit::Pane(7);
+        assert_eq!(crate::session::should_open_pane_menu(hit), Some(7));
+    }
+
+    #[test]
+    fn should_open_pane_menu_returns_none_for_tab_hit() {
+        assert_eq!(crate::session::should_open_pane_menu(layout::Hit::Tab(2)), None);
+    }
+
+    #[test]
+    fn should_open_pane_menu_returns_none_for_divider_hit() {
+        assert_eq!(
+            crate::session::should_open_pane_menu(layout::Hit::Divider(Vec::new())),
+            None
+        );
+    }
+
+    #[test]
+    fn should_open_pane_menu_returns_none_for_none_hit() {
+        assert_eq!(crate::session::should_open_pane_menu(layout::Hit::None), None);
+    }
+
+    #[tokio::test]
+    async fn motion_with_menu_open_updates_highlight_not_divider_drag() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let menu_rect = crate::menu::menu_rect(
+            (10, 5),
+            session.content_area_for_test(),
+            4,
+            18,
+        );
+        let hover_col = (menu_rect.x + 2) + 1;
+        let hover_row = (menu_rect.y + 3) + 1;
+        let mut drag = None;
+        let motion = MouseEvent {
+            button: 3,
+            col: hover_col,
+            row: hover_row,
+            kind: MouseKind::Drag,
+        };
+        let _ = session.handle_mouse(motion, &mut drag);
+        assert_eq!(session.menu_highlighted_for_test(), Some(2));
+        assert!(drag.is_none(), "menu hover must not initiate a divider drag");
+    }
+
+    #[tokio::test]
+    async fn motion_with_menu_closed_routes_to_existing_drag_path() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let mut drag: Option<(usize, layout::SplitPath)> = Some((0, Vec::new()));
+        let motion = MouseEvent {
+            button: 3,
+            col: 50,
+            row: 5,
+            kind: MouseKind::Drag,
+        };
+        let _ = session.handle_mouse(motion, &mut drag);
+        assert!(!session.menu_open(), "Drag while menu closed must not open menu");
+        assert!(drag.is_some(), "Drag tuple must persist — proves event reached existing dispatcher");
+    }
+
+    #[tokio::test]
+    async fn right_click_while_menu_open_close_then_reopens_at_new_anchor() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let panes = session.window_pane_ids(0);
+        let first = panes[0];
+        let second = *panes.last().unwrap();
+
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: first },
+            anchor: (10, 5),
+            highlighted: 2,
+        }));
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(60, 5), &mut drag);
+
+        assert!(session.menu_open());
+        let anchor = session.menu_anchor_for_test();
+        assert_eq!(anchor, Some((60, 5)), "menu must re-anchor at B's click");
+        assert_eq!(session.menu_highlighted_for_test(), Some(0));
+        assert_eq!(session.menu_pane_for_test(), Some(second));
+    }
+
+    #[tokio::test]
+    async fn left_click_on_split_item_returns_effect_with_spawned_pane() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        let first = panes[0];
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: first },
+            anchor: (10, 5),
+            highlighted: 0, // Split Vertically
+        }));
+        let menu_rect = crate::menu::menu_rect(
+            (10, 5),
+            session.content_area_for_test(),
+            4,
+            18,
+        );
+        let click_col = (menu_rect.x + 5) + 1;
+        let click_row = (menu_rect.y + 1) + 1;
+        let mut drag = None;
+        let eff = session.handle_mouse(left_press(click_col, click_row), &mut drag);
+        assert!(!eff.spawned.is_empty(), "Split must produce a spawned-pane effect");
     }
 }

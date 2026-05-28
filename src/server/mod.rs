@@ -446,8 +446,27 @@ fn apply_events(
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
-                if let Some(st) = clients.get_mut(&id) {
-                    session.handle_mouse(m, &mut st.drag);
+                let eff = if let Some(st) = clients.get_mut(&id) {
+                    session.handle_mouse(m, &mut st.drag)
+                } else {
+                    crate::session::CommandEffect::default()
+                };
+                for (pane_id, rx) in eff.spawned {
+                    spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+                }
+                for runtime in eff.closed {
+                    runtime.close();
+                }
+                if eff.detach {
+                    if let Some(st) = remove_client(clients, foreground, session, dirty, id) {
+                        let _ = st.control.send(Control::Detach);
+                        let mut writer = st.writer;
+                        tokio::spawn(async move {
+                            if timeout(TEARDOWN_TIMEOUT, &mut writer).await.is_err() {
+                                writer.abort();
+                            }
+                        });
+                    }
                 }
                 if session.refresh_window_names(crate::procinfo::process_name) {
                     *dirty = true;
