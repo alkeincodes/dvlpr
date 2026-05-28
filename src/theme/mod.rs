@@ -223,7 +223,6 @@ mod tests {
 
     #[test]
     fn latte_palette_spot_check() {
-        use crate::compositor::Color;
         assert_eq!(LATTE.mauve, Color::Rgb(0x88, 0x39, 0xef));
         assert_eq!(LATTE.peach, Color::Rgb(0xfe, 0x64, 0x0b));
         assert_eq!(LATTE.text, Color::Rgb(0x4c, 0x4f, 0x69));
@@ -233,7 +232,6 @@ mod tests {
 
     #[test]
     fn mocha_palette_spot_check() {
-        use crate::compositor::Color;
         assert_eq!(MOCHA.mauve, Color::Rgb(0xcb, 0xa6, 0xf7));
         assert_eq!(MOCHA.peach, Color::Rgb(0xfa, 0xb3, 0x87));
         assert_eq!(MOCHA.crust, Color::Rgb(0x11, 0x11, 0x1b));
@@ -242,7 +240,6 @@ mod tests {
 
     #[test]
     fn frappe_and_macchiato_spot_check() {
-        use crate::compositor::Color;
         assert_eq!(FRAPPE.peach, Color::Rgb(0xef, 0x9f, 0x76));
         assert_eq!(FRAPPE.crust, Color::Rgb(0x23, 0x26, 0x34));
         assert_eq!(MACCHIATO.peach, Color::Rgb(0xf5, 0xa9, 0x7f));
