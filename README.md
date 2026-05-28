@@ -47,6 +47,35 @@ The full quality gate (formatting, lints, tests) is wrapped by `just`:
 just check   # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
 ```
 
+## Line editing inside agent CLIs
+
+The default prefix is `Ctrl-B` (matching tmux's convention), which leaves
+the standard readline line-editing keys free to reach the foreground CLI.
+Inside `claude`, `codex`, `zsh`, or any other readline-style prompt
+running in a dvlpr pane, these all work as plain pane bytes:
+
+| Key | Action |
+|-----|--------|
+| `Ctrl-A` | Beginning of line |
+| `Ctrl-E` | End of line |
+| `Ctrl-U` | Kill to beginning of line |
+| `Ctrl-W` | Kill word backward |
+| `Ctrl-K` | Kill to end of line |
+| `Option-←` / `Option-→` | Move by word (already emitted by Warp/iTerm2/Ghostty) |
+| `Option-Backspace` | Kill word backward |
+
+If you previously used `Ctrl-A` as the dvlpr prefix and want to keep that
+binding, add `prefix = "C-a"` to `~/.config/dvlpr/config.toml`.
+
+### Warp note
+
+Warp does not expose a keybind action that sends arbitrary bytes to the
+foreground process, so the macOS `Cmd+Backspace` / `Cmd+←` / `Cmd+→`
+shortcuts cannot be made to reach `claude`/`codex` while running inside
+dvlpr — use the `Ctrl-`-prefixed equivalents above. A future slice will
+add a copy mode (with `OSC 52` clipboard yank) to address text selection
+from the back buffer.
+
 ## License
 
 dvlpr's own license is not yet decided. The vendored `libghostty-vt` library under
