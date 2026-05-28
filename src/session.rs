@@ -315,11 +315,25 @@ impl Session {
     }
 
     /// Auto-close the menu if its anchored pane is gone, or the anchor is
-    /// outside the current content area. Called at the bottom of every
-    /// menu-affecting mutator. Task 10 fills this in.
-    #[allow(dead_code)]
+    /// Auto-close the menu when the anchored pane is gone, when the
+    /// anchor falls outside the current content area (e.g. after a
+    /// resize or sidebar toggle), or unconditionally for window-switching
+    /// / detach / sidebar-toggle / resize mutators. Called at the bottom
+    /// of every menu-affecting mutator.
     fn reconcile_menu(&mut self) {
-        // stub
+        let Some(menu) = self.menu.as_ref() else { return };
+        let content_area = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let (ax, ay) = (menu.anchor.0.saturating_sub(1), menu.anchor.1.saturating_sub(1));
+        let anchor_inside = content_area.contains(ax, ay);
+        let pane_alive = match menu.kind {
+            crate::menu::MenuKind::Pane { pane_id } => self
+                .windows
+                .get(self.active_window)
+                .is_some_and(|w| layout::all_panes(&w.root).contains(&pane_id)),
+        };
+        if !anchor_inside || !pane_alive {
+            self.menu = None;
+        }
     }
 
     #[cfg(test)]
@@ -414,6 +428,7 @@ impl Session {
         self.cols = cols.max(1);
         self.rows = rows.max(1);
         self.relayout_all();
+        self.reconcile_menu();
     }
 
     /// Number of panes in the active window (0 if there is no active window).
@@ -467,6 +482,7 @@ impl Session {
             }
             Command::NewWindow => {
                 self.unzoom_active(); // leaving the current window
+                self.menu = None;
                 self.new_window(&mut eff)
             }
             Command::NextWindow => {
@@ -474,6 +490,7 @@ impl Session {
                     self.unzoom_active();
                     self.active_window = (self.active_window + 1) % self.windows.len();
                 }
+                self.menu = None;
             }
             Command::PrevWindow => {
                 if !self.windows.is_empty() {
@@ -481,6 +498,7 @@ impl Session {
                     let n = self.windows.len();
                     self.active_window = (self.active_window + n - 1) % n;
                 }
+                self.menu = None;
             }
             Command::SelectWindow(n) => {
                 if n >= 1 {
@@ -490,6 +508,7 @@ impl Session {
                         self.active_window = idx;
                     }
                 }
+                self.menu = None;
             }
             Command::ToggleZoom => {
                 if let Some(win) = self.windows.get_mut(self.active_window) {
@@ -499,9 +518,14 @@ impl Session {
             }
             Command::ToggleSidebar => {
                 self.toggle_sidebar();
+                self.menu = None;
             }
-            Command::Detach => eff.detach = true,
+            Command::Detach => {
+                eff.detach = true;
+                self.menu = None;
+            }
         }
+        self.reconcile_menu();
         eff
     }
 
@@ -637,6 +661,7 @@ impl Session {
             }
         }
         self.relayout_all();
+        self.reconcile_menu();
         removed
     }
 
@@ -812,7 +837,7 @@ impl Session {
     /// Returns whether a divider drag should be initiated for this hit
     /// — Some(SplitPath) for a Divider hit, None otherwise.
     pub(crate) fn handle_hit(&mut self, hit: layout::Hit) -> Option<layout::SplitPath> {
-        match hit {
+        let out = match hit {
             layout::Hit::Pane(id) => {
                 self.focus(id);
                 None
@@ -849,7 +874,9 @@ impl Session {
                 None
             }
             layout::Hit::None => None,
-        }
+        };
+        self.reconcile_menu();
+        out
     }
 
     #[cfg(test)]
@@ -2394,5 +2421,150 @@ mod tests {
             kind: MouseKind::Press,
         });
         assert!(session.try_consume_menu_event(&mouse).is_none());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_when_anchored_pane_closes_via_command() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let panes = session.window_pane_ids(0);
+        let first = panes[0];
+        let second = *panes.last().unwrap();
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: second },
+            anchor: (60, 5),
+            highlighted: 0,
+        }));
+        session.focus_for_test(second);
+        let _ = session.apply_command(Command::ClosePane);
+        assert!(!session.menu_open());
+        let _ = first;
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_when_anchored_pane_exits_naturally() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let panes = session.window_pane_ids(0);
+        let second = *panes.last().unwrap();
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: second },
+            anchor: (60, 5),
+            highlighted: 0,
+        }));
+        let _ = session.pane_exited(second);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_select_window() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.apply_command(Command::NewWindow);
+        session.apply_command(Command::SelectWindow(0));
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let _ = session.apply_command(Command::SelectWindow(1));
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_next_window() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.apply_command(Command::NewWindow);
+        session.apply_command(Command::SelectWindow(0));
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let _ = session.apply_command(Command::NextWindow);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_toggle_sidebar() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let _ = session.apply_command(Command::ToggleSidebar);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_resize_when_anchor_falls_outside_new_content_area() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (70, 20),
+            highlighted: 0,
+        }));
+        session.resize(40, 10);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_survives_resize_when_anchor_still_inside_new_content_area() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        session.resize(80, 30);
+        assert!(session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_detach() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let _ = session.apply_command(Command::Detach);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_auto_closes_on_prev_window() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.apply_command(Command::NewWindow);
+        session.apply_command(Command::SelectWindow(0));
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let _ = session.apply_command(Command::PrevWindow);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn menu_does_not_auto_close_on_focus_change_within_window() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::SplitVertical);
+        let panes = session.window_pane_ids(0);
+        session.focus_for_test(panes[1]);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        session.focus_for_test(panes[1]);
+        assert!(session.menu_open());
     }
 }
