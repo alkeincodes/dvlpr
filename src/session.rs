@@ -36,6 +36,7 @@ pub struct Session {
     active_window: usize,
     panes: HashMap<PaneId, Pane>,
     compositor: Compositor,
+    theme: crate::theme::Theme,
     next_pane_id: PaneId,
     cols: u16,
     rows: u16,
@@ -78,6 +79,7 @@ impl Session {
         cwd: String,
         cols: u16,
         rows: u16,
+        theme: crate::theme::Theme,
     ) -> io::Result<(Self, PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         // Clamp to at least 1x1 (matches GhosttyScreen/PaneRuntime resize behavior).
         let cols = cols.max(1);
@@ -88,6 +90,7 @@ impl Session {
             active_window: 0,
             panes: HashMap::new(),
             compositor: Compositor::new(),
+            theme,
             next_pane_id: 1,
             cols,
             rows,
@@ -198,6 +201,7 @@ impl Session {
             self.active_window,
             win.focused,
             win.zoomed,
+            &self.theme,
             &refs,
         )
     }
@@ -661,6 +665,7 @@ mod tests {
             ".".into(),
             40,
             10,
+            crate::theme::Theme::default(),
         )
         .expect("session");
 
@@ -696,6 +701,7 @@ mod tests {
             ".".into(),
             40,
             10,
+            crate::theme::Theme::default(),
         )
         .expect("session");
 
@@ -723,6 +729,7 @@ mod tests {
             ".".into(),
             40,
             10,
+            crate::theme::Theme::default(),
         )
         .expect("session");
 
@@ -757,6 +764,7 @@ mod tests {
             ".".into(),
             40,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
 
@@ -783,6 +791,7 @@ mod tests {
             ".".into(),
             40,
             3,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         let eff = session.apply_command(Command::SplitHorizontal);
@@ -804,6 +813,7 @@ mod tests {
             ".".into(),
             40,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         let eff = session.apply_command(Command::NewWindow);
@@ -826,6 +836,7 @@ mod tests {
             ".".into(),
             40,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -849,6 +860,7 @@ mod tests {
             ".".into(),
             40,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         let eff = session.apply_command(Command::Detach);
@@ -867,6 +879,7 @@ mod tests {
             ".".into(),
             40,
             24,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         // Two horizontal splits => three panes in one window; newest pane is focused.
@@ -899,6 +912,7 @@ mod tests {
             ".".into(),
             41,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         // Vertical split: left = first (focused after split is the NEW right pane).
@@ -936,6 +950,7 @@ mod tests {
             ".".into(),
             41,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -991,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn compose_returns_grid_matching_viewport_dims() {
         let (session, _id, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8, crate::theme::Theme::default()).unwrap();
         let grid = session.compose();
         assert_eq!(grid.dims(), (30, 8));
         assert_eq!(grid.cells.len(), 30 * 8);
@@ -1002,7 +1017,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_window_names_updates_only_on_change() {
         let (mut session, _id, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 30, 8, crate::theme::Theme::default()).unwrap();
         // First resolve to "claude": name changes -> true.
         assert!(session.refresh_window_names(|_pid| Some("claude".to_string())));
         // Same value again: no change -> false.
@@ -1014,7 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn zoom_shows_only_focused_pane_then_restores() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::SplitVertical); // now two panes
         assert_eq!(session.active_pane_rects().len(), 2);
 
@@ -1041,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn split_auto_unzooms() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::SplitVertical);
         session.apply_command(Command::ToggleZoom);
         assert_eq!(session.active_pane_rects().len(), 1); // zoomed
@@ -1052,7 +1067,7 @@ mod tests {
     #[tokio::test]
     async fn focused_pane_exit_in_active_window_auto_unzooms() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::SplitVertical); // two panes in the active window
         session.apply_command(Command::ToggleZoom);
         assert!(session.active_zoomed_for_test());
@@ -1066,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn background_window_pane_exit_does_not_unzoom_active() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         // Window 1 (index 0) gets a second pane; remember one of its pane ids.
         session.apply_command(Command::SplitVertical);
         let bg_pane = session.focused_pane();
@@ -1082,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn window_switch_auto_unzooms() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::SplitVertical);
         session.apply_command(Command::ToggleZoom);
         assert_eq!(session.active_pane_rects().len(), 1);
@@ -1095,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn hit_while_zoomed_resolves_body_to_focused_pane() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::SplitVertical);
         session.apply_command(Command::ToggleZoom);
         // A click in the right half of the body (where the sibling used to be)
@@ -1107,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn hit_while_zoomed_still_switches_windows_via_tab_click() {
         let (mut session, _first, _rx) =
-            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12).unwrap();
+            Session::new("test".into(), vec!["cat".into()], ".".into(), 40, 12, crate::theme::Theme::default()).unwrap();
         session.apply_command(Command::NewWindow); // 2 windows -> tab bar has tabs
         session.apply_command(Command::SplitVertical); // window 2 now has 2 panes
         session.apply_command(Command::ToggleZoom); // zoom window 2
@@ -1141,6 +1156,7 @@ mod tests {
             ".".into(),
             40,
             12,
+            crate::theme::Theme::default(),
         )
         .expect("session");
         session.apply_command(Command::NewWindow); // window 1

@@ -139,16 +139,18 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
 
     // The session owns all windows/panes and the compositor; start with one pane.
+    let runtime_cfg: Config = config.keymap.unwrap_or_else(Config::load);
     let (mut session, first_pane, first_rx) = Session::new(
         config.session.clone(),
         config.command.clone(),
         config.cwd.clone(),
         80,
         24,
+        runtime_cfg.theme,
     )?;
     spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
-    let keymap = config.keymap.unwrap_or_else(Config::load);
+    let keymap = runtime_cfg;
 
     // Accept connections.
     {

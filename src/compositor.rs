@@ -125,6 +125,7 @@ impl Compositor {
         active_window: usize,
         focused: PaneId,
         zoomed: bool,
+        theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Grid {
         debug_assert!(
@@ -155,14 +156,14 @@ impl Compositor {
         if !zoomed {
             for d in layout::dividers(root, content) {
                 let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
-                draw_divider(&mut buf, cols, &d, heavy);
+                draw_divider(&mut buf, cols, &d, heavy, theme);
             }
         }
 
         // Status/tab bar (always present): session prefix at the left, then tabs.
         if let Some(ty) = layout::tab_row(viewport, window_count) {
             let regions = layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
-            draw_tabs(&mut buf, cols, ty, session_name, &regions);
+            draw_tabs(&mut buf, cols, ty, session_name, &regions, active_window, theme);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -197,6 +198,7 @@ impl Compositor {
         active_window: usize,
         focused: PaneId,
         zoomed: bool,
+        theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
     ) -> Vec<u8> {
         serialize_full(&self.compose(
@@ -207,6 +209,7 @@ impl Compositor {
             active_window,
             focused,
             zoomed,
+            theme,
             panes,
         ))
     }
@@ -419,7 +422,7 @@ fn blit_pane(buf: &mut [StyledCell], cols: u16, rect: Rect, pane: &dyn PaneCells
 /// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
 /// focused pane). Junctions where dividers cross are simple last-write-wins
 /// overwrites (proper `┼` junctions are deferred polish).
-fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool) {
+fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool, _theme: &crate::theme::Theme) {
     let glyph = match (d.dir, heavy) {
         (SplitDir::Vertical, false) => '│',
         (SplitDir::Vertical, true) => '┃',
@@ -468,6 +471,8 @@ fn draw_tabs(
     ty: u16,
     session_name: &str,
     regions: &[layout::TabRegion],
+    _active_window: usize,
+    _theme: &crate::theme::Theme,
 ) {
     for (x, ch) in session_name.chars().enumerate() {
         if x >= cols as usize {
@@ -602,10 +607,10 @@ mod tests {
             dir: SplitDir::Vertical,
         };
         let at = |r: usize, c: usize| r * cols as usize + c;
-        draw_divider(&mut buf, cols, &d, false);
+        draw_divider(&mut buf, cols, &d, false, &crate::theme::Theme::default());
         assert_eq!(buf[at(0, 2)].ch, '│');
         assert_eq!(buf[at(1, 2)].ch, '│');
-        draw_divider(&mut buf, cols, &d, true);
+        draw_divider(&mut buf, cols, &d, true, &crate::theme::Theme::default());
         assert_eq!(buf[at(0, 2)].ch, '┃'); // heavy
     }
 
@@ -651,7 +656,7 @@ mod tests {
         let mut buf = vec![StyledCell::default(); 20 * 2];
         let regions = layout::tab_layout("s", &["a".to_string(), "b".to_string()], 0, false, cols);
         // Tab row is the last row (y = 1).
-        draw_tabs(&mut buf, cols, 1, "s", &regions);
+        draw_tabs(&mut buf, cols, 1, "s", &regions, 0, &crate::theme::Theme::default());
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
         let row: String = (0..cols)
             .map(|x| buf[cols as usize + x as usize].ch)
@@ -685,6 +690,7 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &pane)],
         );
         let s = String::from_utf8(out).unwrap();
@@ -722,6 +728,7 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &left), (2, &right)],
         );
         let s = String::from_utf8(out).unwrap();
@@ -742,7 +749,7 @@ mod tests {
         };
         // Two windows -> the bottom row has session prefix + tab labels.
         let names = vec!["one".to_string(), "two".to_string()];
-        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &[(1, &pane)]);
+        let out = c.render(vp, &tree, "s", &names, 1, 1, false, &crate::theme::Theme::default(), &[(1, &pane)]);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("1:one")); // inactive window 0 (1-based, no marker)
         assert!(s.contains("2:two*")); // active window 1 marked with '*'
@@ -756,6 +763,7 @@ mod tests {
             0,
             1,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &pane)],
         );
         let s2 = String::from_utf8(single).unwrap();
@@ -840,6 +848,7 @@ mod tests {
             0,
             2,
             false,
+            &crate::theme::Theme::default(),
             &[(1, &top), (2, &bottom)],
         );
         let s = String::from_utf8(out).unwrap();
