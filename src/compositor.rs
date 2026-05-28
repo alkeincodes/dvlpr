@@ -592,6 +592,29 @@ mod tests {
         s.chars().map(sc).collect()
     }
 
+    /// Strip all ANSI/CSI escape sequences from `s`, leaving only printable
+    /// characters. Used in tests that assert structural content of rendered
+    /// frames without being coupled to exact SGR byte sequences.
+    fn strip_sgr(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // CSI sequence: skip until we hit a byte in 0x40–0x7E (the final byte).
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7E).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1; // consume final byte
+            } else {
+                out.push(s[i..].chars().next().unwrap());
+                i += s[i..].chars().next().unwrap().len_utf8();
+            }
+        }
+        out
+    }
+
     #[test]
     fn compositor_constructs() {
         let _c = Compositor::new();
@@ -710,9 +733,12 @@ mod tests {
             assert_eq!(buf[x].style.bg, theme.session_bg, "session bg at x={x}");
             assert_eq!(buf[x].style.fg, theme.session_fg, "session fg at x={x}");
         }
-        // Two-space gap (x=4..=5) retains bar_bg from the row-fill step.
+        // Two-space gap (x=4..=5) retains bar_bg and inactive_tab_fg from
+        // the row-fill step (fg is set so future overlay characters in gap
+        // cells have a sensible color rather than the terminal default).
         for x in 4..6 {
             assert_eq!(buf[x].style.bg, theme.bar_bg, "gap bg at x={x}");
+            assert_eq!(buf[x].style.fg, theme.inactive_tab_fg, "gap fg at x={x}");
         }
         // Active tab (window 1, "2:vim*") starts at the second region's x_start.
         let active_region = &regions[1];
@@ -736,6 +762,7 @@ mod tests {
         for x in (last + 1)..cols {
             let i = x as usize;
             assert_eq!(buf[i].style.bg, theme.bar_bg, "right-edge fill at x={x}");
+            assert_eq!(buf[i].style.fg, theme.inactive_tab_fg, "right-edge fg at x={x}");
         }
     }
 
@@ -788,7 +815,8 @@ mod tests {
         // palette tweaks don't churn this test.
         assert!(s.starts_with("\x1b[2J\x1b[H\x1b[0m"), "frame must start with clear+home+reset, got: {s:?}");
         assert!(s.contains("ab "), "frame must contain the pane row content");
-        assert!(s.contains("s"), "frame must contain the session prefix");
+        let plain = strip_sgr(&s);
+        assert!(plain.contains("s  "), "frame must contain the session prefix + two-space gap, plain={plain:?}");
         assert!(s.ends_with("\x1b[1;2H"), "frame must end with the cursor CUP");
     }
 
