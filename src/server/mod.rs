@@ -37,9 +37,9 @@ pub struct FrameSnapshot {
 /// orchestration shell and the edge logic is unit-testable in isolation.
 fn one_oh_three_edge_prefix(last: bool, next: bool) -> &'static [u8] {
     match (last, next) {
-        (false, true)  => b"\x1b[?1003h",
-        (true,  false) => b"\x1b[?1003l",
-        _              => b"",
+        (false, true) => b"\x1b[?1003h",
+        (true, false) => b"\x1b[?1003l",
+        _ => b"",
     }
 }
 
@@ -597,7 +597,10 @@ fn spawn_writer(
         first_data.extend_from_slice(&first_body);
         if write_msg(
             &mut write_half,
-            &ServerMsg::Frame { data: first_data, full: true },
+            &ServerMsg::Frame {
+                data: first_data,
+                full: true,
+            },
         )
         .await
         .is_err()
@@ -822,10 +825,16 @@ mod tests {
             cells: vec![],
             cursor: (0, 0),
         };
-        let s = FrameSnapshot { grid: g.clone(), menu_open: false };
-        assert_eq!(s.menu_open, false);
-        let s2 = FrameSnapshot { grid: g, menu_open: true };
-        assert_eq!(s2.menu_open, true);
+        let s = FrameSnapshot {
+            grid: g.clone(),
+            menu_open: false,
+        };
+        assert!(!s.menu_open);
+        let s2 = FrameSnapshot {
+            grid: g,
+            menu_open: true,
+        };
+        assert!(s2.menu_open);
     }
 
     #[test]

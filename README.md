@@ -128,6 +128,14 @@ keybind = cmd+right=text:\x05
 Ghostty also implements `modifyOtherKeys` natively (Warp does not), so
 the `bindkey` lines above are not strictly needed in a Ghostty session.
 
+## Mouse
+
+- **Left-click** a pane to focus it. Drag a divider between panes to resize.
+- **Right-click** a pane to open the context menu: **Split Vertically**,
+  **Split Horizontally**, **Zoom** (toggle), **Exit** (close this pane).
+  Navigate with `↑` / `↓` (or hover); confirm with `Enter` or a left-click;
+  dismiss with `Esc` or by clicking outside the menu.
+
 ## License
 
 dvlpr's own license is not yet decided. The vendored `libghostty-vt` library under

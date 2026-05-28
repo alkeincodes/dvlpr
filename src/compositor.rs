@@ -187,7 +187,14 @@ impl Compositor {
         // sidebar in its footprint. The rect is clipped to content_area
         // inside draw_menu so the bar/sidebar are never overwritten.
         if let Some(m) = menu {
-            draw_menu(&mut buf, cols, m, crate::menu::PANE_MENU_ITEMS, theme, content);
+            draw_menu(
+                &mut buf,
+                cols,
+                m,
+                crate::menu::PANE_MENU_ITEMS,
+                theme,
+                content,
+            );
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -532,7 +539,10 @@ fn draw_tabs(
         for x in 0..cols as usize {
             let idx = ty as usize * cols as usize + x;
             if idx < buf.len() {
-                buf[idx] = StyledCell { ch: ' ', style: bar_style };
+                buf[idx] = StyledCell {
+                    ch: ' ',
+                    style: bar_style,
+                };
             }
         }
     }
@@ -549,7 +559,10 @@ fn draw_tabs(
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch, style: session_style };
+            buf[idx] = StyledCell {
+                ch,
+                style: session_style,
+            };
         }
     }
 
@@ -764,8 +777,7 @@ pub fn draw_menu(
             .y
             .saturating_add(content_area.h.saturating_sub(1));
         if ay.saturating_add(h.saturating_sub(1)) > bottom {
-            ay.saturating_sub(h.saturating_sub(1))
-                .max(content_area.y)
+            ay.saturating_sub(h.saturating_sub(1)).max(content_area.y)
         } else {
             ay
         }
@@ -837,12 +849,18 @@ pub fn draw_menu(
                 let item = items.get(i);
                 let highlighted = i == menu.highlighted;
                 let (fg, bg, bold) = if highlighted {
-                    (theme.menu_highlight_fg, theme.menu_highlight_bg, theme.menu_highlight_bold)
+                    (
+                        theme.menu_highlight_fg,
+                        theme.menu_highlight_bg,
+                        theme.menu_highlight_bold,
+                    )
                 } else {
                     (theme.menu_label_fg, theme.menu_bg, false)
                 };
                 let col_in_interior = x - natural_tlx - 1;
-                let chars: Vec<char> = item.map(|it| it.label.chars().collect()).unwrap_or_default();
+                let chars: Vec<char> = item
+                    .map(|it| it.label.chars().collect())
+                    .unwrap_or_default();
                 let ch = if col_in_interior == 0 {
                     ' '
                 } else if (col_in_interior as usize - 1) < chars.len() {
@@ -852,7 +870,12 @@ pub fn draw_menu(
                 };
                 StyledCell {
                     ch,
-                    style: CellStyle { fg, bg, bold, ..Default::default() },
+                    style: CellStyle {
+                        fg,
+                        bg,
+                        bold,
+                        ..Default::default()
+                    },
                 }
             };
 
@@ -1097,15 +1120,15 @@ mod tests {
         let cols: u16 = 30;
         let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
-            bar_bg:          Color::Default,
-            session_bg:      Color::Default,
-            session_fg:      Color::Rgb(2, 2, 2),
-            active_tab_fg:   Color::Rgb(4, 4, 4),
-            active_tab_bg:   Color::Rgb(5, 5, 5),
+            bar_bg: Color::Default,
+            session_bg: Color::Default,
+            session_fg: Color::Rgb(2, 2, 2),
+            active_tab_fg: Color::Rgb(4, 4, 4),
+            active_tab_bg: Color::Rgb(5, 5, 5),
             active_tab_bold: true,
             inactive_tab_bg: Color::Default,
             inactive_tab_fg: Color::Rgb(6, 6, 6),
-            agent_idle_fg:    Color::Rgb(7, 7, 7),
+            agent_idle_fg: Color::Rgb(7, 7, 7),
             agent_working_fg: Color::Rgb(8, 8, 8),
             agent_blocked_fg: Color::Rgb(9, 9, 9),
             menu_bg: Color::Default,
@@ -1145,7 +1168,11 @@ mod tests {
         // Inter-tab gaps and bar row beyond the last tab: cells stay default.
         let last = regions.last().unwrap().x_end;
         for x in (last + 1)..cols {
-            assert_eq!(buf[x as usize], StyledCell::default(), "gap/right tail at x={x}");
+            assert_eq!(
+                buf[x as usize],
+                StyledCell::default(),
+                "gap/right tail at x={x}"
+            );
         }
     }
 
@@ -1642,7 +1669,11 @@ mod tests {
         assert_eq!(buf[2], StyledCell::default(), "prefix gap stays default");
         // Cells far past the last tab also stay default.
         for x in (cols - 3)..cols {
-            assert_eq!(buf[x as usize], StyledCell::default(), "right tail at x={x}");
+            assert_eq!(
+                buf[x as usize],
+                StyledCell::default(),
+                "right tail at x={x}"
+            );
         }
     }
 
@@ -1651,7 +1682,7 @@ mod tests {
         let cols: u16 = 20;
         let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
-            bar_bg:     Color::Default,
+            bar_bg: Color::Default,
             session_bg: Color::Default,
             session_fg: Color::Rgb(11, 22, 33),
             ..crate::theme::Theme::default()
@@ -1694,7 +1725,11 @@ mod tests {
         // The cell at inactive.x_end + 1 (if within bounds) must stay default.
         if (inactive.x_end + 1) < cols {
             let gap_x = (inactive.x_end + 1) as usize;
-            assert_eq!(buf[gap_x], StyledCell::default(), "trailing gap stays default");
+            assert_eq!(
+                buf[gap_x],
+                StyledCell::default(),
+                "trailing gap stays default"
+            );
         }
     }
 
@@ -1719,7 +1754,8 @@ mod tests {
 
         for x in 9..cols {
             assert_eq!(
-                buf[x as usize], StyledCell::default(),
+                buf[x as usize],
+                StyledCell::default(),
                 "x={x} is past x_end and must be untouched"
             );
         }
@@ -1769,14 +1805,26 @@ mod tests {
         // fill or session-prefix bg paint, this test fails immediately.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default(); // OneDark — transparent bgs
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names: Vec<String> = vec![];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 0, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            0,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         assert_eq!(
@@ -1797,14 +1845,26 @@ mod tests {
         // dropped active bg would push it to 0. Both fail this assertion.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default();
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names = vec!["zsh".to_string(), "vim".to_string()];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 1, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            1,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         assert_eq!(
@@ -1827,14 +1887,26 @@ mod tests {
         // skip the reset and this test would fail.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default();
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names = vec!["zsh".to_string(), "vim".to_string()];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 1, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            1,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         let inactive_pos = text.find("1:zsh").expect("inactive label in output");
@@ -1864,8 +1936,8 @@ mod tests {
         );
     }
 
-    use crate::menu::{menu_rect, MenuKind, MenuState, PANE_MENU_ITEMS};
     use crate::layout::Rect;
+    use crate::menu::{menu_rect, MenuKind, MenuState, PANE_MENU_ITEMS};
 
     fn fresh_buf(cols: u16, rows: u16) -> Vec<StyledCell> {
         vec![StyledCell::default(); cols as usize * rows as usize]
@@ -1877,14 +1949,15 @@ mod tests {
     }
 
     fn menu_theme() -> crate::theme::Theme {
-        let mut t = crate::theme::Theme::default();
-        t.menu_bg = Color::Rgb(10, 10, 10);
-        t.menu_border_fg = Color::Rgb(20, 20, 20);
-        t.menu_label_fg = Color::Rgb(30, 30, 30);
-        t.menu_highlight_bg = Color::Rgb(40, 40, 40);
-        t.menu_highlight_fg = Color::Rgb(50, 50, 50);
-        t.menu_highlight_bold = true;
-        t
+        crate::theme::Theme {
+            menu_bg: Color::Rgb(10, 10, 10),
+            menu_border_fg: Color::Rgb(20, 20, 20),
+            menu_label_fg: Color::Rgb(30, 30, 30),
+            menu_highlight_bg: Color::Rgb(40, 40, 40),
+            menu_highlight_fg: Color::Rgb(50, 50, 50),
+            menu_highlight_bold: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1897,7 +1970,12 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
@@ -1928,7 +2006,12 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
@@ -1942,7 +2025,8 @@ mod tests {
         let label = "Split Vertically";
         for (i, c) in label.chars().enumerate() {
             assert_eq!(
-                buf[pos(rect.x + 2 + i as u16, row_y)].ch, c,
+                buf[pos(rect.x + 2 + i as u16, row_y)].ch,
+                c,
                 "label char {i} mismatch at row 0"
             );
         }
@@ -1962,7 +2046,12 @@ mod tests {
             anchor: (10, 5),
             highlighted: 1,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
@@ -1994,7 +2083,12 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
@@ -2037,7 +2131,12 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
@@ -2061,7 +2160,12 @@ mod tests {
             anchor: (1, 1),
             highlighted: 0,
         };
-        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = menu_theme();
         let items = PANE_MENU_ITEMS;
         let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;

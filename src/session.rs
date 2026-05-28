@@ -230,9 +230,7 @@ impl Session {
         ev: &crate::input::InputEvent,
     ) -> Option<crate::session::CommandEffect> {
         use crate::input::InputEvent;
-        if self.menu.is_none() {
-            return None;
-        }
+        self.menu.as_ref()?;
         match ev {
             InputEvent::Mouse(_) | InputEvent::FocusIn => None,
             InputEvent::Command(_) => Some(CommandEffect::default()),
@@ -272,9 +270,15 @@ impl Session {
         use crate::input::MouseKind;
         use crate::menu::{menu_hit, MenuHit, MenuKind, MenuState};
 
-        let Some(menu) = self.menu.clone() else { return CommandEffect::default() };
+        let Some(menu) = self.menu.clone() else {
+            return CommandEffect::default();
+        };
         let items = menu.items();
-        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0) as u16;
+        let label_w = items
+            .iter()
+            .map(|i| i.label.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
         let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
         let hit = menu_hit(&menu, items.len(), label_w, content, ev.col, ev.row);
 
@@ -321,9 +325,15 @@ impl Session {
     /// / detach / sidebar-toggle / resize mutators. Called at the bottom
     /// of every menu-affecting mutator.
     fn reconcile_menu(&mut self) {
-        let Some(menu) = self.menu.as_ref() else { return };
-        let content_area = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
-        let (ax, ay) = (menu.anchor.0.saturating_sub(1), menu.anchor.1.saturating_sub(1));
+        let Some(menu) = self.menu.as_ref() else {
+            return;
+        };
+        let content_area =
+            layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let (ax, ay) = (
+            menu.anchor.0.saturating_sub(1),
+            menu.anchor.1.saturating_sub(1),
+        );
         let anchor_inside = content_area.contains(ax, ay);
         let pane_alive = match menu.kind {
             crate::menu::MenuKind::Pane { pane_id } => self
@@ -2031,7 +2041,7 @@ mod tests {
     #[tokio::test]
     async fn session_menu_starts_as_none() {
         let (session, _pane_id, _rx) = build_session_with_one_pane().await;
-        assert_eq!(session.menu_open(), false);
+        assert!(!session.menu_open());
     }
 
     #[tokio::test]
@@ -2048,10 +2058,20 @@ mod tests {
     }
 
     fn right_press(col: u16, row: u16) -> MouseEvent {
-        MouseEvent { button: 2, col, row, kind: MouseKind::Press }
+        MouseEvent {
+            button: 2,
+            col,
+            row,
+            kind: MouseKind::Press,
+        }
     }
     fn left_press(col: u16, row: u16) -> MouseEvent {
-        MouseEvent { button: 0, col, row, kind: MouseKind::Press }
+        MouseEvent {
+            button: 0,
+            col,
+            row,
+            kind: MouseKind::Press,
+        }
     }
 
     #[tokio::test]
@@ -2110,12 +2130,7 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         }));
-        let menu_rect = crate::menu::menu_rect(
-            (10, 5),
-            session.content_area_for_test(),
-            4,
-            18,
-        );
+        let menu_rect = crate::menu::menu_rect((10, 5), session.content_area_for_test(), 4, 18);
         let click_col = (menu_rect.x + 5) + 1;
         let click_row = (menu_rect.y + 1) + 1;
         let mut drag = None;
@@ -2148,12 +2163,18 @@ mod tests {
         let mut drag = None;
         let _ = session.handle_mouse(right_press(40, 5), &mut drag);
         assert!(!session.menu_open());
-        assert!(drag.is_none(), "right-click on divider must not start a drag");
+        assert!(
+            drag.is_none(),
+            "right-click on divider must not start a drag"
+        );
     }
 
     #[tokio::test]
     async fn right_click_on_sidebar_entry_does_not_open_menu_v1() {
-        let hit = layout::Hit::SidebarEntry { window_index: 0, pane_id: 99 };
+        let hit = layout::Hit::SidebarEntry {
+            window_index: 0,
+            pane_id: 99,
+        };
         assert_eq!(crate::session::should_open_pane_menu(hit), None);
 
         let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
@@ -2173,7 +2194,10 @@ mod tests {
 
     #[test]
     fn should_open_pane_menu_returns_none_for_tab_hit() {
-        assert_eq!(crate::session::should_open_pane_menu(layout::Hit::Tab(2)), None);
+        assert_eq!(
+            crate::session::should_open_pane_menu(layout::Hit::Tab(2)),
+            None
+        );
     }
 
     #[test]
@@ -2186,7 +2210,10 @@ mod tests {
 
     #[test]
     fn should_open_pane_menu_returns_none_for_none_hit() {
-        assert_eq!(crate::session::should_open_pane_menu(layout::Hit::None), None);
+        assert_eq!(
+            crate::session::should_open_pane_menu(layout::Hit::None),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2198,12 +2225,7 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         }));
-        let menu_rect = crate::menu::menu_rect(
-            (10, 5),
-            session.content_area_for_test(),
-            4,
-            18,
-        );
+        let menu_rect = crate::menu::menu_rect((10, 5), session.content_area_for_test(), 4, 18);
         let hover_col = (menu_rect.x + 2) + 1;
         let hover_row = (menu_rect.y + 3) + 1;
         let mut drag = None;
@@ -2215,7 +2237,10 @@ mod tests {
         };
         let _ = session.handle_mouse(motion, &mut drag);
         assert_eq!(session.menu_highlighted_for_test(), Some(2));
-        assert!(drag.is_none(), "menu hover must not initiate a divider drag");
+        assert!(
+            drag.is_none(),
+            "menu hover must not initiate a divider drag"
+        );
     }
 
     #[tokio::test]
@@ -2230,8 +2255,14 @@ mod tests {
             kind: MouseKind::Drag,
         };
         let _ = session.handle_mouse(motion, &mut drag);
-        assert!(!session.menu_open(), "Drag while menu closed must not open menu");
-        assert!(drag.is_some(), "Drag tuple must persist — proves event reached existing dispatcher");
+        assert!(
+            !session.menu_open(),
+            "Drag while menu closed must not open menu"
+        );
+        assert!(
+            drag.is_some(),
+            "Drag tuple must persist — proves event reached existing dispatcher"
+        );
     }
 
     #[tokio::test]
@@ -2267,17 +2298,15 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0, // Split Vertically
         }));
-        let menu_rect = crate::menu::menu_rect(
-            (10, 5),
-            session.content_area_for_test(),
-            4,
-            18,
-        );
+        let menu_rect = crate::menu::menu_rect((10, 5), session.content_area_for_test(), 4, 18);
         let click_col = (menu_rect.x + 5) + 1;
         let click_row = (menu_rect.y + 1) + 1;
         let mut drag = None;
         let eff = session.handle_mouse(left_press(click_col, click_row), &mut drag);
-        assert!(!eff.spawned.is_empty(), "Split must produce a spawned-pane effect");
+        assert!(
+            !eff.spawned.is_empty(),
+            "Split must produce a spawned-pane effect"
+        );
     }
 
     use crate::input::InputEvent;
@@ -2289,8 +2318,12 @@ mod tests {
     #[tokio::test]
     async fn try_consume_returns_false_when_menu_closed() {
         let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
-        assert!(session.try_consume_menu_event(&pane_event(b"\x1b")).is_none());
-        assert!(session.try_consume_menu_event(&InputEvent::FocusIn).is_none());
+        assert!(session
+            .try_consume_menu_event(&pane_event(b"\x1b"))
+            .is_none());
+        assert!(session
+            .try_consume_menu_event(&InputEvent::FocusIn)
+            .is_none());
     }
 
     #[tokio::test]
@@ -2316,7 +2349,9 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         }));
-        assert!(session.try_consume_menu_event(&pane_event(b"\x1b[B")).is_some());
+        assert!(session
+            .try_consume_menu_event(&pane_event(b"\x1b[B"))
+            .is_some());
         assert!(session.menu_open());
         assert_eq!(session.menu_highlighted_for_test(), Some(1));
     }
@@ -2330,7 +2365,9 @@ mod tests {
             anchor: (10, 5),
             highlighted: 2,
         }));
-        assert!(session.try_consume_menu_event(&pane_event(b"\x1b[A")).is_some());
+        assert!(session
+            .try_consume_menu_event(&pane_event(b"\x1b[A"))
+            .is_some());
         assert_eq!(session.menu_highlighted_for_test(), Some(1));
     }
 
@@ -2402,7 +2439,9 @@ mod tests {
             anchor: (10, 5),
             highlighted: 0,
         }));
-        assert!(session.try_consume_menu_event(&InputEvent::FocusIn).is_none());
+        assert!(session
+            .try_consume_menu_event(&InputEvent::FocusIn)
+            .is_none());
     }
 
     #[tokio::test]

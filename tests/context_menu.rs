@@ -64,7 +64,9 @@ async fn handshake(path: &std::path::Path, cols: u16, rows: u16) -> (Reader, Wri
 }
 
 async fn send_input(w: &mut Writer, bytes: &[u8]) {
-    write_msg(w, &ClientMsg::Input(bytes.to_vec())).await.unwrap();
+    write_msg(w, &ClientMsg::Input(bytes.to_vec()))
+        .await
+        .unwrap();
 }
 
 async fn collect_frames(r: &mut Reader, secs: u64) -> Vec<Vec<u8>> {
@@ -76,7 +78,6 @@ async fn collect_frames(r: &mut Reader, secs: u64) -> Vec<Vec<u8>> {
         match msg {
             ServerMsg::Frame { data, .. } => out.push(data),
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
-            _ => {}
         }
     }
     out
@@ -101,7 +102,6 @@ async fn until_frame_contains(r: &mut Reader, secs: u64, needle: &[u8]) -> bool 
                 }
             }
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
-            _ => {}
         }
     }
     false
@@ -113,18 +113,23 @@ async fn right_click_from_one_client_makes_menu_visible_on_all_clients() {
     spawn_daemon(path.clone());
     wait_for_socket(&path).await;
     let (mut ar, mut aw) = handshake(&path, 80, 24).await;
-    let (mut br, mut bw) = handshake(&path, 80, 24).await;
+    let (mut br, _bw) = handshake(&path, 80, 24).await;
     let _ = collect_frames(&mut ar, 1).await;
     let _ = collect_frames(&mut br, 1).await;
-    let _ = bw;
 
     send_input(&mut aw, b"\x1b[<2;10;5M").await;
 
     let frames_a = collect_frames(&mut ar, 2).await;
     let frames_b = collect_frames(&mut br, 2).await;
     let corner = "┌".as_bytes();
-    assert!(frames_contain(&frames_a, corner), "client A did not see the menu corner glyph");
-    assert!(frames_contain(&frames_b, corner), "client B did not see the menu corner glyph");
+    assert!(
+        frames_contain(&frames_a, corner),
+        "client A did not see the menu corner glyph"
+    );
+    assert!(
+        frames_contain(&frames_b, corner),
+        "client B did not see the menu corner glyph"
+    );
 }
 
 #[tokio::test]
@@ -165,7 +170,10 @@ async fn any_client_can_drive_the_menu() {
             }
         }
     }
-    assert!(saw_split, "split did not happen — B saw no horizontal divider");
+    assert!(
+        saw_split,
+        "split did not happen — B saw no horizontal divider"
+    );
     let _ = aw;
 }
 
@@ -184,8 +192,14 @@ async fn ten_oh_three_h_reaches_every_attached_client_when_menu_opens() {
     let frames_a = collect_frames(&mut ar, 2).await;
     let frames_b = collect_frames(&mut br, 2).await;
     let needle = b"\x1b[?1003h";
-    assert!(frames_contain(&frames_a, needle), "client A did not receive ?1003h");
-    assert!(frames_contain(&frames_b, needle), "client B did not receive ?1003h");
+    assert!(
+        frames_contain(&frames_a, needle),
+        "client A did not receive ?1003h"
+    );
+    assert!(
+        frames_contain(&frames_b, needle),
+        "client B did not receive ?1003h"
+    );
 }
 
 #[tokio::test]
@@ -206,8 +220,14 @@ async fn ten_oh_three_l_reaches_every_attached_client_when_menu_closes() {
     let frames_a = collect_frames(&mut ar, 2).await;
     let frames_b = collect_frames(&mut br, 2).await;
     let needle = b"\x1b[?1003l";
-    assert!(frames_contain(&frames_a, needle), "client A did not receive ?1003l");
-    assert!(frames_contain(&frames_b, needle), "client B did not receive ?1003l");
+    assert!(
+        frames_contain(&frames_a, needle),
+        "client A did not receive ?1003l"
+    );
+    assert!(
+        frames_contain(&frames_b, needle),
+        "client B did not receive ?1003l"
+    );
 }
 
 #[tokio::test]
@@ -223,7 +243,10 @@ async fn late_attaching_client_receives_1003h_in_first_full_frame_when_menu_alre
     let (mut br, _bw) = handshake(&path, 80, 24).await;
     let frames_b = collect_frames(&mut br, 2).await;
     let needle = b"\x1b[?1003h";
-    assert!(frames_contain(&frames_b, needle), "late-attached client B did not receive ?1003h in its first full frame");
+    assert!(
+        frames_contain(&frames_b, needle),
+        "late-attached client B did not receive ?1003h in its first full frame"
+    );
 }
 
 #[tokio::test]
@@ -244,7 +267,10 @@ async fn right_click_from_b_while_menu_is_open_reanchors_to_b() {
     let frames_b = collect_frames(&mut br, 2).await;
 
     let corner = "┌".as_bytes();
-    assert!(frames_contain(&frames_b, corner), "client B did not see a reanchored menu corner glyph");
+    assert!(
+        frames_contain(&frames_b, corner),
+        "client B did not see a reanchored menu corner glyph"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +285,10 @@ async fn ten_oh_three_l_reaches_detaching_client_on_detach_even_if_menu_already_
 
     let frames_a = collect_frames(&mut ar, 2).await;
     let needle = b"\x1b[?1003l";
-    assert!(frames_contain(&frames_a, needle), "detaching client did not receive final ?1003l before Detach");
+    assert!(
+        frames_contain(&frames_a, needle),
+        "detaching client did not receive final ?1003l before Detach"
+    );
 }
 
 #[tokio::test]
@@ -280,7 +309,10 @@ async fn ten_oh_three_l_reaches_client_before_closed_when_session_shuts_down() {
     {
         match msg {
             ServerMsg::Frame { data, .. } => {
-                if data.windows(b"\x1b[?1003l".len()).any(|w| w == b"\x1b[?1003l") {
+                if data
+                    .windows(b"\x1b[?1003l".len())
+                    .any(|w| w == b"\x1b[?1003l")
+                {
                     saw_1003l_frame = true;
                 }
             }
@@ -289,9 +321,11 @@ async fn ten_oh_three_l_reaches_client_before_closed_when_session_shuts_down() {
                 break;
             }
             ServerMsg::Detach => break,
-            _ => {}
         }
     }
-    assert!(saw_1003l_frame, "no ?1003l Frame observed before session shutdown");
+    assert!(
+        saw_1003l_frame,
+        "no ?1003l Frame observed before session shutdown"
+    );
     assert!(saw_closed, "ServerMsg::Closed never arrived");
 }
