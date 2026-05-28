@@ -751,7 +751,12 @@ impl Session {
     /// resolver.
     pub fn refresh_agent_states(&mut self, resolve_name: impl Fn(i32) -> Option<String>) -> bool {
         let mut changed = false;
-        for pane in self.panes.values_mut() {
+        // Sentinel-file gate (vs env var): survives across server restarts you
+        // don't control, and works regardless of how the server was launched.
+        // `touch /tmp/dvlpr-detect.enable` to turn on, `rm` to turn off — the
+        // next 500ms tick picks it up.
+        let debug = std::path::Path::new("/tmp/dvlpr-detect.enable").exists();
+        for (pane_id, pane) in self.panes.iter_mut() {
             let prev_state = pane.agent_state;
 
             // Step 1: Identify foreground (cached, with reset on change,
@@ -801,11 +806,44 @@ impl Session {
                 }
             };
 
-            // Step 3: Sample tail (20 rows).
-            let tail = pane.screen.tail_text(20);
+            // Step 3: Sample the whole active screen.
+            //
+            // The original design read only the bottom 20 rows ("tail") on
+            // the assumption that the agent's current-state UI always sits
+            // near the bottom. That holds for Claude's normal prompt box
+            // and spinner — but NOT for full-screen takeover UIs like the
+            // "trust this folder" safety check or AskUserQuestion menus,
+            // which render at the TOP of the pane and leave the bottom
+            // empty. A 20-row tail of those screens is all blank → classify
+            // returns Idle while the user is staring at a blocked prompt.
+            //
+            // Reading the whole screen is cheap (one FFI call per cell, a
+            // few milliseconds even for large panes, every 500ms) and is
+            // unambiguously correct: the classifier's patterns are
+            // structurally distinctive, so extra context can't false-match.
+            let tail = pane.screen.tail_text(pane.screen.rows());
 
             // Step 4: Classify.
             let candidate = detect::classify(agent, &tail);
+
+            // Debug instrumentation: when DVLPR_DETECT_DEBUG is set, append
+            // every claude pane's sampled tail + classify result to
+            // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
+            // env var is unset. Use to verify what tail_text actually sees
+            // when classify disagrees with what's on screen.
+            if debug {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/dvlpr-detect.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
+                    );
+                }
+            }
 
             // Step 5: Stabilize.
             match candidate {

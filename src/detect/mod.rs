@@ -48,20 +48,23 @@ fn classify_claude(tail: &str) -> AgentState {
         return AgentState::Idle;
     }
 
+    // Compute once — both detectors need it.
+    let input_box = active_input_box(tail);
+
     // Blocked is checked BEFORE working: a permission prompt with
     // spinner overflow still correctly classifies as needing attention.
-    if is_claude_blocked(tail, &lower) {
+    if is_claude_blocked(tail, &lower, input_box.as_ref()) {
         return AgentState::Blocked;
     }
 
-    if is_claude_working(tail) {
+    if is_claude_working(tail, input_box.as_ref()) {
         return AgentState::Working;
     }
 
     AgentState::Idle
 }
 
-fn is_claude_blocked(tail: &str, lower: &str) -> bool {
+fn is_claude_blocked(tail: &str, lower: &str, input_box: Option<&InputBox>) -> bool {
     has_confirmation_prompt(lower)
         || lower.contains("do you want to proceed?")
         || lower.contains("would you like to proceed?")
@@ -70,12 +73,16 @@ fn is_claude_blocked(tail: &str, lower: &str) -> bool {
         // AskUserQuestion always renders a "Chat about this" affordance —
         // a stable signal regardless of menu shape or wording.
         || lower.contains("chat about this")
-        // Any `❯ N. <label>` selection menu means the agent is waiting for
-        // user input — whether the labels are yes/no (permission prompts)
-        // or open-ended (AskUserQuestion). `❯` (U+276F) is the menu cursor
-        // glyph; Claude's regular input cursor is plain `>` so they don't
-        // collide.
-        || has_selection_prompt(tail)
+        // Structural `❯ N. <label>` fallback. Only valid when there is NO
+        // active input box: when the input box is visible at the bottom,
+        // the agent is in normal interactive mode and any `❯ N.` higher
+        // up is either (a) stale scrollback from a previously-dismissed
+        // menu, or (b) a navigation menu (slash commands, settings) the
+        // user is browsing — neither is "agent blocked on user". With no
+        // input box, a full-screen dialog has taken over (trust folder,
+        // AskUserQuestion without the keyword fallback) and the menu IS
+        // the current state.
+        || (input_box.is_none() && has_selection_prompt(tail))
 }
 
 /// "do you want" or "would you like", with "yes" or "❯" appearing later
@@ -117,25 +124,80 @@ fn has_selection_prompt(tail: &str) -> bool {
     })
 }
 
-/// Match Claude's working hint on any line that isn't part of the user's
-/// own input row.
+/// Match Claude's working hint anywhere on screen EXCEPT inside the user's
+/// own input box.
 ///
 /// Real layout: the input box sits ABOVE the spinner, so the working hint
 /// lives BELOW the box's bottom border. We can't anchor "above the first
 /// ─ border" — that excludes the very rows the spinner occupies. Instead,
-/// look at every line and skip ones starting with `>` (the user's input
-/// cursor inside the prompt box). Claude renders selection-menu cursors
-/// as `❯`, never `>`, so the two don't collide.
-fn is_claude_working(tail: &str) -> bool {
-    tail.lines().any(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('>') {
-            // User typed "esc to interrupt" into their own prompt — ignore.
-            return false;
+/// scan every line and skip those inside the active input box (which is
+/// what would contain user-typed text like a literal "esc to interrupt").
+fn is_claude_working(tail: &str, input_box: Option<&InputBox>) -> bool {
+    tail.lines().enumerate().any(|(i, line)| {
+        if let Some(b) = input_box {
+            if i >= b.content_start_line && i < b.content_end_line {
+                return false; // line is inside the input box — ignore
+            }
         }
-        let lower = trimmed.to_ascii_lowercase();
+        let lower = line.to_ascii_lowercase();
         lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt")
     })
+}
+
+/// Line range (half-open: `[content_start_line, content_end_line)`) of the
+/// content rows INSIDE the active input box at the bottom of the screen.
+/// `content_end_line` is the index of the bottom border (the row AFTER the
+/// last content row).
+#[derive(Clone, Copy, Debug)]
+struct InputBox {
+    content_start_line: usize,
+    content_end_line: usize,
+}
+
+/// Detect the bottom-of-screen Claude input box: a `❯`-cursored content
+/// region bracketed by two horizontal-rule lines.
+///
+/// Real Claude layout:
+/// ```text
+/// ─────────────────────────       ← top border (HR)
+/// ❯ <user input>                  ← cursor line (may span multiple rows)
+/// ─────────────────────────       ← bottom border (HR)
+/// <footer>                        ← status chips, hints
+/// ```
+///
+/// We pick the LAST two HRs in the tail; the input box, if present, is
+/// always the bottommost such bracketed region. The `❯` requirement
+/// rejects accidental matches against unrelated double-rule blocks (e.g.,
+/// banner separators) that don't contain a cursor.
+fn active_input_box(tail: &str) -> Option<InputBox> {
+    let lines: Vec<&str> = tail.lines().collect();
+    let bot = lines.iter().rposition(|l| is_horizontal_rule(l))?;
+    let top = lines[..bot].iter().rposition(|l| is_horizontal_rule(l))?;
+    let has_cursor = lines[top + 1..bot]
+        .iter()
+        .any(|line| line.trim_start().starts_with('❯'));
+    if !has_cursor {
+        return None;
+    }
+    Some(InputBox {
+        content_start_line: top + 1,
+        content_end_line: bot,
+    })
+}
+
+/// A row consisting only of `─` (and `╭╮╰╯` corners + whitespace), with at
+/// least four `─` so a stray hyphen-like glyph doesn't false-match.
+fn is_horizontal_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().filter(|c| *c == '─').count() < 4 {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| matches!(c, '─' | '╭' | '╮' | '╰' | '╯') || c.is_whitespace())
 }
 
 #[cfg(test)]
@@ -186,10 +248,63 @@ mod tests {
     }
 
     #[test]
-    fn classify_claude_marker_below_prompt_box_is_idle() {
-        // User typed "esc to interrupt" into their own prompt — should NOT
-        // false-positive Working because the marker is BELOW the prompt box.
-        let tail = "────────\n> esc to interrupt\n────────\n";
+    fn classify_claude_marker_inside_input_box_is_idle() {
+        // User typed "esc to interrupt" into their own input. The actual
+        // Claude input cursor is `❯`, not `>` (the original spec was
+        // wrong). The marker must be ignored because it sits INSIDE the
+        // input box's content region (between top/bot ─ borders).
+        let tail = "────────\n❯ esc to interrupt\n────────\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_fresh_session_ignores_stale_menu_in_scrollback() {
+        // Repro of the live bug: user dismissed a trust-folder prompt and
+        // re-ran `claude`. Claude Code does NOT clear the screen — the
+        // dismissed menu's `❯ 2. No, exit` row persists in scrollback
+        // above the new input box. Without input-box-aware gating, the
+        // structural fallback keeps matching the stale row and reports
+        // Blocked forever even though the user is idle.
+        let tail = "Quick safety check: Is this a project you created?\n\
+                    ❯ 2. No, exit\n\
+                    Enter to confirm · Esc to cancel\n\
+                    alkein@host ~ % claude\n\
+                    Claude Code v2.1.153\n\
+                    ─────────────────────────\n\
+                    ❯\u{a0}\n\
+                    ─────────────────────────\n\
+                    Sonnet 4.6  high\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_working_with_active_input_box_and_spinner_below() {
+        // Normal working state: input box visible at the bottom, spinner
+        // line BELOW the bottom border. Working detection must look past
+        // the input box to find the spinner.
+        let tail = "...previous response...\n\
+                    ─────────────────────────\n\
+                    ❯ tell me a joke\n\
+                    ─────────────────────────\n\
+                    ✻ Generating… (5s · esc to interrupt)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_navigation_menu_with_input_box_is_idle() {
+        // Slash-command / settings menus reuse the same `❯ N.` selection
+        // widget as permission prompts. When the input box is still
+        // visible at the bottom, the user is navigating — NOT waiting on
+        // the agent. Matches the reference's documented design: "Claude uses the
+        // same generic Select widget for both permission flows and
+        // ordinary slash/settings menus."
+        let tail = "Available commands:\n\
+                    ❯ 1. /help\n\
+                      2. /model\n\
+                      3. /clear\n\
+                    ─────────────────────────\n\
+                    ❯ /\n\
+                    ─────────────────────────\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
     }
 
