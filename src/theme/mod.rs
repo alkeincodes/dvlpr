@@ -240,11 +240,11 @@ pub struct Theme {
 
 impl Theme {
     /// Materialise the role mapping for a given flavor. Background roles are
-    /// uniform across flavors (`mauve` / `peach` / `surface0` / `crust`).
-    /// Foreground roles split on `Flavor::is_light`: in Latte the fg on accent
-    /// backgrounds is `text` (the darkest neutral), in the dark flavors it is
-    /// `crust` (their darkest neutral). See the design spec's contrast-budget
-    /// section for the rationale.
+    /// uniform `Color::Default` (transparent) across every flavor: the host
+    /// terminal background shows through everywhere except the active-tab
+    /// chip. Foreground roles split on `Flavor::is_light`: Latte uses `text`
+    /// for `active_tab_fg` (text on vivid peach, bold-acceptable contrast);
+    /// dark flavors use `crust` (≥7:1 on pastel peach / muted orange).
     pub fn from_flavor(flavor: Flavor) -> Self {
         let p: &Palette = match flavor {
             Flavor::Latte     => &LATTE,
@@ -253,28 +253,17 @@ impl Theme {
             Flavor::Mocha     => &MOCHA,
             Flavor::OneDark   => &ONE_DARK,
         };
-        let (session_fg, active_tab_fg) = if flavor.is_light() {
-            // Latte: `crust` is the darkest surface shade (#dce0e8, still a
-            // light color). Paired with the deep mauve it gives readable
-            // contrast. `text` (#4c4f69) is the darkest neutral overall and
-            // pairs with the vivid peach for a bold-acceptable ~3.32:1 ratio
-            // — DO NOT switch this to a lighter color; contrast will tank.
-            (p.crust, p.text)
-        } else {
-            // Dark flavors: `crust` is the darkest neutral; pastel accents pair
-            // with it for high contrast (≥7:1 on Mocha).
-            (p.crust, p.crust)
-        };
+        let active_tab_fg = if flavor.is_light() { p.text } else { p.crust };
         Theme {
-            bar_bg: p.crust,
-            session_fg,
-            session_bg: p.mauve,
+            bar_bg:          Color::Default,
+            session_bg:      Color::Default,
+            session_fg:      p.mauve,
+            active_tab_bg:   p.peach,
             active_tab_fg,
-            active_tab_bg: p.peach,
             active_tab_bold: true,
+            inactive_tab_bg: Color::Default,
             inactive_tab_fg: p.text,
-            inactive_tab_bg: p.surface0,
-            agent_idle_fg: p.green,
+            agent_idle_fg:    p.green,
             agent_working_fg: p.yellow,
             agent_blocked_fg: p.red,
         }
@@ -349,10 +338,9 @@ mod tests {
     fn theme_default_is_latte() {
         let t = Theme::default();
         assert_eq!(t, Theme::from_flavor(Flavor::Latte));
-        // Spot-check one value so a future refactor of Default that drifts
-        // away from Latte fails this test instead of silently shipping a
-        // different default flavor.
-        assert_eq!(t.bar_bg, LATTE.crust);
+        // Spot-check the new uniform rule: bar_bg is transparent in every
+        // flavor, including the current default.
+        assert_eq!(t.bar_bg, Color::Default);
     }
 
     #[test]
@@ -371,14 +359,18 @@ mod tests {
     #[test]
     fn latte_role_mapping_uses_expected_palette_colors() {
         let t = Theme::from_flavor(Flavor::Latte);
-        // Backgrounds: same role across flavors.
-        assert_eq!(t.bar_bg, LATTE.crust);
-        assert_eq!(t.session_bg, LATTE.mauve);
+        // Backgrounds: uniform Color::Default (transparent) across all flavors.
+        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t.session_bg, Color::Default);
+        assert_eq!(t.inactive_tab_bg, Color::Default);
+        // Active tab background: still per-flavor.
         assert_eq!(t.active_tab_bg, LATTE.peach);
-        assert_eq!(t.inactive_tab_bg, LATTE.surface0);
-        // Foregrounds: per-flavor. Latte is the light branch.
-        assert_eq!(t.session_fg, LATTE.crust);
-        assert_eq!(t.active_tab_fg, LATTE.text); // <-- text, NOT crust (contrast-driven split)
+        // Foregrounds:
+        //  - session_fg is now the accent (mauve), not crust.
+        //  - inactive_tab_fg unchanged.
+        //  - active_tab_fg per-flavor: Latte (light) uses text; dark uses crust.
+        assert_eq!(t.session_fg, LATTE.mauve);
+        assert_eq!(t.active_tab_fg, LATTE.text);
         assert_eq!(t.inactive_tab_fg, LATTE.text);
         assert_eq!(t.agent_idle_fg, LATTE.green);
         assert_eq!(t.agent_working_fg, LATTE.yellow);
@@ -388,12 +380,12 @@ mod tests {
     #[test]
     fn frappe_role_mapping_uses_expected_palette_colors() {
         let t = Theme::from_flavor(Flavor::Frappe);
-        assert_eq!(t.bar_bg, FRAPPE.crust);
-        assert_eq!(t.session_bg, FRAPPE.mauve);
+        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t.session_bg, Color::Default);
+        assert_eq!(t.inactive_tab_bg, Color::Default);
         assert_eq!(t.active_tab_bg, FRAPPE.peach);
-        assert_eq!(t.inactive_tab_bg, FRAPPE.surface0);
-        assert_eq!(t.session_fg, FRAPPE.crust);
-        assert_eq!(t.active_tab_fg, FRAPPE.crust); // dark-flavor branch
+        assert_eq!(t.session_fg, FRAPPE.mauve);
+        assert_eq!(t.active_tab_fg, FRAPPE.crust);
         assert_eq!(t.inactive_tab_fg, FRAPPE.text);
         assert_eq!(t.agent_idle_fg, FRAPPE.green);
         assert_eq!(t.agent_working_fg, FRAPPE.yellow);
@@ -403,11 +395,11 @@ mod tests {
     #[test]
     fn macchiato_role_mapping_uses_expected_palette_colors() {
         let t = Theme::from_flavor(Flavor::Macchiato);
-        assert_eq!(t.bar_bg, MACCHIATO.crust);
-        assert_eq!(t.session_bg, MACCHIATO.mauve);
+        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t.session_bg, Color::Default);
+        assert_eq!(t.inactive_tab_bg, Color::Default);
         assert_eq!(t.active_tab_bg, MACCHIATO.peach);
-        assert_eq!(t.inactive_tab_bg, MACCHIATO.surface0);
-        assert_eq!(t.session_fg, MACCHIATO.crust);
+        assert_eq!(t.session_fg, MACCHIATO.mauve);
         assert_eq!(t.active_tab_fg, MACCHIATO.crust);
         assert_eq!(t.inactive_tab_fg, MACCHIATO.text);
         assert_eq!(t.agent_idle_fg, MACCHIATO.green);
@@ -418,11 +410,11 @@ mod tests {
     #[test]
     fn mocha_role_mapping_uses_expected_palette_colors() {
         let t = Theme::from_flavor(Flavor::Mocha);
-        assert_eq!(t.bar_bg, MOCHA.crust);
-        assert_eq!(t.session_bg, MOCHA.mauve);
+        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t.session_bg, Color::Default);
+        assert_eq!(t.inactive_tab_bg, Color::Default);
         assert_eq!(t.active_tab_bg, MOCHA.peach);
-        assert_eq!(t.inactive_tab_bg, MOCHA.surface0);
-        assert_eq!(t.session_fg, MOCHA.crust);
+        assert_eq!(t.session_fg, MOCHA.mauve);
         assert_eq!(t.active_tab_fg, MOCHA.crust);
         assert_eq!(t.inactive_tab_fg, MOCHA.text);
         assert_eq!(t.agent_idle_fg, MOCHA.green);
@@ -458,5 +450,20 @@ mod tests {
         assert_eq!(ONE_DARK.green, Color::Rgb(0x98, 0xc3, 0x79));
         assert_eq!(ONE_DARK.yellow, Color::Rgb(0xe5, 0xc0, 0x7b));
         assert_eq!(ONE_DARK.red, Color::Rgb(0xe0, 0x6c, 0x75));
+    }
+
+    #[test]
+    fn one_dark_role_mapping_uses_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::OneDark);
+        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t.session_bg, Color::Default);
+        assert_eq!(t.inactive_tab_bg, Color::Default);
+        assert_eq!(t.active_tab_bg, ONE_DARK.peach);
+        assert_eq!(t.session_fg, ONE_DARK.mauve);
+        assert_eq!(t.active_tab_fg, ONE_DARK.crust); // dark-flavor branch
+        assert_eq!(t.inactive_tab_fg, ONE_DARK.text);
+        assert_eq!(t.agent_idle_fg, ONE_DARK.green);
+        assert_eq!(t.agent_working_fg, ONE_DARK.yellow);
+        assert_eq!(t.agent_blocked_fg, ONE_DARK.red);
     }
 }
