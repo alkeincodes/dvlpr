@@ -144,6 +144,57 @@ pub fn menu_rect(
     }
 }
 
+/// Result of `menu_hit`: which menu region a click landed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuHit {
+    /// The interior cell of item index `usize` — execute on press, hover
+    /// on motion.
+    Item(usize),
+    /// A border cell (corner or edge). Swallow without execute or close.
+    Border,
+    /// Outside the resolved rect entirely. Close-on-press.
+    Outside,
+}
+
+/// Classify a 1-based `(col, row)` click against the open menu. Recomputes
+/// `menu_rect` internally so callers don't need to.
+pub fn menu_hit(
+    menu: &MenuState,
+    items_len: usize,
+    label_w: u16,
+    content_area: Rect,
+    col: u16,
+    row: u16,
+) -> MenuHit {
+    let rect = menu_rect(menu.anchor, content_area, items_len, label_w);
+    let x = col.saturating_sub(1);
+    let y = row.saturating_sub(1);
+
+    // Outside the rect.
+    if x < rect.x || x >= rect.x + rect.w || y < rect.y || y >= rect.y + rect.h {
+        return MenuHit::Outside;
+    }
+
+    // Border cells: outer ring of the rect.
+    let is_left = x == rect.x;
+    let is_right = x == rect.x + rect.w - 1;
+    let is_top = y == rect.y;
+    let is_bottom = y == rect.y + rect.h - 1;
+    if is_left || is_right || is_top || is_bottom {
+        return MenuHit::Border;
+    }
+
+    // Interior: y - rect.y - 1 indexes into `items`.
+    let i = (y - rect.y - 1) as usize;
+    if i < items_len {
+        MenuHit::Item(i)
+    } else {
+        // Shouldn't happen if rect.h matches items_len + 2, but guard against
+        // clipped rects where the visible item rows are fewer than items_len.
+        MenuHit::Border
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +347,112 @@ mod tests {
         let r = menu_rect((6, 3), area(5, 2, 30, 10), 4, 18);
         assert_eq!(r.x, 5);
         assert_eq!(r.y, 2);
+    }
+
+    #[test]
+    fn menu_hit_returns_item_for_interior_row() {
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = area(0, 0, 80, 24);
+        let label_w = 18;
+        let r = menu_rect(menu.anchor, content, 4, label_w);
+
+        // Item 0: row r.y + 1, interior column.
+        let col_1based = (r.x + 5) + 1;
+        let row_1based = (r.y + 1) + 1;
+        assert_eq!(
+            menu_hit(&menu, 4, label_w, content, col_1based, row_1based),
+            MenuHit::Item(0)
+        );
+
+        // Item 3: row r.y + 4.
+        let row_1based = (r.y + 4) + 1;
+        assert_eq!(
+            menu_hit(&menu, 4, label_w, content, col_1based, row_1based),
+            MenuHit::Item(3)
+        );
+    }
+
+    #[test]
+    fn menu_hit_returns_border_for_chrome_cells() {
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = area(0, 0, 80, 24);
+        let r = menu_rect(menu.anchor, content, 4, 18);
+
+        // Top-left corner.
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, r.x + 1, r.y + 1),
+            MenuHit::Border
+        );
+        // Right border, interior row.
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, r.x + r.w - 1 + 1, r.y + 2 + 1),
+            MenuHit::Border
+        );
+        // Bottom-right corner.
+        assert_eq!(
+            menu_hit(
+                &menu,
+                4,
+                18,
+                content,
+                r.x + r.w - 1 + 1,
+                r.y + r.h - 1 + 1
+            ),
+            MenuHit::Border
+        );
+    }
+
+    #[test]
+    fn menu_hit_returns_outside_for_cells_past_rect() {
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = area(0, 0, 80, 24);
+        let r = menu_rect(menu.anchor, content, 4, 18);
+
+        // One column right of the rect.
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, r.x + r.w + 1, r.y + 1 + 1),
+            MenuHit::Outside
+        );
+        // One row below the rect.
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, r.x + 1, r.y + r.h + 1),
+            MenuHit::Outside
+        );
+        // Origin (1, 1) when menu is anchored far away.
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, 1, 1),
+            MenuHit::Outside
+        );
+    }
+
+    #[test]
+    fn menu_hit_after_flip_resolves_correct_item() {
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 22),
+            highlighted: 0,
+        };
+        let content = area(0, 0, 80, 24);
+        let r = menu_rect(menu.anchor, content, 4, 18);
+        assert_eq!(r.y + r.h - 1, 21);
+
+        let row_1based = (r.y + 4) + 1;
+        let col_1based = (r.x + 2) + 1;
+        assert_eq!(
+            menu_hit(&menu, 4, 18, content, col_1based, row_1based),
+            MenuHit::Item(3)
+        );
     }
 }
