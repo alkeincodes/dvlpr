@@ -188,6 +188,65 @@ pub const MOCHA: Palette = Palette {
     crust: Color::Rgb(0x11, 0x11, 0x1b),
 };
 
+/// Renderer-facing role mapping. The compositor reads these fields directly to
+/// style status-bar cells and the heavy divider glyph. Constructed once per
+/// session via `from_flavor` and stored immutably; the hot render path never
+/// re-parses a flavor string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub bar_bg: Color,
+    pub session_fg: Color,
+    pub session_bg: Color,
+    pub active_tab_fg: Color,
+    pub active_tab_bg: Color,
+    pub active_tab_bold: bool,
+    pub inactive_tab_fg: Color,
+    pub inactive_tab_bg: Color,
+}
+
+impl Theme {
+    /// Materialise the role mapping for a given flavor. Background roles are
+    /// uniform across flavors (`mauve` / `peach` / `surface0` / `crust`).
+    /// Foreground roles split on `Flavor::is_light`: in Latte the fg on accent
+    /// backgrounds is `text` (the darkest neutral), in the dark flavors it is
+    /// `crust` (their darkest neutral). See the design spec's contrast-budget
+    /// section for the rationale.
+    pub fn from_flavor(flavor: Flavor) -> Self {
+        let p: &Palette = match flavor {
+            Flavor::Latte => &LATTE,
+            Flavor::Frappe => &FRAPPE,
+            Flavor::Macchiato => &MACCHIATO,
+            Flavor::Mocha => &MOCHA,
+        };
+        let (session_fg, active_tab_fg) = if flavor.is_light() {
+            // Latte: `crust` is the lightest neutral; pair it with the deep
+            // mauve. `text` is the darkest; pair it with the vivid peach for a
+            // bold-acceptable ~3.32:1 ratio.
+            (p.crust, p.text)
+        } else {
+            // Dark flavors: `crust` is the darkest neutral; pastel accents pair
+            // with it for high contrast (≥7:1 on Mocha).
+            (p.crust, p.crust)
+        };
+        Theme {
+            bar_bg: p.crust,
+            session_fg,
+            session_bg: p.mauve,
+            active_tab_fg,
+            active_tab_bg: p.peach,
+            active_tab_bold: true,
+            inactive_tab_fg: p.text,
+            inactive_tab_bg: p.surface0,
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::from_flavor(Flavor::Latte)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,5 +303,67 @@ mod tests {
         assert_eq!(FRAPPE.crust, Color::Rgb(0x23, 0x26, 0x34));
         assert_eq!(MACCHIATO.peach, Color::Rgb(0xf5, 0xa9, 0x7f));
         assert_eq!(MACCHIATO.crust, Color::Rgb(0x18, 0x19, 0x26));
+    }
+
+    #[test]
+    fn theme_default_is_latte() {
+        assert_eq!(Theme::default(), Theme::from_flavor(Flavor::Latte));
+    }
+
+    #[test]
+    fn active_tab_is_bold_in_every_flavor() {
+        for f in [Flavor::Latte, Flavor::Frappe, Flavor::Macchiato, Flavor::Mocha] {
+            assert!(Theme::from_flavor(f).active_tab_bold, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn latte_role_mapping_uses_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::Latte);
+        // Backgrounds: same role across flavors.
+        assert_eq!(t.bar_bg, LATTE.crust);
+        assert_eq!(t.session_bg, LATTE.mauve);
+        assert_eq!(t.active_tab_bg, LATTE.peach);
+        assert_eq!(t.inactive_tab_bg, LATTE.surface0);
+        // Foregrounds: per-flavor. Latte is the light branch.
+        assert_eq!(t.session_fg, LATTE.crust);
+        assert_eq!(t.active_tab_fg, LATTE.text); // <-- text, NOT crust (contrast-driven split)
+        assert_eq!(t.inactive_tab_fg, LATTE.text);
+    }
+
+    #[test]
+    fn frappe_role_mapping_uses_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::Frappe);
+        assert_eq!(t.bar_bg, FRAPPE.crust);
+        assert_eq!(t.session_bg, FRAPPE.mauve);
+        assert_eq!(t.active_tab_bg, FRAPPE.peach);
+        assert_eq!(t.inactive_tab_bg, FRAPPE.surface0);
+        assert_eq!(t.session_fg, FRAPPE.crust);
+        assert_eq!(t.active_tab_fg, FRAPPE.crust); // dark-flavor branch
+        assert_eq!(t.inactive_tab_fg, FRAPPE.text);
+    }
+
+    #[test]
+    fn macchiato_role_mapping_uses_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::Macchiato);
+        assert_eq!(t.bar_bg, MACCHIATO.crust);
+        assert_eq!(t.session_bg, MACCHIATO.mauve);
+        assert_eq!(t.active_tab_bg, MACCHIATO.peach);
+        assert_eq!(t.inactive_tab_bg, MACCHIATO.surface0);
+        assert_eq!(t.session_fg, MACCHIATO.crust);
+        assert_eq!(t.active_tab_fg, MACCHIATO.crust);
+        assert_eq!(t.inactive_tab_fg, MACCHIATO.text);
+    }
+
+    #[test]
+    fn mocha_role_mapping_uses_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::Mocha);
+        assert_eq!(t.bar_bg, MOCHA.crust);
+        assert_eq!(t.session_bg, MOCHA.mauve);
+        assert_eq!(t.active_tab_bg, MOCHA.peach);
+        assert_eq!(t.inactive_tab_bg, MOCHA.surface0);
+        assert_eq!(t.session_fg, MOCHA.crust);
+        assert_eq!(t.active_tab_fg, MOCHA.crust);
+        assert_eq!(t.inactive_tab_fg, MOCHA.text);
     }
 }
