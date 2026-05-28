@@ -219,9 +219,11 @@ impl Theme {
             Flavor::Mocha => &MOCHA,
         };
         let (session_fg, active_tab_fg) = if flavor.is_light() {
-            // Latte: `crust` is the lightest neutral; pair it with the deep
-            // mauve. `text` is the darkest; pair it with the vivid peach for a
-            // bold-acceptable ~3.32:1 ratio.
+            // Latte: `crust` is the darkest surface shade (#dce0e8, still a
+            // light color). Paired with the deep mauve it gives readable
+            // contrast. `text` (#4c4f69) is the darkest neutral overall and
+            // pairs with the vivid peach for a bold-acceptable ~3.32:1 ratio
+            // — DO NOT switch this to a lighter color; contrast will tank.
             (p.crust, p.text)
         } else {
             // Dark flavors: `crust` is the darkest neutral; pastel accents pair
@@ -307,7 +309,12 @@ mod tests {
 
     #[test]
     fn theme_default_is_latte() {
-        assert_eq!(Theme::default(), Theme::from_flavor(Flavor::Latte));
+        let t = Theme::default();
+        assert_eq!(t, Theme::from_flavor(Flavor::Latte));
+        // Spot-check one value so a future refactor of Default that drifts
+        // away from Latte fails this test instead of silently shipping a
+        // different default flavor.
+        assert_eq!(t.bar_bg, LATTE.crust);
     }
 
     #[test]
