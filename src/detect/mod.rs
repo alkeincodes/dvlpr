@@ -3,6 +3,9 @@
 //! Each pane's bottom-of-buffer text is sampled periodically and matched
 //! against known agent output patterns to classify state.
 
+mod spinner_verbs;
+use spinner_verbs::SPINNER_VERBS;
+
 /// An agent dvlpr can classify the state of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Agent {
@@ -127,11 +130,16 @@ fn has_selection_prompt(tail: &str) -> bool {
 /// Match Claude's working hint anywhere on screen EXCEPT inside the user's
 /// own input box.
 ///
+/// Two signals trip the Working state:
+/// - the interrupt hint (`esc to interrupt` / `ctrl+c to interrupt`)
+/// - a spinner verb framed with an ellipsis (`Combobulating…`, `Working…`,
+///   `Pondering...`), drawn from Claude Code's own verb pool.
+///
 /// Real layout: the input box sits ABOVE the spinner, so the working hint
 /// lives BELOW the box's bottom border. We can't anchor "above the first
 /// ─ border" — that excludes the very rows the spinner occupies. Instead,
 /// scan every line and skip those inside the active input box (which is
-/// what would contain user-typed text like a literal "esc to interrupt").
+/// what would contain user-typed text matching either signal).
 fn is_claude_working(tail: &str, input_box: Option<&InputBox>) -> bool {
     tail.lines().enumerate().any(|(i, line)| {
         if let Some(b) = input_box {
@@ -140,7 +148,31 @@ fn is_claude_working(tail: &str, input_box: Option<&InputBox>) -> bool {
             }
         }
         let lower = line.to_ascii_lowercase();
-        lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt")
+        if lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt") {
+            return true;
+        }
+        has_spinner_verb_line(line)
+    })
+}
+
+/// True if `line` contains a Claude spinner verb framed with an ellipsis
+/// (`<Verb>…` or `<Verb>...`). The ellipsis anchor is what separates a
+/// spinner status from chat prose that happens to mention the same word.
+///
+/// Iterates whitespace-delimited words on the line, strips a trailing
+/// `…` / `...`, and checks the remainder against the verb pool. The
+/// `…` is U+2026 (3 bytes UTF-8); `...` is three ASCII dots — both shapes
+/// appear in the wild.
+fn has_spinner_verb_line(line: &str) -> bool {
+    line.split_whitespace().any(|word| {
+        for ellipsis in ["…", "..."] {
+            if let Some(verb) = word.strip_suffix(ellipsis) {
+                if SPINNER_VERBS.contains(&verb) {
+                    return true;
+                }
+            }
+        }
+        false
     })
 }
 
@@ -416,5 +448,53 @@ mod tests {
         // Detection should match it the same as the bare form.
         let tail = "✻ Generating… (12s · ↓ 2.1k tokens · esc to interrupt)\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_working_spinner_verb_alone_combobulating() {
+        // Spinner verb anchored by `…` — the working hint should match
+        // even when "esc to interrupt" isn't on screen (e.g., narrow pane
+        // where the parens wrap off, or the verb-only frame Claude shows
+        // between tool steps).
+        let tail = "✻ Combobulating… (3s)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_working_spinner_verb_working_with_ellipsis() {
+        // "Working" is itself a spinner verb in Claude's pool. Must trip
+        // detection ONLY when framed with the spinner ellipsis — bare
+        // "Working" in chat prose stays Idle (covered in a separate test).
+        let tail = "✻ Working…\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_working_spinner_verb_ascii_three_dots() {
+        // Some Claude renderings (and the Pi agent in the reference) use ASCII
+        // `...` rather than the Unicode `…`. Match both.
+        let tail = "Working...\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_bare_spinner_verb_in_prose_is_idle() {
+        // Without the ellipsis anchor, a spinner-verb word in chat output
+        // must NOT false-positive Working. This protects against Claude's
+        // own responses mentioning these words conversationally.
+        let tail = "I think we were working on something earlier.\n\
+                    Just Pondering the next step here.\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_spinner_verb_inside_input_box_is_idle() {
+        // User typed "Combobulating…" into their own input box — should
+        // be ignored by the same input-box-content skip as "esc to
+        // interrupt".
+        let tail = "─────────────────────────\n\
+                    ❯ Combobulating…\n\
+                    ─────────────────────────\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
     }
 }
