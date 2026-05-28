@@ -86,28 +86,28 @@ fn last_cursor_col(frame: &str) -> Option<u16> {
 }
 
 #[tokio::test]
-async fn ctrl_a_down_splits_into_two_panes_with_a_divider() {
+async fn prefix_down_splits_into_two_panes_with_a_divider() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("split.sock");
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
-    // Ctrl-a (0x01) then Down arrow (ESC [ B).
-    send_input(&mut w, &[0x01, 0x1b, b'[', b'B']).await;
+    // Default prefix (0x02 = Ctrl-b) then Down arrow (ESC [ B).
+    send_input(&mut w, &[0x02, 0x1b, b'[', b'B']).await;
     assert!(
         until_frame(&mut r, 5, |f| f.contains('─') || f.contains('━')).await,
-        "expected a horizontal divider after Ctrl-a Down"
+        "expected a horizontal divider after prefix Down"
     );
 }
 
 #[tokio::test]
-async fn ctrl_a_c_creates_a_window_and_shows_the_tab_bar() {
+async fn prefix_c_creates_a_window_and_shows_the_tab_bar() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("win.sock");
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
-    send_input(&mut w, &[0x01, b'c']).await; // Ctrl-a c => new window
+    send_input(&mut w, &[0x02, b'c']).await; // prefix c => new window
     assert!(
         until_frame(&mut r, 5, |f| f.contains("1:")
             && f.contains("2:")
@@ -118,13 +118,13 @@ async fn ctrl_a_c_creates_a_window_and_shows_the_tab_bar() {
 }
 
 #[tokio::test]
-async fn ctrl_a_d_detaches_the_client() {
+async fn prefix_d_detaches_the_client() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("detach.sock");
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
-    send_input(&mut w, &[0x01, b'd']).await; // Ctrl-a d => detach
+    send_input(&mut w, &[0x02, b'd']).await; // prefix d => detach
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut detached = false;
     while let Ok(Ok(Some(msg))) =
@@ -135,7 +135,7 @@ async fn ctrl_a_d_detaches_the_client() {
             break;
         }
     }
-    assert!(detached, "expected ServerMsg::Detach after Ctrl-a d");
+    assert!(detached, "expected ServerMsg::Detach after prefix d");
 }
 
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn clicking_a_pane_moves_focus_between_panes() {
     // 41 cols: vertical split => left x0..=19 (cols 1..=20), divider col 21,
     // right x21..=40 (cols 22..=41). New right pane is focused after the split.
     let (mut r, mut w) = handshake(&sock, 41, 12).await;
-    send_input(&mut w, &[0x01, 0x1b, b'[', b'C']).await; // Ctrl-a Right => split vertical
+    send_input(&mut w, &[0x02, 0x1b, b'[', b'C']).await; // prefix Right => split vertical
                                                          // Cursor should land in the right (focused) pane: col >= 22.
     assert!(
         until_frame(&mut r, 5, |f| last_cursor_col(f)
@@ -168,13 +168,13 @@ async fn clicking_a_pane_moves_focus_between_panes() {
 }
 
 #[tokio::test]
-async fn ctrl_a_x_closing_the_last_pane_shuts_the_session_down() {
+async fn prefix_x_closing_the_last_pane_shuts_the_session_down() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("close.sock");
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
-    send_input(&mut w, &[0x01, b'x']).await; // Ctrl-a x => close the only pane
+    send_input(&mut w, &[0x02, b'x']).await; // prefix x => close the only pane
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut closed = false;
     while let Ok(Ok(Some(msg))) =

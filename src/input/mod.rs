@@ -376,22 +376,22 @@ mod tests {
 
     #[test]
     fn prefix_then_close_pane_key_yields_the_command() {
-        // Ctrl-a x => ClosePane (no pane bytes).
+        // Ctrl-b x => ClosePane (no pane bytes).
         assert_eq!(
-            parse_all(&[0x01, b'x']),
+            parse_all(&[0x02, b'x']),
             vec![InputEvent::Command(Command::ClosePane)]
         );
     }
 
     #[test]
     fn prefix_then_prefix_sends_a_literal_prefix_byte() {
-        assert_eq!(parse_all(&[0x01, 0x01]), vec![InputEvent::Pane(vec![0x01])]);
+        assert_eq!(parse_all(&[0x02, 0x02]), vec![InputEvent::Pane(vec![0x02])]);
     }
 
     #[test]
     fn prefix_then_digit_selects_a_window() {
         assert_eq!(
-            parse_all(&[0x01, b'2']),
+            parse_all(&[0x02, b'2']),
             vec![InputEvent::Command(Command::SelectWindow(2))]
         );
     }
@@ -406,30 +406,30 @@ mod tests {
     #[test]
     fn prefix_then_s_toggles_sidebar() {
         assert_eq!(
-            parse_all(&[0x01, b's']),
+            parse_all(&[0x02, b's']),
             vec![InputEvent::Command(Command::ToggleSidebar)]
         );
     }
 
     #[test]
     fn prefix_then_unknown_key_is_dropped() {
-        assert_eq!(parse_all(&[0x01, b'Z']), vec![]);
+        assert_eq!(parse_all(&[0x02, b'Z']), vec![]);
     }
 
     #[test]
     fn prefix_then_down_arrow_splits_horizontal() {
-        // Ctrl-a ESC [ B => SplitHorizontal (default binding Down).
+        // Ctrl-b ESC [ B => SplitHorizontal (default binding Down).
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'[', b'B']),
+            parse_all(&[0x02, 0x1b, b'[', b'B']),
             vec![InputEvent::Command(Command::SplitHorizontal)]
         );
     }
 
     #[test]
     fn prefix_then_ss3_right_arrow_splits_vertical() {
-        // Application-cursor encoding: Ctrl-a ESC O C => SplitVertical (Right).
+        // Application-cursor encoding: Ctrl-b ESC O C => SplitVertical (Right).
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'O', b'C']),
+            parse_all(&[0x02, 0x1b, b'O', b'C']),
             vec![InputEvent::Command(Command::SplitVertical)]
         );
     }
@@ -452,7 +452,7 @@ mod tests {
     fn fragmented_prefix_arrow_across_feeds() {
         let cfg = Config::default();
         let mut p = InputParser::new();
-        assert_eq!(p.feed(&cfg, &[0x01, 0x1b]), vec![]); // Ctrl-a ESC, waiting
+        assert_eq!(p.feed(&cfg, &[0x02, 0x1b]), vec![]); // Ctrl-b ESC, waiting
         assert_eq!(p.feed(&cfg, b"["), vec![]); // CSI, waiting
         assert_eq!(
             p.feed(&cfg, b"B"),
@@ -553,9 +553,9 @@ mod tests {
 
     #[test]
     fn prefix_then_csi_right_arrow_splits_vertical() {
-        // CSI (non-application-cursor) encoding: Ctrl-a ESC [ C => Right => SplitVertical.
+        // CSI (non-application-cursor) encoding: Ctrl-b ESC [ C => Right => SplitVertical.
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'[', b'C']),
+            parse_all(&[0x02, 0x1b, b'[', b'C']),
             vec![InputEvent::Command(Command::SplitVertical)]
         );
     }
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn armed_mode_focus_in_emits_focusin_and_preserves_prefix() {
-        // After the user presses the prefix (Ctrl-a = 0x01), the parser is in the
+        // After the user presses the prefix (Ctrl-b = 0x02), the parser is in the
         // Armed state. A focus event arriving here (ESC [ I) must:
         //   - emit one FocusIn event (so promotion happens),
         //   - preserve the Armed state (focus is side-channel terminal metadata,
@@ -655,7 +655,7 @@ mod tests {
         // then the next byte `x` resolves to the bound ClosePane command, NOT a
         // literal pane byte.
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'[', b'I', b'x']),
+            parse_all(&[0x02, 0x1b, b'[', b'I', b'x']),
             vec![
                 InputEvent::FocusIn,
                 InputEvent::Command(crate::config::Command::ClosePane),
@@ -668,7 +668,7 @@ mod tests {
         // FocusOut after prefix: zero focus events, prefix preserved, next `x`
         // still resolves to ClosePane.
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'[', b'O', b'x']),
+            parse_all(&[0x02, 0x1b, b'[', b'O', b'x']),
             vec![InputEvent::Command(crate::config::Command::ClosePane)]
         );
     }
@@ -681,7 +681,7 @@ mod tests {
         // alongside the focus tests so a future ACsi refactor can't silently
         // break this in isolation.)
         assert_eq!(
-            parse_all(&[0x01, 0x1b, b'[', b'B']),
+            parse_all(&[0x02, 0x1b, b'[', b'B']),
             vec![InputEvent::Command(crate::config::Command::SplitHorizontal)]
         );
     }

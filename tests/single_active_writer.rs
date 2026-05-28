@@ -321,7 +321,7 @@ async fn foreground_detach_repromotes_survivor() {
         "B (60x18) is foreground"
     );
 
-    write_msg(&mut wb, &ClientMsg::Input(b"\x01d".to_vec()))
+    write_msg(&mut wb, &ClientMsg::Input(b"\x02d".to_vec()))
         .await
         .unwrap();
     // A=100x30 → pane is 100x29.

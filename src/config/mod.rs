@@ -18,8 +18,8 @@ pub enum Command {
     NextWindow,
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
-    ToggleZoom,          // C-a 0: fullscreen the focused pane (toggle)
-    ToggleSidebar,       // C-a s: show/hide agent-awareness sidebar
+    ToggleZoom,          // C-b 0: fullscreen the focused pane (toggle)
+    ToggleSidebar,       // C-b s: show/hide agent-awareness sidebar
     Detach,
 }
 
@@ -142,6 +142,13 @@ impl Default for KeyMap {
     }
 }
 
+/// The compiled-in default prefix key. Ctrl-B (matching tmux's own default)
+/// leaves Ctrl-A free for readline's beginning-of-line inside the foreground
+/// CLI, which is how the user actually edits prompts in `claude`/`codex`/zsh.
+/// Single source of truth — both `Config::default()` and the
+/// malformed-prefix fallback in `from_toml_str` consume this.
+const DEFAULT_PREFIX: KeySpec = KeySpec::Ctrl('b');
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub prefix: KeySpec,
@@ -152,7 +159,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            prefix: KeySpec::Ctrl('a'),
+            prefix: DEFAULT_PREFIX,
             keys: KeyMap::default(),
             theme: crate::theme::Theme::default(),
         }
@@ -253,7 +260,7 @@ impl Config {
         let d = KeyMap::default();
         let theme = flavor_or_default(&raw.theme.flavor);
         Config {
-            prefix: spec_or_default(&raw.prefix, "prefix", KeySpec::Ctrl('a')),
+            prefix: spec_or_default(&raw.prefix, "prefix", DEFAULT_PREFIX),
             keys: KeyMap {
                 split_horizontal: spec_or_default(
                     &raw.keys.split_horizontal,
@@ -316,7 +323,7 @@ mod tests {
     #[test]
     fn defaults_match_the_spec() {
         let c = Config::default();
-        assert_eq!(c.prefix, KeySpec::Ctrl('a'));
+        assert_eq!(c.prefix, KeySpec::Ctrl('b'));
         assert_eq!(c.keys.split_horizontal, KeySpec::Named(NamedKey::Down));
         assert_eq!(c.keys.split_vertical, KeySpec::Named(NamedKey::Right));
         assert_eq!(c.keys.close_pane, KeySpec::Char('x'));
@@ -324,6 +331,16 @@ mod tests {
         assert_eq!(c.keys.next_window, KeySpec::Char('n'));
         assert_eq!(c.keys.prev_window, KeySpec::Char('p'));
         assert_eq!(c.keys.detach, KeySpec::Char('d'));
+    }
+
+    #[test]
+    fn default_prefix_is_ctrl_b() {
+        // Pins the user-facing contract: dvlpr's compiled-in default prefix is
+        // Ctrl-B (matching tmux's default), so Ctrl-A is free for readline's
+        // beginning-of-line inside the foreground CLI. Redundant with the
+        // prefix assertion in `defaults_match_the_spec`, but named to make the
+        // rationale searchable in the codebase.
+        assert_eq!(Config::default().prefix, KeySpec::Ctrl('b'));
     }
 
     #[test]
