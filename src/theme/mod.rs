@@ -6,15 +6,14 @@
 use crate::compositor::Color;
 use std::str::FromStr;
 
-/// One of the supported theme flavors. `Default` is `Latte` (the light
-/// catppuccin flavor), chosen per the design spec.
+/// One of the supported theme flavors. `Default` is `OneDark`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Flavor {
-    #[default]
     Latte,
     Frappe,
     Macchiato,
     Mocha,
+    #[default]
     OneDark,
 }
 
@@ -273,7 +272,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::from_flavor(Flavor::Latte)
+        Theme::from_flavor(Flavor::OneDark)
     }
 }
 
@@ -282,8 +281,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flavor_default_is_latte() {
-        assert_eq!(Flavor::default(), Flavor::Latte);
+    fn flavor_default_is_one_dark() {
+        assert_eq!(Flavor::default(), Flavor::OneDark);
     }
 
     #[test]
@@ -336,12 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn theme_default_is_latte() {
+    fn theme_default_is_one_dark() {
         let t = Theme::default();
-        assert_eq!(t, Theme::from_flavor(Flavor::Latte));
-        // Spot-check that the new uniform rule (bar_bg = Color::Default)
-        // applies to the current default flavor.
-        assert_eq!(t.bar_bg, Color::Default);
+        assert_eq!(t, Theme::from_flavor(Flavor::OneDark));
+        // Spot-check one role so a future refactor of Default that drifts
+        // away from OneDark fails this test instead of silently shipping
+        // a different default flavor.
+        assert_eq!(t.active_tab_bg, ONE_DARK.peach);
     }
 
     #[test]
