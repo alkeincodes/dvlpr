@@ -1403,6 +1403,8 @@ mod tests {
             pane_id: 1,
             agent: crate::detect::Agent::Claude,
             state: crate::detect::AgentState::Working,
+            session_label: None,
+            branch: None,
         }];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries);
         let dot_idx = (2 * cols as usize) + 13;
@@ -1429,6 +1431,8 @@ mod tests {
             pane_id: 1,
             agent: crate::detect::Agent::Claude,
             state: crate::detect::AgentState::Idle,
+            session_label: None,
+            branch: None,
         }];
         draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries);
         draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries);

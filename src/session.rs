@@ -38,6 +38,20 @@ struct Pane {
     /// the pane last classified as non-Idle. Resets to 0 on any non-Idle
     /// classification; clamped at 2.
     idle_streak: u8,
+    /// Cached tmux/multiplexer session label for the sidebar, populated by
+    /// `refresh_agent_meta`. None until the first successful fetch.
+    session_label: Option<String>,
+    /// Cached VCS branch for the sidebar, populated by `refresh_agent_meta`.
+    /// None until the first successful fetch.
+    branch: Option<String>,
+    /// Timestamp of the last successful `refresh_agent_meta` run for this
+    /// pane. Initialised 60 s in the past so the first tick fires immediately.
+    #[allow(dead_code)]
+    meta_last_refresh: std::time::Instant,
+    /// Set of `ErrorKind`s already logged for this pane's meta-refresh, so
+    /// we don't spam the log on every tick for a persistent failure.
+    #[allow(dead_code)]
+    meta_err_seen: std::collections::HashSet<std::io::ErrorKind>,
 }
 
 struct Window {
@@ -62,6 +76,12 @@ pub struct AgentEntry {
     pub pane_id: crate::layout::PaneId,
     pub agent: crate::detect::Agent,
     pub state: crate::detect::AgentState,
+    /// Cached session label from the multiplexer (e.g. tmux window name).
+    /// None until `refresh_agent_meta` populates the pane's cache.
+    pub session_label: Option<String>,
+    /// Cached VCS branch for this pane's working directory.
+    /// None until `refresh_agent_meta` populates the pane's cache.
+    pub branch: Option<String>,
 }
 
 pub struct Session {
@@ -81,6 +101,11 @@ pub struct Session {
     /// `layout::compute_regions` may still suppress the sidebar's visual
     /// presence if the viewport is too narrow (see SIDEBAR_MIN_CONTENT_COLS).
     sidebar_visible: bool,
+    /// Width of the sidebar in columns, as set at construction time from the
+    /// user's config. Replaces the `layout::SIDEBAR_WIDTH_DEFAULT` constant
+    /// in all layout calculations so the value propagates from config to
+    /// every relayout call.
+    sidebar_width: u16,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -119,6 +144,7 @@ impl Session {
         cols: u16,
         rows: u16,
         theme: crate::theme::Theme,
+        sidebar_width: u16,
     ) -> io::Result<(Self, PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         // Clamp to at least 1x1 (matches GhosttyScreen/PaneRuntime resize behavior).
         let cols = cols.max(1);
@@ -136,6 +162,7 @@ impl Session {
             command,
             cwd,
             sidebar_visible: false,
+            sidebar_width,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -147,7 +174,7 @@ impl Session {
                 h: rows,
             },
             session.sidebar_visible,
-            layout::SIDEBAR_WIDTH_DEFAULT,
+            session.sidebar_width,
         )
         .content_area;
         let (id, rx) = session.spawn_pane(content)?;
@@ -181,9 +208,19 @@ impl Session {
                 agent: None,
                 agent_state: detect::AgentState::Idle,
                 idle_streak: 0,
+                session_label: None,
+                branch: None,
+                meta_last_refresh: std::time::Instant::now()
+                    - std::time::Duration::from_secs(60),
+                meta_err_seen: std::collections::HashSet::new(),
             },
         );
         Ok((id, rx))
+    }
+
+    /// Return the configured sidebar width (columns).
+    pub fn sidebar_width(&self) -> u16 {
+        self.sidebar_width
     }
 
     fn viewport(&self) -> Rect {
@@ -209,7 +246,7 @@ impl Session {
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
     fn relayout_all(&mut self) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
             // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
@@ -388,7 +425,7 @@ impl Session {
             return;
         };
         let focused = win.focused;
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
         let Some((_, rect)) = layout::pane_rects(&win.root, content)
             .into_iter()
             .find(|(id, _)| *id == focused)
@@ -437,7 +474,7 @@ impl Session {
     }
 
     fn new_window(&mut self, eff: &mut CommandEffect) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
         let (id, rx) = match self.spawn_pane(content) {
             Ok(v) => v,
             Err(_) => return,
@@ -534,7 +571,7 @@ impl Session {
     /// the active window is zoomed, this is just the focused pane at the full
     /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
         match self.windows.get(self.active_window) {
             Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
@@ -584,7 +621,7 @@ impl Session {
         let x = col - 1;
         let y = row - 1;
 
-        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT);
+        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width);
 
         // 1. Sidebar FIRST — works in both zoomed and non-zoomed branches.
         if let Some(sb) = regions.sidebar {
@@ -888,6 +925,8 @@ impl Session {
                             pane_id,
                             agent,
                             state: pane.agent_state,
+                            session_label: pane.session_label.clone(),
+                            branch: pane.branch.clone(),
                         });
                     }
                 }
@@ -901,7 +940,7 @@ impl Session {
     /// active one). If that window is gone or the path no longer leads to a split,
     /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
     fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
         let Some(win) = self.windows.get_mut(window) else {
             return;
         };
@@ -951,6 +990,7 @@ mod tests {
             80,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("Session::new");
         (session, pane_id, rx)
@@ -1057,6 +1097,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1093,6 +1134,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1121,6 +1163,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1156,6 +1199,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1183,6 +1227,7 @@ mod tests {
             40,
             3,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::SplitHorizontal);
@@ -1205,6 +1250,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::NewWindow);
@@ -1228,6 +1274,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -1252,6 +1299,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::Detach);
@@ -1271,6 +1319,7 @@ mod tests {
             40,
             24,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         // Two horizontal splits => three panes in one window; newest pane is focused.
@@ -1304,6 +1353,7 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         // Vertical split: left = first (focused after split is the NEW right pane).
@@ -1342,6 +1392,7 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -1403,6 +1454,7 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         let grid = session.compose();
@@ -1421,6 +1473,7 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         // First resolve to "claude": name changes -> true.
@@ -1440,6 +1493,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // now two panes
@@ -1474,6 +1528,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1492,6 +1547,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // two panes in the active window
@@ -1513,6 +1569,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         // Window 1 (index 0) gets a second pane; remember one of its pane ids.
@@ -1536,6 +1593,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1556,6 +1614,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1575,6 +1634,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::NewWindow); // 2 windows -> tab bar has tabs
@@ -1611,6 +1671,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::NewWindow); // window 1
@@ -1791,5 +1852,40 @@ mod tests {
             pane_id,
         });
         assert_eq!(session.active_window_index(), active_before);
+    }
+
+    #[tokio::test]
+    async fn session_new_stores_sidebar_width_argument() {
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let (session, _pid, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            80,
+            10,
+            crate::theme::Theme::default(),
+            30, // sidebar_width
+        )
+        .expect("Session::new");
+        assert_eq!(session.sidebar_width(), 30);
+    }
+
+    #[tokio::test]
+    async fn agent_entries_carry_session_label_and_branch_when_cached() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // First, classify the pane as Claude so it survives the
+        // agent_entries filter.
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+        // Manually seed the cache fields the way refresh_agent_meta would.
+        {
+            let pane = session.panes.get_mut(&pane_id).expect("pane");
+            pane.session_label = Some("hello world".to_string());
+            pane.branch = Some("main".to_string());
+        }
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_label.as_deref(), Some("hello world"));
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
     }
 }

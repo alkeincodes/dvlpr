@@ -20,8 +20,8 @@ use dvlpr::theme::Theme;
 
 #[tokio::test]
 async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
-    // 1. Build a Session with one shell pane. Session::new takes 6 args
-    //    (the 6th is theme), and returns Result<(Self, PaneId, rx)>.
+    // 1. Build a Session with one shell pane. Session::new takes 7 args
+    //    (the 7th is sidebar_width), and returns Result<(Self, PaneId, rx)>.
     let (mut session, pane_id, _rx) = Session::new(
         "test".to_string(),
         vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
@@ -32,6 +32,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
         80,
         24,
         Theme::default(),
+        dvlpr::layout::SIDEBAR_WIDTH_DEFAULT,
     )
     .expect("Session::new");
 

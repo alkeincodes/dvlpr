@@ -150,6 +150,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         80,
         24,
         initial_theme,
+        runtime_cfg.sidebar.width,
     )?;
     spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
