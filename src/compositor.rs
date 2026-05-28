@@ -945,6 +945,12 @@ mod tests {
             agent_idle_fg:    Color::Rgb(7, 7, 7),
             agent_working_fg: Color::Rgb(8, 8, 8),
             agent_blocked_fg: Color::Rgb(9, 9, 9),
+            menu_bg: Color::Default,
+            menu_border_fg: Color::Default,
+            menu_label_fg: Color::Default,
+            menu_highlight_bg: Color::Default,
+            menu_highlight_fg: Color::Default,
+            menu_highlight_bold: false,
         };
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;

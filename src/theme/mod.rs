@@ -235,6 +235,12 @@ pub struct Theme {
     pub agent_idle_fg: Color,
     pub agent_working_fg: Color,
     pub agent_blocked_fg: Color,
+    pub menu_bg: Color,
+    pub menu_border_fg: Color,
+    pub menu_label_fg: Color,
+    pub menu_highlight_bg: Color,
+    pub menu_highlight_fg: Color,
+    pub menu_highlight_bold: bool,
 }
 
 impl Theme {
@@ -266,6 +272,12 @@ impl Theme {
             agent_idle_fg:   p.green,
             agent_working_fg: p.yellow,
             agent_blocked_fg: p.red,
+            menu_bg: p.crust,
+            menu_border_fg: p.peach,
+            menu_label_fg: p.text,
+            menu_highlight_bg: p.peach,
+            menu_highlight_fg: active_tab_fg,
+            menu_highlight_bold: true,
         }
     }
 }
@@ -465,5 +477,72 @@ mod tests {
         assert_eq!(t.agent_idle_fg, ONE_DARK.green);
         assert_eq!(t.agent_working_fg, ONE_DARK.yellow);
         assert_eq!(t.agent_blocked_fg, ONE_DARK.red);
+    }
+
+    #[test]
+    fn one_dark_menu_roles_use_expected_palette_colors() {
+        let t = Theme::from_flavor(Flavor::OneDark);
+        assert_eq!(t.menu_bg, ONE_DARK.crust);
+        assert_eq!(t.menu_border_fg, ONE_DARK.peach);
+        assert_eq!(t.menu_label_fg, ONE_DARK.text);
+        assert_eq!(t.menu_highlight_bg, ONE_DARK.peach);
+        assert_eq!(t.menu_highlight_fg, ONE_DARK.crust);
+        assert!(t.menu_highlight_bold);
+    }
+
+    #[test]
+    fn latte_menu_highlight_fg_uses_text_on_light_flavor() {
+        let t = Theme::from_flavor(Flavor::Latte);
+        assert_eq!(t.menu_bg, LATTE.crust);
+        assert_eq!(t.menu_border_fg, LATTE.peach);
+        assert_eq!(t.menu_label_fg, LATTE.text);
+        assert_eq!(t.menu_highlight_bg, LATTE.peach);
+        assert_eq!(t.menu_highlight_fg, LATTE.text);
+        assert!(t.menu_highlight_bold);
+    }
+
+    #[test]
+    fn frappe_menu_roles() {
+        let t = Theme::from_flavor(Flavor::Frappe);
+        assert_eq!(t.menu_bg, FRAPPE.crust);
+        assert_eq!(t.menu_border_fg, FRAPPE.peach);
+        assert_eq!(t.menu_label_fg, FRAPPE.text);
+        assert_eq!(t.menu_highlight_bg, FRAPPE.peach);
+        assert_eq!(t.menu_highlight_fg, FRAPPE.crust);
+        assert!(t.menu_highlight_bold);
+    }
+
+    #[test]
+    fn macchiato_menu_roles() {
+        let t = Theme::from_flavor(Flavor::Macchiato);
+        assert_eq!(t.menu_bg, MACCHIATO.crust);
+        assert_eq!(t.menu_border_fg, MACCHIATO.peach);
+        assert_eq!(t.menu_label_fg, MACCHIATO.text);
+        assert_eq!(t.menu_highlight_bg, MACCHIATO.peach);
+        assert_eq!(t.menu_highlight_fg, MACCHIATO.crust);
+        assert!(t.menu_highlight_bold);
+    }
+
+    #[test]
+    fn mocha_menu_roles() {
+        let t = Theme::from_flavor(Flavor::Mocha);
+        assert_eq!(t.menu_bg, MOCHA.crust);
+        assert_eq!(t.menu_border_fg, MOCHA.peach);
+        assert_eq!(t.menu_label_fg, MOCHA.text);
+        assert_eq!(t.menu_highlight_bg, MOCHA.peach);
+        assert_eq!(t.menu_highlight_fg, MOCHA.crust);
+        assert!(t.menu_highlight_bold);
+    }
+
+    #[test]
+    fn theme_default_menu_roles_match_one_dark() {
+        let t = Theme::default();
+        let one_dark = Theme::from_flavor(Flavor::OneDark);
+        assert_eq!(t.menu_bg, one_dark.menu_bg);
+        assert_eq!(t.menu_border_fg, one_dark.menu_border_fg);
+        assert_eq!(t.menu_label_fg, one_dark.menu_label_fg);
+        assert_eq!(t.menu_highlight_bg, one_dark.menu_highlight_bg);
+        assert_eq!(t.menu_highlight_fg, one_dark.menu_highlight_fg);
+        assert_eq!(t.menu_highlight_bold, one_dark.menu_highlight_bold);
     }
 }
