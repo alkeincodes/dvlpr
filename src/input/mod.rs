@@ -723,4 +723,44 @@ mod tests {
             vec![InputEvent::Command(crate::config::Command::SplitHorizontal)]
         );
     }
+
+    #[test]
+    fn sgr_right_button_press_decodes_button_2() {
+        // SGR mouse press, right-button (bit 0..1 == 10): b=2, col=10, row=5.
+        assert_eq!(
+            parse_all(b"\x1b[<2;10;5M"),
+            vec![InputEvent::Mouse(MouseEvent {
+                button: 2,
+                col: 10,
+                row: 5,
+                kind: MouseKind::Press,
+            })]
+        );
+    }
+
+    #[test]
+    fn sgr_motion_under_1003_is_decoded_as_drag_kind() {
+        // SGR motion report under any-event tracking: b = 32 + base. With
+        // no button held, base = 35 (specifically the "no button" sentinel
+        // some terminals use). The parser already treats `b & 32 != 0` as
+        // MouseKind::Drag regardless of which low bits are set.
+        assert_eq!(
+            parse_all(b"\x1b[<35;10;5M"),
+            vec![InputEvent::Mouse(MouseEvent {
+                button: 3,
+                col: 10,
+                row: 5,
+                kind: MouseKind::Drag,
+            })]
+        );
+    }
+
+    #[test]
+    fn parse_sgr_motion_does_not_reject_button_released_motion() {
+        // The same bytes as above must NOT be rejected (return Vec::new()) by
+        // parse_sgr — they must reach the run loop as a Mouse event.
+        let events = parse_all(b"\x1b[<35;10;5M");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], InputEvent::Mouse(_)));
+    }
 }
