@@ -375,6 +375,15 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_a_now_passes_through_to_the_pane() {
+        // Pins the user-facing contract: under the default config, Ctrl-A
+        // (0x01) reaches the foreground pane as a plain byte (where the inner
+        // CLI's readline binds it to "beginning of line"). Regression guard
+        // against any future flip-back of DEFAULT_PREFIX.
+        assert_eq!(parse_all(&[0x01]), vec![InputEvent::Pane(vec![0x01])]);
+    }
+
+    #[test]
     fn prefix_then_close_pane_key_yields_the_command() {
         // Ctrl-b x => ClosePane (no pane bytes).
         assert_eq!(
@@ -540,6 +549,21 @@ mod tests {
     }
 
     #[test]
+    fn option_backspace_passes_through_to_the_pane() {
+        // ESC \x7f is the macOS Option+Backspace "kill word backward"
+        // sequence (\x7f is DEL, the byte the terminal sends for the
+        // Delete/Backspace key). Walks the same NEsc -> non-bracket path
+        // as ESC + arbitrary byte (covered by
+        // esc_then_non_bracket_byte_flushes_both_to_pane), but pins the
+        // exact byte the user-facing contract depends on rather than
+        // inferring from the generic case.
+        assert_eq!(
+            parse_all(b"\x1b\x7f"),
+            vec![InputEvent::Pane(vec![0x1b]), InputEvent::Pane(vec![0x7f]),]
+        );
+    }
+
+    #[test]
     fn malformed_mouse_sequence_is_discarded_and_recovers() {
         // ESC [ < 0 ; 5 then a bogus 'Z' aborts the mouse parse; 'Z' becomes pane input.
         let cfg = Config::default();
@@ -575,6 +599,20 @@ mod tests {
         assert_eq!(
             parse_all(b"\x1b[1;5C"),
             vec![InputEvent::Pane(b"\x1b[1;5C".to_vec())]
+        );
+    }
+
+    #[test]
+    fn option_arrow_left_passes_through_to_the_pane() {
+        // ESC [ 1 ; 3 D is the macOS Option+Left "previous word" sequence
+        // (modifier=3 means Alt/Option in xterm modifyOtherKeys semantics).
+        // The generic parameterized-CSI path handles this — the modifier
+        // value doesn't change the parser's behavior — but we pin the
+        // exact Option-modifier bytes here so the user-facing contract is
+        // asserted directly, not just inferred from the Ctrl-modifier test.
+        assert_eq!(
+            parse_all(b"\x1b[1;3D"),
+            vec![InputEvent::Pane(b"\x1b[1;3D".to_vec())]
         );
     }
 
