@@ -67,7 +67,12 @@ fn is_claude_blocked(tail: &str, lower: &str) -> bool {
         || lower.contains("would you like to proceed?")
         || lower.contains("waiting for permission")
         || lower.contains("do you want to allow this connection?")
-        || (has_selection_prompt(tail) && has_yes_no_choice(tail))
+        // Any `❯ N. <label>` selection menu means the agent is waiting for
+        // user input — whether the labels are yes/no (permission prompts)
+        // or open-ended (AskUserQuestion). `❯` (U+276F) is the menu cursor
+        // glyph; Claude's regular input cursor is plain `>` so they don't
+        // collide.
+        || has_selection_prompt(tail)
 }
 
 /// "do you want" or "would you like", with "yes" or "❯" appearing later
@@ -86,67 +91,48 @@ fn has_confirmation_prompt(lower: &str) -> bool {
     }
 }
 
-/// A line starting with "❯" that also contains a digit-dot pair somewhere
-/// on the same line (matches "❯ 1. Yes" patterns).
+/// A "❯ N." selection cursor appears anywhere on a line — the `❯` glyph may
+/// be preceded by box-drawing chars (e.g., `│ ` when the menu is inside a
+/// bordered dialog like AskUserQuestion's). We require digits followed
+/// immediately by `.` after the cursor to keep `❯ Yes` (no digit) from
+/// matching here — `has_confirmation_prompt` covers that path.
 fn has_selection_prompt(tail: &str) -> bool {
-    for line in tail.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('❯')
-            && trimmed.chars().any(|c| c.is_ascii_digit())
-            && trimmed.contains('.')
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// At least one line whose trimmed content (with leading ❯ stripped) reads
-/// as a yes/no choice. Anchors the structural fallback so a stray "❯"
-/// without yes/no doesn't trigger Blocked.
-fn has_yes_no_choice(tail: &str) -> bool {
     tail.lines().any(|line| {
-        let t = line
-            .trim()
-            .trim_start_matches('❯')
-            .trim_start()
-            .to_lowercase();
-        t == "yes"
-            || t == "no"
-            || t.starts_with("1. yes")
-            || t.starts_with("2. no")
-            || t.starts_with("yes, and ")
-            || t.starts_with("no, and tell claude")
+        let Some(idx) = line.find('❯') else {
+            return false;
+        };
+        let after = line[idx + '❯'.len_utf8()..].trim_start();
+        let mut saw_digit = false;
+        for c in after.chars() {
+            if c.is_ascii_digit() {
+                saw_digit = true;
+            } else {
+                return saw_digit && c == '.';
+            }
+        }
+        false
     })
 }
 
-fn is_claude_working(tail: &str) -> bool {
-    let above = content_above_prompt_box(tail);
-    let lower = above.to_ascii_lowercase();
-    lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt")
-}
-
-/// Claude's input UI is bracketed by two horizontal-rule lines with `❯`
-/// between them. Return the tail content above the FIRST top-border found;
-/// if no box, return the whole tail.
+/// Match Claude's working hint on any line that isn't part of the user's
+/// own input row.
 ///
-/// Heuristic match: a row consisting (after trim) of ≥4 consecutive '─'
-/// plus only whitespace / box-corner glyphs. Brittle against titled
-/// borders — accepted v1 limitation per the spec.
-fn content_above_prompt_box(tail: &str) -> &str {
-    let lines: Vec<&str> = tail.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.chars().filter(|c| *c == '─').count() >= 4
-            && trimmed.chars().all(|c| {
-                c == '─' || c.is_whitespace() || c == '┌' || c == '┐' || c == '╭' || c == '╮'
-            })
-        {
-            let byte_offset: usize = lines[..i].iter().map(|l| l.len() + 1).sum();
-            return &tail[..byte_offset.min(tail.len())];
+/// Real layout: the input box sits ABOVE the spinner, so the working hint
+/// lives BELOW the box's bottom border. We can't anchor "above the first
+/// ─ border" — that excludes the very rows the spinner occupies. Instead,
+/// look at every line and skip ones starting with `>` (the user's input
+/// cursor inside the prompt box). Claude renders selection-menu cursors
+/// as `❯`, never `>`, so the two don't collide.
+fn is_claude_working(tail: &str) -> bool {
+    tail.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('>') {
+            // User typed "esc to interrupt" into their own prompt — ignore.
+            return false;
         }
-    }
-    tail
+        let lower = trimmed.to_ascii_lowercase();
+        lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt")
+    })
 }
 
 #[cfg(test)]
@@ -248,5 +234,40 @@ mod tests {
         // "do you want" without yes/❯ nearby → NOT blocked.
         let tail = "I'll explain what I'm about to do. Do you want to keep going?\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_working_when_spinner_below_prompt_box() {
+        // Real Claude Code layout: the input box is drawn ABOVE the spinner —
+        // the working hint lives BELOW the box's bottom border. v1's
+        // "above the prompt box only" logic missed this and reported Idle.
+        let tail = "context above\n\
+                    ╭──────────────────────────────────╮\n\
+                    │ >                                │\n\
+                    ╰──────────────────────────────────╯\n\
+                    ✻ Generating… (5s · esc to interrupt)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_blocked_open_ended_selection_prompt() {
+        // AskUserQuestion renders a menu with arbitrary labels — never "yes"
+        // / "no". The structural fallback must catch it regardless.
+        let tail = "╭──────────────────────────────────╮\n\
+                    │ Which library should we use?     │\n\
+                    │                                  │\n\
+                    │ ❯ 1. date-fns                    │\n\
+                    │   2. moment                      │\n\
+                    │   3. dayjs                       │\n\
+                    ╰──────────────────────────────────╯\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Blocked);
+    }
+
+    #[test]
+    fn classify_claude_working_paren_spinner_format() {
+        // The on-screen spinner is parenthesized: "(5s · esc to interrupt)".
+        // Detection should match it the same as the bare form.
+        let tail = "✻ Generating… (12s · ↓ 2.1k tokens · esc to interrupt)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
     }
 }
