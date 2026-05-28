@@ -179,6 +179,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut agent_tick = tokio::time::interval(Duration::from_millis(500));
+    agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let reason: String = loop {
         tokio::select! {
@@ -316,6 +318,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             }
             _ = autoname_tick.tick() => {
                 if session.refresh_window_names(crate::procinfo::process_name) {
+                    dirty = true;
+                }
+            }
+            _ = agent_tick.tick() => {
+                if session.refresh_agent_states(crate::procinfo::process_name) {
                     dirty = true;
                 }
             }
