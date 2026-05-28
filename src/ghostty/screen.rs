@@ -454,4 +454,24 @@ mod tests {
         let out = s.render_ansi();
         assert!(out.starts_with(b"\x1b[2J\x1b[H"));
     }
+
+    #[test]
+    fn focus_mode_toggle_does_not_emit_pty_writes() {
+        // The design depends on libghostty-vt absorbing DECSET 1004 (focus reporting)
+        // as a stored mode without writing any PTY reply back. If a future vendor
+        // update started echoing focus toggles, pane-app focus chatter would leak
+        // upstream to the host terminal — exactly the "dvlpr owns host focus"
+        // guarantee this test pins.
+        let mut s = GhosttyScreen::new(80, 24);
+        s.feed(b"\x1b[?1004h");
+        assert!(
+            s.take_pty_writes().is_empty(),
+            "DECSET 1004 (enable) must not produce a PTY reply"
+        );
+        s.feed(b"\x1b[?1004l");
+        assert!(
+            s.take_pty_writes().is_empty(),
+            "DECSET 1004 (disable) must not produce a PTY reply"
+        );
+    }
 }
