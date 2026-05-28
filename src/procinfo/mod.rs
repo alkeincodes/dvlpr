@@ -157,6 +157,54 @@ pub fn process_name(pid: i32) -> Option<String> {
     friendly_name(&argv_of(pid)?)
 }
 
+/// Resolve a pid's current working directory, or `None` on any failure
+/// (EPERM, ESRCH, permission denied, unsupported platform).
+#[cfg(target_os = "macos")]
+pub fn pid_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    // Use proc_pidinfo(PROC_PIDVNODEPATHINFO) — the standard macOS API for
+    // resolving a process's cwd. libc exposes the required types and function.
+    use std::ffi::CStr;
+    use std::mem;
+    let mut info: libc::proc_vnodepathinfo = unsafe { mem::zeroed() };
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    // SAFETY: pvi_cdir.vip_path is [[c_char; 32]; 32] = 1024 bytes, laid out
+    // contiguously in memory.  The kernel ABI for PROC_PIDVNODEPATHINFO
+    // (Apple's sys/proc_info.h) guarantees the path is NUL-terminated, so
+    // CStr::from_ptr below will always find a terminator within the array.
+    let flat: &[libc::c_char; 1024] = unsafe {
+        &*(&info.pvi_cdir.vip_path as *const [[libc::c_char; 32]; 32]
+            as *const [libc::c_char; 1024])
+    };
+    let cstr = unsafe { CStr::from_ptr(flat.as_ptr()) };
+    let path = std::path::PathBuf::from(cstr.to_string_lossy().into_owned());
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn pid_cwd(pid: i32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn pid_cwd(_pid: i32) -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{friendly_name, parse_procargs2};
@@ -245,5 +293,36 @@ mod tests {
         buf.extend_from_slice(b"app.js\0");
         let argv = parse_procargs2(&buf).unwrap();
         assert_eq!(argv, vec!["node".to_string(), "app.js".to_string()]);
+    }
+
+    #[test]
+    fn pid_cwd_resolves_to_the_process_working_directory() {
+        use std::process::{Command, Stdio};
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let want = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+
+        // Spawn `sleep 5` with cwd = tempdir; capture its pid.
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .current_dir(&want)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+
+        // Give the OS a moment to update the process table.
+        sleep(Duration::from_millis(50));
+
+        let got = super::pid_cwd(pid);
+
+        // Cleanup BEFORE asserting so a failure doesn't leak the child.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait();
+
+        assert_eq!(got, Some(want));
     }
 }
