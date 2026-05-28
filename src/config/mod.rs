@@ -1,9 +1,16 @@
-//! Server-side configuration: the prefix key and command keymap, loaded once at
-//! daemon start from `~/.config/dvlpr/config.toml`. Defaults are compiled in; the
-//! file overrides. Malformed entries fall back to their default and are logged; a
-//! malformed file never crashes the daemon. This module owns `Command` and the
-//! key-spec types so `input`/`session` depend on `config` without a cycle.
+//! Server-side configuration: the prefix key and command keymap, loaded once
+//! at daemon start from the first existing file in this order:
+//!
+//!   1. `$XDG_CONFIG_HOME/dvlpr/config.toml` (or `~/.config/dvlpr/config.toml`
+//!      when `XDG_CONFIG_HOME` is unset)
+//!   2. `~/.dvlpr/config.toml` (dotfile fallback)
+//!
+//! Defaults are compiled in; the file overrides. Malformed entries fall back
+//! to their default and are logged; a malformed file never crashes the daemon.
+//! This module owns `Command` and the key-spec types so `input`/`session`
+//! depend on `config` without a cycle.
 
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::Deserialize;
@@ -232,20 +239,24 @@ fn flavor_or_default(raw: &Option<String>) -> crate::theme::Theme {
 }
 
 impl Config {
-    /// Load from `~/.config/dvlpr/config.toml`. Missing file or parse failure =>
-    /// all defaults (logged), never fatal.
+    /// Load from the first existing candidate in `config_path_candidates()`.
+    /// All-missing or parse failure => all defaults (logged), never fatal. A
+    /// non-`NotFound` read error on a candidate (e.g. permission denied) logs a
+    /// warning and falls back to defaults rather than silently trying the next
+    /// candidate — a file that exists but can't be read is a misconfiguration
+    /// worth surfacing.
     pub fn load() -> Config {
-        let Some(path) = config_path() else {
-            return Config::default();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Config::from_toml_str(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "cannot read config; using defaults");
-                Config::default()
+        for path in config_path_candidates() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => return Config::from_toml_str(&text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "cannot read config; using defaults");
+                    return Config::default();
+                }
             }
         }
+        Config::default()
     }
 
     /// Parse TOML text into a `Config`. Unparseable TOML => all defaults (logged).
@@ -306,14 +317,32 @@ impl Config {
     }
 }
 
-/// `~/.config/dvlpr/config.toml`, honoring `XDG_CONFIG_HOME`.
-fn config_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-        })?;
-    Some(base.join("dvlpr").join("config.toml"))
+/// First-match-wins candidate list, env-aware (see `build_candidates` for the
+/// pure helper). Order: XDG config dir, then `~/.dvlpr/config.toml`.
+fn config_path_candidates() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    build_candidates(home.as_deref(), xdg.as_deref())
+}
+
+/// Pure candidate-list builder (testable without env mutation). Order:
+///   1. `$XDG_CONFIG_HOME/dvlpr/config.toml` if `xdg` is set, otherwise
+///      `$HOME/.config/dvlpr/config.toml` if `home` is set
+///   2. `$HOME/.dvlpr/config.toml` if `home` is set
+///
+/// Returns an empty vec when neither `home` nor `xdg` are available — in that
+/// (degenerate) environment, `Config::load` returns all defaults.
+fn build_candidates(home: Option<&Path>, xdg: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(xdg) = xdg {
+        out.push(xdg.join("dvlpr").join("config.toml"));
+    } else if let Some(home) = home {
+        out.push(home.join(".config").join("dvlpr").join("config.toml"));
+    }
+    if let Some(home) = home {
+        out.push(home.join(".dvlpr").join("config.toml"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -476,6 +505,52 @@ flavor = "one-dark"
         assert_eq!(
             c.theme,
             crate::theme::Theme::from_flavor(crate::theme::Flavor::OneDark)
+        );
+    }
+
+    #[test]
+    fn build_candidates_with_xdg_uses_xdg_then_dotfile() {
+        // When XDG_CONFIG_HOME is set, the XDG path is the primary; ~/.config
+        // is NOT also consulted (preserves the XDG convention). The dotfile
+        // fallback is appended as a second candidate.
+        let home = PathBuf::from("/home/alice");
+        let xdg = PathBuf::from("/custom/xdg");
+        let candidates = build_candidates(Some(&home), Some(&xdg));
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/custom/xdg/dvlpr/config.toml"),
+                PathBuf::from("/home/alice/.dvlpr/config.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_candidates_without_xdg_uses_dot_config_then_dotfile() {
+        let home = PathBuf::from("/home/alice");
+        let candidates = build_candidates(Some(&home), None);
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/home/alice/.config/dvlpr/config.toml"),
+                PathBuf::from("/home/alice/.dvlpr/config.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_candidates_with_no_home_is_empty() {
+        // No HOME and no XDG => nothing to read; load() returns defaults.
+        assert!(build_candidates(None, None).is_empty());
+    }
+
+    #[test]
+    fn build_candidates_with_xdg_but_no_home_returns_only_xdg() {
+        let xdg = PathBuf::from("/custom/xdg");
+        let candidates = build_candidates(None, Some(&xdg));
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("/custom/xdg/dvlpr/config.toml")]
         );
     }
 }

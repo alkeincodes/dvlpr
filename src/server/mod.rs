@@ -27,8 +27,9 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub command: Vec<String>,
     pub cwd: String,
-    /// Keymap to use. `None` => load from `~/.config/dvlpr/config.toml` (production
-    /// default). Tests pass `Some(Config::default())` for deterministic bindings.
+    /// Keymap to use. `None` => load from disk via `Config::load` (production
+    /// default; see `config::config_path_candidates` for the resolution order).
+    /// Tests pass `Some(Config::default())` for deterministic bindings.
     pub keymap: Option<Config>,
     /// The session name this daemon serves (its socket is `{session}.sock`).
     pub session: String,

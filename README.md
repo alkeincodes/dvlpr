@@ -64,8 +64,15 @@ running in a dvlpr pane, these all work as plain pane bytes:
 | `Option-←` / `Option-→` | Move by word (already emitted by Warp/iTerm2/Ghostty) |
 | `Option-Backspace` | Kill word backward |
 
-If you previously used `Ctrl-A` as the dvlpr prefix and want to keep that
-binding, add `prefix = "C-a"` to `~/.config/dvlpr/config.toml`.
+To change the prefix, add `prefix = "C-<letter>"` to a dvlpr config file.
+dvlpr loads the first existing file in this order:
+
+1. `$XDG_CONFIG_HOME/dvlpr/config.toml` (or `~/.config/dvlpr/config.toml`
+   when `XDG_CONFIG_HOME` is unset)
+2. `~/.dvlpr/config.toml` (dotfile fallback)
+
+For example, to restore the pre-2026-05-28 `Ctrl-A` prefix, write
+`prefix = "C-a"` to either path.
 
 **Upgrading from a prior release:** a running daemon caches its config at
 startup, so an existing session keeps the old default prefix until that
