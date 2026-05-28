@@ -5,18 +5,13 @@
 
 /// One of catppuccin's four flavors. `Default` is `Latte` (the light flavor),
 /// chosen per the design spec.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Flavor {
+    #[default]
     Latte,
     Frappe,
     Macchiato,
     Mocha,
-}
-
-impl Default for Flavor {
-    fn default() -> Self {
-        Flavor::Latte
-    }
 }
 
 #[cfg(test)]
