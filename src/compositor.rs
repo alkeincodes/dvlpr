@@ -1590,4 +1590,108 @@ mod tests {
         assert_eq!(buf[r1.x_end as usize].ch, ' ');
         assert_eq!(buf[r1.x_end as usize].style.bg, theme.active_tab_bg);
     }
+
+    #[test]
+    fn serialize_full_zero_tabs_emits_zero_bg_sgrs() {
+        // Stronger pin than counting: render with NO tabs (just a session
+        // prefix). All theme bg roles are Color::Default; nothing should
+        // ever paint a bg. The byte stream MUST contain zero "48;" SGR
+        // codes. If a future refactor accidentally re-introduces a row
+        // fill or session-prefix bg paint, this test fails immediately.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default(); // OneDark — transparent bgs
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names: Vec<String> = vec![];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 0, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.matches("48;").count(),
+            0,
+            "no bg SGR anywhere when every bg role is Color::Default and there is no active tab"
+        );
+        // The session-prefix label still emits fg SGRs.
+        assert!(text.contains("38;"), "session prefix fg SGR present");
+    }
+
+    #[test]
+    fn serialize_full_active_chip_emits_exactly_one_bg_sgr() {
+        // Render with one active tab. The active chip paints `1 + label + 1`
+        // contiguous cells with the same pen — the serializer collapses them
+        // into ONE "48;" SGR transition. Any other bg paint (row fill,
+        // inactive label, gap) would push the count above 1; an accidentally
+        // dropped active bg would push it to 0. Both fail this assertion.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names = vec!["zsh".to_string(), "vim".to_string()];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 1, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            text.matches("48;").count(),
+            1,
+            "exactly one bg SGR transition for the single active chip; \
+             gap and inactive tab must not paint bg"
+        );
+        assert!(text.contains("38;"), "fg SGRs are emitted for labels");
+    }
+
+    #[test]
+    fn serialize_full_inter_tab_gap_resets_to_default_pen() {
+        // Stronger pin for the inter-tab gap claim: render with one inactive
+        // ("1:zsh") followed by one active ("2:vim*"). In the byte stream,
+        // between the inactive label and the active chip, the serializer
+        // MUST emit a bare `\x1b[0m` (the pen reset at the gap cell) AND
+        // MUST NOT emit any `48;` (no accidental bg paint in the gap). A
+        // regression that styled the gap with fg-only inactive bytes would
+        // skip the reset and this test would fail.
+        let cols: u16 = 40;
+        let rows: u16 = 3;
+        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let root = Node::Leaf(0);
+        let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
+        let tab_names = vec!["zsh".to_string(), "vim".to_string()];
+        let bytes = Compositor::new().render(
+            viewport, &root, "session", &tab_names, 1, 0u64, false,
+            &theme, &[(0u64, &pane as &dyn PaneCells)],
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        let inactive_pos = text.find("1:zsh").expect("inactive label in output");
+        let active_pos = text.find("2:vim*").expect("active label in output");
+        assert!(
+            inactive_pos < active_pos,
+            "inactive label appears before active label"
+        );
+        // The bytes from end-of-inactive-label to start-of-"2:vim*" include
+        // the gap pen-reset, the gap space cell, the active chip's SGR
+        // (which legitimately contains `48;`), and the chip's left pad
+        // space. Trim off the active SGR + left pad by finding the LAST
+        // `\x1b[` before "2:vim*" — that's the active chip's SGR opener.
+        // The remaining "gap" slice is just the gap-cell bytes.
+        let span_to_active = &text[inactive_pos + "1:zsh".len()..active_pos];
+        let active_sgr_start = span_to_active
+            .rfind("\x1b[")
+            .expect("active chip SGR present before its label");
+        let gap = &span_to_active[..active_sgr_start];
+        assert!(
+            gap.contains("\x1b[0m"),
+            "gap between inactive label and active chip must reset pen: gap = {gap:?}"
+        );
+        assert!(
+            !gap.contains("48;"),
+            "gap must not emit any bg SGR: gap = {gap:?}"
+        );
+    }
 }
