@@ -138,7 +138,7 @@ impl Compositor {
         let rows = viewport.h;
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
 
-        let regions = layout::compute_regions(viewport, sidebar_visible);
+        let regions = layout::compute_regions(viewport, sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT);
         let content = regions.content_area;
         let rects = if zoomed {
             vec![(focused, content)]

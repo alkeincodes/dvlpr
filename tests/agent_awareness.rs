@@ -42,7 +42,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     assert_eq!(grid_before_classify.cols, 80);
 
     // 3. Feed busy marker positioned so tail_text(20) can see it.
-    //    After toggle_sidebar the pane is resized to 64×23.
+    //    After toggle_sidebar the pane is resized to 54×23 (80 - SIDEBAR_WIDTH_DEFAULT 26).
     //    tail_text(20) reads the last 20 rows (rows 3..22, 0-based).
     //    \x1b[20;1H moves the cursor to row 20, col 1 (1-based) = row 19 (0-based),
     //    which is within the tail window.
@@ -51,10 +51,10 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
 
     let theme = Theme::default();
     let grid = session.compose();
-    // Sidebar rect: cols (80-16)=64..79, rows 0..22. Dot at column 64+13 = 77,
+    // Sidebar rect: cols (80-26)=54..79, rows 0..22. Dot at column 54+13 = 67,
     // row 2 (first entry, after AGENTS header + separator).
     // grid.cols = 80 (full viewport width).
-    let dot_idx = (2 * grid.cols as usize) + 77;
+    let dot_idx = (2 * grid.cols as usize) + 67;
     assert_eq!(
         grid.cells[dot_idx].style.fg, theme.agent_working_fg,
         "dot should be theme.agent_working_fg (the default flavor's yellow)"
@@ -105,7 +105,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     // 7. Toggle off; content area returns to full width.
     let _ = session.apply_command(Command::ToggleSidebar);
     let grid = session.compose();
-    let cell = grid.cells[(2 * grid.cols as usize) + 77];
+    let cell = grid.cells[(2 * grid.cols as usize) + 67];
     assert_ne!(
         cell.style.fg, theme.agent_idle_fg,
         "sidebar should be gone after toggle off"

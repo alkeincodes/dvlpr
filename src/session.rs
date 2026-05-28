@@ -147,6 +147,7 @@ impl Session {
                 h: rows,
             },
             session.sidebar_visible,
+            layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .content_area;
         let (id, rx) = session.spawn_pane(content)?;
@@ -208,7 +209,7 @@ impl Session {
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
     fn relayout_all(&mut self) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
             // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
@@ -387,7 +388,7 @@ impl Session {
             return;
         };
         let focused = win.focused;
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
         let Some((_, rect)) = layout::pane_rects(&win.root, content)
             .into_iter()
             .find(|(id, _)| *id == focused)
@@ -436,7 +437,7 @@ impl Session {
     }
 
     fn new_window(&mut self, eff: &mut CommandEffect) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
         let (id, rx) = match self.spawn_pane(content) {
             Ok(v) => v,
             Err(_) => return,
@@ -533,7 +534,7 @@ impl Session {
     /// the active window is zoomed, this is just the focused pane at the full
     /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
         match self.windows.get(self.active_window) {
             Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
@@ -583,7 +584,7 @@ impl Session {
         let x = col - 1;
         let y = row - 1;
 
-        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible);
+        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT);
 
         // 1. Sidebar FIRST — works in both zoomed and non-zoomed branches.
         if let Some(sb) = regions.sidebar {
@@ -900,7 +901,7 @@ impl Session {
     /// active one). If that window is gone or the path no longer leads to a split,
     /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
     fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, layout::SIDEBAR_WIDTH_DEFAULT).content_area;
         let Some(win) = self.windows.get_mut(window) else {
             return;
         };
@@ -1702,7 +1703,8 @@ mod tests {
         let initial_cols = session.panes.get(&pane_id).unwrap().screen.cols();
         session.toggle_sidebar();
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        assert_eq!(after_cols, initial_cols - 16);
+        // Sidebar default is SIDEBAR_WIDTH_DEFAULT (26), not the old SIDEBAR_COLS (16).
+        assert_eq!(after_cols, initial_cols - layout::SIDEBAR_WIDTH_DEFAULT);
         session.toggle_sidebar();
         assert_eq!(
             session.panes.get(&pane_id).unwrap().screen.cols(),
@@ -1716,8 +1718,8 @@ mod tests {
         let _eff = session.apply_command(crate::config::Command::ToggleSidebar);
         assert!(session.sidebar_visible);
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        // initial cols from helper is 80; sidebar shrinks by 16
-        assert_eq!(after_cols, 80 - 16);
+        // initial cols from helper is 80; sidebar shrinks by SIDEBAR_WIDTH_DEFAULT (26).
+        assert_eq!(after_cols, 80 - layout::SIDEBAR_WIDTH_DEFAULT);
     }
 
     #[tokio::test]
@@ -1727,8 +1729,8 @@ mod tests {
         session.feed(pane_id, b"esc to interrupt\n");
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
 
-        // Sidebar starts at col 65 (cols 64..80, 1-based 65..80).
-        // First entry at sidebar row 2 (0-based) = row 3 1-based.
+        // Sidebar width is SIDEBAR_WIDTH_DEFAULT (26); starts at 0-based col 54 (1-based 55..80).
+        // First entry at sidebar row 2 (0-based) = row 3 1-based. Col 70 is inside the sidebar.
         let hit = session.hit(70, 3);
         match hit {
             layout::Hit::SidebarEntry {

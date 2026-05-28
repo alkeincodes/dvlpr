@@ -141,13 +141,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     // The session owns all windows/panes and the compositor; start with one pane.
     let runtime_cfg: Config = config.keymap.unwrap_or_else(Config::load);
+    // Extract the Copy-able theme before moving runtime_cfg into `keymap` below.
+    let initial_theme = runtime_cfg.theme;
     let (mut session, first_pane, first_rx) = Session::new(
         config.session.clone(),
         config.command.clone(),
         config.cwd.clone(),
         80,
         24,
-        runtime_cfg.theme,
+        initial_theme,
     )?;
     spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
