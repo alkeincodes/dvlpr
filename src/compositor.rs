@@ -735,11 +735,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn draw_tabs_paints_themed_blocks() {
         // 30-column bar row. Three windows: active = index 1 ("vim"). Sentinel
         // colors per role so the assertions are unambiguous.
         let cols: u16 = 30;
-        let mut buf = vec![StyledCell::default(); cols as usize * 1];
+        let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
             bar_bg: Color::Rgb(1, 1, 1),
             session_fg: Color::Rgb(2, 2, 2),
