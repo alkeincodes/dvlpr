@@ -443,6 +443,30 @@ fn apply_events(
     dirty: &mut bool,
 ) {
     for ev in events {
+        if let Some(eff) = session.try_consume_menu_event(&ev) {
+            for (pane_id, rx) in eff.spawned {
+                spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+            }
+            for runtime in eff.closed {
+                runtime.close();
+            }
+            if eff.detach {
+                if let Some(st) = remove_client(clients, foreground, session, dirty, id) {
+                    let _ = st.control.send(Control::Detach);
+                    let mut writer = st.writer;
+                    tokio::spawn(async move {
+                        if timeout(TEARDOWN_TIMEOUT, &mut writer).await.is_err() {
+                            writer.abort();
+                        }
+                    });
+                }
+            }
+            if session.refresh_window_names(crate::procinfo::process_name) {
+                *dirty = true;
+            }
+            *dirty = true;
+            continue;
+        }
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {

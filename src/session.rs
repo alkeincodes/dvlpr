@@ -216,12 +216,55 @@ impl Session {
         self.menu.is_some()
     }
 
-    /// Menu keyboard event intercept. Returns `true` if the event was
-    /// consumed by the menu (caller skips its normal dispatch). Returns
-    /// `false` otherwise. Task 9 fills this in; current stub passes
-    /// through.
-    pub fn try_consume_menu_event(&mut self, _ev: &crate::input::InputEvent) -> bool {
-        false
+    /// Post-parser keyboard intercept. Returns `true` if the event was
+    /// consumed (caller skips its normal dispatch). Returns `None` when the
+    /// event was NOT consumed by the menu (caller continues normal dispatch).
+    /// Returns `Some(eff)` when the event WAS consumed; `eff` carries any
+    /// side effects (spawned panes, closed runtimes, detach) that the caller
+    /// must propagate. Mouse and FocusIn events always return `None` so they
+    /// reach `handle_mouse` / the focus-promotion path respectively. `Command`
+    /// events are swallowed so prefix-bound commands cannot mutate state while
+    /// the menu is up.
+    pub fn try_consume_menu_event(
+        &mut self,
+        ev: &crate::input::InputEvent,
+    ) -> Option<crate::session::CommandEffect> {
+        use crate::input::InputEvent;
+        if self.menu.is_none() {
+            return None;
+        }
+        match ev {
+            InputEvent::Mouse(_) | InputEvent::FocusIn => None,
+            InputEvent::Command(_) => Some(CommandEffect::default()),
+            InputEvent::Pane(bytes) => match bytes.as_slice() {
+                b"\x1b" => {
+                    self.menu = None;
+                    Some(CommandEffect::default())
+                }
+                b"\x1b[A" => {
+                    if let Some(m) = self.menu.as_mut() {
+                        m.move_up();
+                    }
+                    Some(CommandEffect::default())
+                }
+                b"\x1b[B" => {
+                    if let Some(m) = self.menu.as_mut() {
+                        m.move_down();
+                    }
+                    Some(CommandEffect::default())
+                }
+                b"\r" | b"\n" => {
+                    if let Some(m) = self.menu.clone() {
+                        let cmd = m.items()[m.highlighted].command;
+                        self.menu = None;
+                        Some(self.apply_command(cmd))
+                    } else {
+                        Some(CommandEffect::default())
+                    }
+                }
+                _ => Some(CommandEffect::default()),
+            },
+        }
     }
 
     /// Mouse dispatch when a menu is open.
@@ -2208,5 +2251,148 @@ mod tests {
         let mut drag = None;
         let eff = session.handle_mouse(left_press(click_col, click_row), &mut drag);
         assert!(!eff.spawned.is_empty(), "Split must produce a spawned-pane effect");
+    }
+
+    use crate::input::InputEvent;
+
+    fn pane_event(bytes: &[u8]) -> InputEvent {
+        InputEvent::Pane(bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn try_consume_returns_false_when_menu_closed() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        assert!(session.try_consume_menu_event(&pane_event(b"\x1b")).is_none());
+        assert!(session.try_consume_menu_event(&InputEvent::FocusIn).is_none());
+    }
+
+    #[tokio::test]
+    async fn escape_with_menu_open_closes_menu_and_does_not_reach_pane() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let consumed = session.try_consume_menu_event(&pane_event(b"\x1b"));
+        assert!(consumed.is_some());
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn arrow_down_with_menu_open_moves_highlight() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        assert!(session.try_consume_menu_event(&pane_event(b"\x1b[B")).is_some());
+        assert!(session.menu_open());
+        assert_eq!(session.menu_highlighted_for_test(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn arrow_up_with_menu_open_moves_highlight() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 2,
+        }));
+        assert!(session.try_consume_menu_event(&pane_event(b"\x1b[A")).is_some());
+        assert_eq!(session.menu_highlighted_for_test(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn enter_with_menu_open_dispatches_highlighted_command() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        assert!(session.try_consume_menu_event(&pane_event(b"\r")).is_some());
+        assert!(!session.menu_open());
+        assert_eq!(session.window_pane_ids(0).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn enter_on_split_item_returns_effect_with_spawned_pane() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0, // Split Vertically
+        }));
+        let eff = session
+            .try_consume_menu_event(&pane_event(b"\r"))
+            .expect("Enter on Item must return Some(effect)");
+        assert!(
+            !eff.spawned.is_empty(),
+            "Enter on Split must propagate a spawned-pane effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrary_keystroke_with_menu_open_is_swallowed() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        assert!(session.try_consume_menu_event(&pane_event(b"q")).is_some());
+        assert!(session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn prefix_byte_with_menu_open_arms_prefix_state_but_resulting_command_is_dropped() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let cmd = InputEvent::Command(Command::ClosePane);
+        assert!(session.try_consume_menu_event(&cmd).is_some());
+        assert_eq!(session.window_pane_ids(0).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn focus_in_event_with_menu_open_passes_through() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        assert!(session.try_consume_menu_event(&InputEvent::FocusIn).is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_event_with_menu_open_is_not_swallowed_by_try_consume_menu_event() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        let mouse = InputEvent::Mouse(MouseEvent {
+            button: 0,
+            col: 1,
+            row: 1,
+            kind: MouseKind::Press,
+        });
+        assert!(session.try_consume_menu_event(&mouse).is_none());
     }
 }
