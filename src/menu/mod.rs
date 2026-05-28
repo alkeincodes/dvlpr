@@ -72,6 +72,15 @@ use crate::layout::Rect;
 const MENU_PAD_X: u16 = 1;
 const MENU_BORDER: u16 = 1;
 
+/// The horizontal pad cell count on each side of an item label. Exposed
+/// so `compositor::draw_menu` can reproduce the natural unclipped rect
+/// for cell→item mapping. Kept as a function (not a `pub const`) so it
+/// behaves identically across crate boundaries with no `const` import.
+pub fn menu_pad_x() -> u16 { MENU_PAD_X }
+
+/// The border cell count on each side. See `menu_pad_x` for rationale.
+pub fn menu_border() -> u16 { MENU_BORDER }
+
 /// Resolve the menu's paint rect given the click anchor, the available
 /// `content_area`, and the menu's item count + label width. The algorithm:
 ///

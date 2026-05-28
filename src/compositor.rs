@@ -698,6 +698,160 @@ fn draw_sidebar(
 
 const SIDEBAR_LABEL_COLS_END: u16 = 16;
 
+/// Paint the open context menu's cells into `buf`. Pure function — no I/O.
+///
+/// The resolved rect comes from `crate::menu::menu_rect(menu.anchor, content_area,
+/// items.len(), label_w)`. Cells outside the rect are not touched.
+///
+/// Layout per row:
+///
+/// ```text
+/// ┌──────────────────────┐    ← border
+/// │ Split Vertically     │    ← item row: 1 pad + label + spaces + 1 pad
+/// │ Split Horizontally   │
+/// │ Zoom                 │
+/// │ Exit                 │
+/// └──────────────────────┘
+/// ```
+///
+/// The highlighted item row paints `menu_highlight_bg` on every interior cell,
+/// including the left and right pad cells (so the chip extends across the
+/// entire menu interior width).
+pub fn draw_menu(
+    buf: &mut [StyledCell],
+    cols: u16,
+    menu: &crate::menu::MenuState,
+    items: &[crate::menu::MenuItem],
+    theme: &crate::theme::Theme,
+    content_area: crate::layout::Rect,
+) {
+    let label_w = items
+        .iter()
+        .map(|i| i.label.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let rect = crate::menu::menu_rect(menu.anchor, content_area, items.len(), label_w);
+
+    let natural_tlx = {
+        let ax = menu.anchor.0.saturating_sub(1);
+        let w = label_w
+            .saturating_add(2 * crate::menu::menu_pad_x())
+            .saturating_add(2 * crate::menu::menu_border());
+        let right = content_area
+            .x
+            .saturating_add(content_area.w.saturating_sub(1));
+        if ax.saturating_add(w.saturating_sub(1)) > right {
+            right
+                .saturating_sub(w.saturating_sub(1))
+                .max(content_area.x)
+        } else {
+            ax
+        }
+    };
+    let natural_tly = {
+        let ay = menu.anchor.1.saturating_sub(1);
+        let h = (items.len() as u16).saturating_add(2 * crate::menu::menu_border());
+        let bottom = content_area
+            .y
+            .saturating_add(content_area.h.saturating_sub(1));
+        if ay.saturating_add(h.saturating_sub(1)) > bottom {
+            ay.saturating_sub(h.saturating_sub(1))
+                .max(content_area.y)
+        } else {
+            ay
+        }
+    };
+
+    let cols_usize = cols as usize;
+    let natural_w = label_w
+        .saturating_add(2 * crate::menu::menu_pad_x())
+        .saturating_add(2 * crate::menu::menu_border());
+    let natural_h = (items.len() as u16).saturating_add(2 * crate::menu::menu_border());
+    let natural_right = natural_tlx + natural_w - 1;
+    let natural_bottom = natural_tly + natural_h - 1;
+
+    for y in rect.y..rect.y + rect.h {
+        let is_top = y == natural_tly;
+        let is_bottom = y == natural_bottom;
+        let is_border_row = is_top || is_bottom;
+        let item_idx = if is_border_row {
+            None
+        } else {
+            Some((y - natural_tly - 1) as usize)
+        };
+
+        for x in rect.x..rect.x + rect.w {
+            let is_left = x == natural_tlx;
+            let is_right = x == natural_right;
+            let is_border_col = is_left || is_right;
+            let idx = y as usize * cols_usize + x as usize;
+            if idx >= buf.len() {
+                continue;
+            }
+
+            let cell: StyledCell = if is_border_row && is_border_col {
+                let ch = match (is_top, is_bottom, is_left, is_right) {
+                    (true, _, true, _) => '┌',
+                    (true, _, _, true) => '┐',
+                    (_, true, true, _) => '└',
+                    (_, true, _, true) => '┘',
+                    _ => '+',
+                };
+                StyledCell {
+                    ch,
+                    style: CellStyle {
+                        fg: theme.menu_border_fg,
+                        bg: theme.menu_bg,
+                        ..Default::default()
+                    },
+                }
+            } else if is_border_row {
+                StyledCell {
+                    ch: '─',
+                    style: CellStyle {
+                        fg: theme.menu_border_fg,
+                        bg: theme.menu_bg,
+                        ..Default::default()
+                    },
+                }
+            } else if is_border_col {
+                StyledCell {
+                    ch: '│',
+                    style: CellStyle {
+                        fg: theme.menu_border_fg,
+                        bg: theme.menu_bg,
+                        ..Default::default()
+                    },
+                }
+            } else {
+                let i = item_idx.expect("non-border row must map to an item index");
+                let item = items.get(i);
+                let highlighted = i == menu.highlighted;
+                let (fg, bg, bold) = if highlighted {
+                    (theme.menu_highlight_fg, theme.menu_highlight_bg, theme.menu_highlight_bold)
+                } else {
+                    (theme.menu_label_fg, theme.menu_bg, false)
+                };
+                let col_in_interior = x - natural_tlx - 1;
+                let chars: Vec<char> = item.map(|it| it.label.chars().collect()).unwrap_or_default();
+                let ch = if col_in_interior == 0 {
+                    ' '
+                } else if (col_in_interior as usize - 1) < chars.len() {
+                    chars[col_in_interior as usize - 1]
+                } else {
+                    ' '
+                };
+                StyledCell {
+                    ch,
+                    style: CellStyle { fg, bg, bold, ..Default::default() },
+                }
+            };
+
+            buf[idx] = cell;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,5 +1853,214 @@ mod tests {
             !gap.contains("48;"),
             "gap must not emit any bg SGR: gap = {gap:?}"
         );
+    }
+
+    use crate::menu::{menu_rect, MenuKind, MenuState, PANE_MENU_ITEMS};
+    use crate::layout::Rect;
+
+    fn fresh_buf(cols: u16, rows: u16) -> Vec<StyledCell> {
+        vec![StyledCell::default(); cols as usize * rows as usize]
+    }
+
+    fn at(cols: u16) -> impl Fn(u16, u16) -> usize {
+        let cols = cols as usize;
+        move |x: u16, y: u16| y as usize * cols + x as usize
+    }
+
+    fn menu_theme() -> crate::theme::Theme {
+        let mut t = crate::theme::Theme::default();
+        t.menu_bg = Color::Rgb(10, 10, 10);
+        t.menu_border_fg = Color::Rgb(20, 20, 20);
+        t.menu_label_fg = Color::Rgb(30, 30, 30);
+        t.menu_highlight_bg = Color::Rgb(40, 40, 40);
+        t.menu_highlight_fg = Color::Rgb(50, 50, 50);
+        t.menu_highlight_bold = true;
+        t
+    }
+
+    #[test]
+    fn draw_menu_paints_box_drawing_border() {
+        let cols = 80u16;
+        let rows = 24u16;
+        let mut buf = fresh_buf(cols, rows);
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let pos = at(cols);
+        assert_eq!(buf[pos(rect.x, rect.y)].ch, '┌');
+        assert_eq!(buf[pos(rect.x + rect.w - 1, rect.y)].ch, '┐');
+        assert_eq!(buf[pos(rect.x, rect.y + rect.h - 1)].ch, '└');
+        assert_eq!(buf[pos(rect.x + rect.w - 1, rect.y + rect.h - 1)].ch, '┘');
+        assert_eq!(buf[pos(rect.x + 1, rect.y)].ch, '─');
+        assert_eq!(buf[pos(rect.x + 1, rect.y + rect.h - 1)].ch, '─');
+        assert_eq!(buf[pos(rect.x, rect.y + 1)].ch, '│');
+        assert_eq!(buf[pos(rect.x + rect.w - 1, rect.y + 1)].ch, '│');
+        assert_eq!(buf[pos(rect.x, rect.y)].style.fg, theme.menu_border_fg);
+        assert_eq!(buf[pos(rect.x, rect.y)].style.bg, theme.menu_bg);
+    }
+
+    #[test]
+    fn draw_menu_label_is_left_aligned_with_one_pad() {
+        let cols = 80u16;
+        let rows = 24u16;
+        let mut buf = fresh_buf(cols, rows);
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let pos = at(cols);
+        let row_y = rect.y + 1;
+        assert_eq!(buf[pos(rect.x + 1, row_y)].ch, ' ');
+        let label = "Split Vertically";
+        for (i, c) in label.chars().enumerate() {
+            assert_eq!(
+                buf[pos(rect.x + 2 + i as u16, row_y)].ch, c,
+                "label char {i} mismatch at row 0"
+            );
+        }
+        let interior_right = rect.x + rect.w - 2;
+        for x in (rect.x + 2 + label.len() as u16)..=interior_right {
+            assert_eq!(buf[pos(x, row_y)].ch, ' ', "non-pad char at x={x}");
+        }
+    }
+
+    #[test]
+    fn draw_menu_highlight_paints_full_row_including_pads() {
+        let cols = 80u16;
+        let rows = 24u16;
+        let mut buf = fresh_buf(cols, rows);
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 1,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let pos = at(cols);
+        let row_y = rect.y + 2;
+        let interior_left = rect.x + 1;
+        let interior_right = rect.x + rect.w - 2;
+        for x in interior_left..=interior_right {
+            assert_eq!(buf[pos(x, row_y)].style.bg, theme.menu_highlight_bg);
+            assert_eq!(buf[pos(x, row_y)].style.fg, theme.menu_highlight_fg);
+            assert!(buf[pos(x, row_y)].style.bold);
+        }
+        let other_row_y = rect.y + 1;
+        assert_eq!(buf[pos(interior_left, other_row_y)].style.bg, theme.menu_bg);
+        assert!(!buf[pos(interior_left, other_row_y)].style.bold);
+    }
+
+    #[test]
+    fn draw_menu_never_writes_outside_resolved_rect() {
+        let cols = 80u16;
+        let rows = 24u16;
+        let mut buf = fresh_buf(cols, rows);
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let pos = at(cols);
+        let default_cell = StyledCell::default();
+        assert_eq!(buf[pos(rect.x + rect.w, rect.y)], default_cell);
+        assert_eq!(buf[pos(rect.x + rect.w, rect.y + rect.h - 1)], default_cell);
+        assert_eq!(buf[pos(rect.x, rect.y + rect.h)], default_cell);
+        if rect.x > 0 {
+            assert_eq!(buf[pos(rect.x - 1, rect.y)], default_cell);
+        }
+        if rect.y > 0 {
+            assert_eq!(buf[pos(rect.x, rect.y - 1)], default_cell);
+        }
+    }
+
+    #[test]
+    fn draw_menu_overwrites_pane_cells_in_its_footprint() {
+        let cols = 80u16;
+        let rows = 24u16;
+        let mut buf = fresh_buf(cols, rows);
+        let pane_fill = StyledCell {
+            ch: 'X',
+            style: CellStyle {
+                fg: Color::Rgb(99, 99, 99),
+                bg: Color::Rgb(88, 88, 88),
+                ..Default::default()
+            },
+        };
+        for cell in buf.iter_mut() {
+            *cell = pane_fill;
+        }
+
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (10, 5),
+            highlighted: 0,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let pos = at(cols);
+        assert_eq!(buf[pos(rect.x, rect.y)].style.bg, theme.menu_bg);
+        assert_ne!(buf[pos(rect.x, rect.y)].style.bg, pane_fill.style.bg);
+        assert_eq!(buf[pos(rect.x + rect.w, rect.y)], pane_fill);
+    }
+
+    #[test]
+    fn draw_menu_with_clipped_label_does_not_panic_and_truncates() {
+        let cols = 12u16;
+        let rows = 10u16;
+        let mut buf = fresh_buf(cols, rows);
+        let menu = MenuState {
+            kind: MenuKind::Pane { pane_id: 1 },
+            anchor: (1, 1),
+            highlighted: 0,
+        };
+        let content = Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = menu_theme();
+        let items = PANE_MENU_ITEMS;
+        let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap() as u16;
+
+        draw_menu(&mut buf, cols, &menu, items, &theme, content);
+
+        let rect = menu_rect(menu.anchor, content, items.len(), label_w);
+        assert!(rect.x + rect.w <= cols);
+        assert!(rect.y + rect.h <= rows);
     }
 }
