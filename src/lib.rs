@@ -12,4 +12,5 @@ pub mod procinfo;
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod sound;
 pub mod theme;
