@@ -65,6 +65,76 @@ pub const PANE_MENU_ITEMS: &[MenuItem] = &[
     MenuItem { label: "Exit",               command: Command::ClosePane       },
 ];
 
+use crate::layout::Rect;
+
+/// 1 cell of horizontal pad on each side of the label, plus 1 border cell
+/// on each side. Total width contribution beyond `label_w` is 4.
+const MENU_PAD_X: u16 = 1;
+const MENU_BORDER: u16 = 1;
+
+/// Resolve the menu's paint rect given the click anchor, the available
+/// `content_area`, and the menu's item count + label width. The algorithm:
+///
+/// 1. Start with top-left at the 0-based anchor cell.
+/// 2. Shift left if the natural right edge overflows `content_area.right`.
+/// 3. Flip up (anchor becomes bottom-left) if the natural bottom edge
+///    overflows `content_area.bottom`.
+/// 4. Hard-clip to `content_area` on both axes. If the content area is
+///    smaller than the natural menu, the rect ends up smaller — the
+///    caller is responsible for truncating cells gracefully.
+///
+/// The returned rect is always fully inside `content_area`.
+pub fn menu_rect(
+    anchor: (u16, u16),
+    content_area: Rect,
+    items_len: usize,
+    label_w: u16,
+) -> Rect {
+    let w = label_w
+        .saturating_add(2 * MENU_PAD_X)
+        .saturating_add(2 * MENU_BORDER);
+    let h = (items_len as u16).saturating_add(2 * MENU_BORDER);
+
+    let ax = anchor.0.saturating_sub(1);
+    let ay = anchor.1.saturating_sub(1);
+    let mut tlx = ax;
+    let mut tly = ay;
+
+    let right = content_area
+        .x
+        .saturating_add(content_area.w.saturating_sub(1));
+    let bottom = content_area
+        .y
+        .saturating_add(content_area.h.saturating_sub(1));
+
+    if tlx.saturating_add(w.saturating_sub(1)) > right {
+        tlx = right
+            .saturating_sub(w.saturating_sub(1))
+            .max(content_area.x);
+    }
+    if tly.saturating_add(h.saturating_sub(1)) > bottom {
+        tly = ay
+            .saturating_sub(h.saturating_sub(1))
+            .max(content_area.y);
+    }
+
+    let x0 = tlx.max(content_area.x);
+    let y0 = tly.max(content_area.y);
+    let x1 = tlx
+        .saturating_add(w.saturating_sub(1))
+        .min(right);
+    let y1 = tly
+        .saturating_add(h.saturating_sub(1))
+        .min(bottom);
+
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1.saturating_sub(x0).saturating_add(1),
+        h: y1.saturating_sub(y0).saturating_add(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +223,69 @@ mod tests {
         };
         menu.move_up();
         assert_eq!(menu.highlighted, 1);
+    }
+
+    use crate::layout::Rect;
+
+    fn area(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn menu_rect_no_clip_when_anchor_fits() {
+        let r = menu_rect((10, 5), area(0, 0, 80, 24), 4, 18);
+        assert_eq!(r, Rect { x: 9, y: 4, w: 22, h: 6 });
+    }
+
+    #[test]
+    fn menu_rect_shifts_left_when_overflowing_right() {
+        let r = menu_rect((75, 5), area(0, 0, 80, 24), 4, 18);
+        assert_eq!(r.x, 58);
+        assert_eq!(r.w, 22);
+        assert_eq!(r.x + r.w - 1, 79);
+    }
+
+    #[test]
+    fn menu_rect_flips_up_when_overflowing_bottom() {
+        let r = menu_rect((10, 22), area(0, 0, 80, 24), 4, 18);
+        assert_eq!(r.x, 9);
+        assert_eq!(r.y, 16);
+        assert_eq!(r.h, 6);
+        assert_eq!(r.y + r.h - 1, 21);
+    }
+
+    #[test]
+    fn menu_rect_shifts_and_flips_when_both_edges_overflow() {
+        let r = menu_rect((75, 22), area(0, 0, 80, 24), 4, 18);
+        assert_eq!(r.x, 58);
+        assert_eq!(r.y, 16);
+        assert_eq!(r.w, 22);
+        assert_eq!(r.h, 6);
+    }
+
+    #[test]
+    fn menu_rect_clamps_to_content_area_when_tiny() {
+        let r = menu_rect((1, 1), area(0, 0, 10, 4), 4, 18);
+        assert!(r.w <= 10);
+        assert!(r.h <= 4);
+        assert!(r.x + r.w <= 10);
+        assert!(r.y + r.h <= 4);
+    }
+
+    #[test]
+    fn menu_rect_never_overlaps_status_bar_or_sidebar() {
+        let content = area(20, 0, 60, 23);
+        let r = menu_rect((79, 23), content, 4, 18);
+        assert!(r.x >= content.x);
+        assert!(r.y >= content.y);
+        assert!(r.x + r.w <= content.x + content.w);
+        assert!(r.y + r.h <= content.y + content.h);
+    }
+
+    #[test]
+    fn menu_rect_respects_content_area_left_origin() {
+        let r = menu_rect((6, 3), area(5, 2, 30, 10), 4, 18);
+        assert_eq!(r.x, 5);
+        assert_eq!(r.y, 2);
     }
 }
