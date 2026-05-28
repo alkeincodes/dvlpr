@@ -422,22 +422,29 @@ fn blit_pane(buf: &mut [StyledCell], cols: u16, rect: Rect, pane: &dyn PaneCells
 /// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
 /// focused pane). Junctions where dividers cross are simple last-write-wins
 /// overwrites (proper `┼` junctions are deferred polish).
-fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool, _theme: &crate::theme::Theme) {
+fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool, theme: &crate::theme::Theme) {
     let glyph = match (d.dir, heavy) {
         (SplitDir::Vertical, false) => '│',
         (SplitDir::Vertical, true) => '┃',
         (SplitDir::Horizontal, false) => '─',
         (SplitDir::Horizontal, true) => '━',
     };
+    // Heavy dividers (focused-pane borders) carry the active-tab accent as fg.
+    // Light dividers stay unstyled — they only need the box-drawing character.
+    let style = if heavy {
+        CellStyle {
+            fg: theme.active_tab_bg,
+            ..CellStyle::default()
+        }
+    } else {
+        CellStyle::default()
+    };
     for y in d.rect.y..d.rect.y + d.rect.h {
         for x in d.rect.x..d.rect.x + d.rect.w {
             let idx = y as usize * cols as usize + x as usize;
             if idx < buf.len() {
-                // Chrome (dividers) is unstyled; overwrite any pane style underneath.
-                buf[idx] = StyledCell {
-                    ch: glyph,
-                    style: CellStyle::default(),
-                };
+                // Chrome (dividers) overwrites any pane style underneath.
+                buf[idx] = StyledCell { ch: glyph, style };
             }
         }
     }
@@ -664,11 +671,29 @@ mod tests {
             dir: SplitDir::Vertical,
         };
         let at = |r: usize, c: usize| r * cols as usize + c;
-        draw_divider(&mut buf, cols, &d, false, &crate::theme::Theme::default());
+        // Theme with a sentinel active accent so we can recognise it in the buffer.
+        let theme = crate::theme::Theme {
+            active_tab_bg: Color::Rgb(99, 99, 99),
+            ..crate::theme::Theme::default()
+        };
+
+        // Light divider (heavy = false): glyph is the light one and style is default.
+        draw_divider(&mut buf, cols, &d, false, &theme);
         assert_eq!(buf[at(0, 2)].ch, '│');
         assert_eq!(buf[at(1, 2)].ch, '│');
-        draw_divider(&mut buf, cols, &d, true, &crate::theme::Theme::default());
-        assert_eq!(buf[at(0, 2)].ch, '┃'); // heavy
+        assert_eq!(buf[at(0, 2)].style, CellStyle::default());
+        assert_eq!(buf[at(1, 2)].style, CellStyle::default());
+
+        // Heavy divider (heavy = true): glyph is the heavy one AND the fg
+        // carries the active accent (Color::Rgb(99, 99, 99)). All other style
+        // fields stay default (no bg, no bold).
+        draw_divider(&mut buf, cols, &d, true, &theme);
+        assert_eq!(buf[at(0, 2)].ch, '┃');
+        assert_eq!(buf[at(1, 2)].ch, '┃');
+        assert_eq!(buf[at(0, 2)].style.fg, Color::Rgb(99, 99, 99));
+        assert_eq!(buf[at(1, 2)].style.fg, Color::Rgb(99, 99, 99));
+        assert_eq!(buf[at(0, 2)].style.bg, Color::Default, "heavy divider has no bg");
+        assert!(!buf[at(0, 2)].style.bold, "heavy divider is not bold");
     }
 
     #[test]
@@ -853,7 +878,13 @@ mod tests {
         );
         let s = String::from_utf8(out).unwrap();
         // content h=1: avail=6, first_w=3 (x0..2), divider x3, right x4..6.
-        assert!(s.contains("LLL┃RRR")); // heavy divider because pane 1 is focused
+        // The heavy divider now carries an fg SGR escape between the left
+        // pane's "LLL" and the "┃" glyph, so the contiguous "LLL┃RRR"
+        // substring no longer holds. Assert the three components separately;
+        // divider style is covered by draw_divider_fills_with_light_or_heavy_glyph.
+        assert!(s.contains("LLL"), "left pane content present");
+        assert!(s.contains("┃"), "heavy divider glyph present");
+        assert!(s.contains("RRR"), "right pane content present");
     }
 
     #[test]
