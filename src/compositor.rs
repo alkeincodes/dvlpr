@@ -155,8 +155,7 @@ impl Compositor {
         let focused_rect = rects.iter().find(|(id, _)| *id == focused).map(|(_, r)| *r);
         if !zoomed {
             for d in layout::dividers(root, content) {
-                let heavy = focused_rect.is_some_and(|fr| divider_touches(&d, fr));
-                draw_divider(&mut buf, cols, &d, heavy, theme);
+                draw_divider(&mut buf, cols, &d, focused_rect, theme);
             }
         }
 
@@ -419,28 +418,33 @@ fn blit_pane(buf: &mut [StyledCell], cols: u16, rect: Rect, pane: &dyn PaneCells
     }
 }
 
-/// Fill a divider's cells with a box-drawing glyph (heavy when it borders the
-/// focused pane). Junctions where dividers cross are simple last-write-wins
-/// overwrites (proper `┼` junctions are deferred polish).
-fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: bool, theme: &crate::theme::Theme) {
-    let glyph = match (d.dir, heavy) {
-        (SplitDir::Vertical, false) => '│',
-        (SplitDir::Vertical, true) => '┃',
-        (SplitDir::Horizontal, false) => '─',
-        (SplitDir::Horizontal, true) => '━',
-    };
-    // Heavy dividers (focused-pane borders) carry the active-tab accent as fg.
-    // Light dividers stay unstyled — they only need the box-drawing character.
-    let style = if heavy {
-        CellStyle {
-            fg: theme.active_tab_bg,
-            ..CellStyle::default()
-        }
-    } else {
-        CellStyle::default()
+/// Fill a divider's cells with a box-drawing glyph. Each cell is heavy iff it
+/// is immediately adjacent to the focused pane along the perpendicular axis —
+/// so a long divider that runs past several stacked panes only goes heavy on
+/// the segment that borders the focused one, and stays light elsewhere.
+/// Junctions where dividers cross are simple last-write-wins overwrites
+/// (proper `┼` junctions are deferred polish).
+fn draw_divider(
+    buf: &mut [StyledCell],
+    cols: u16,
+    d: &layout::Divider,
+    focused: Option<Rect>,
+    theme: &crate::theme::Theme,
+) {
+    let heavy_style = CellStyle {
+        fg: theme.active_tab_bg,
+        ..CellStyle::default()
     };
     for y in d.rect.y..d.rect.y + d.rect.h {
         for x in d.rect.x..d.rect.x + d.rect.w {
+            let heavy = focused.is_some_and(|fr| cell_borders_focused(d.dir, x, y, fr));
+            let glyph = match (d.dir, heavy) {
+                (SplitDir::Vertical, false) => '│',
+                (SplitDir::Vertical, true) => '┃',
+                (SplitDir::Horizontal, false) => '─',
+                (SplitDir::Horizontal, true) => '━',
+            };
+            let style = if heavy { heavy_style } else { CellStyle::default() };
             let idx = y as usize * cols as usize + x as usize;
             if idx < buf.len() {
                 // Chrome (dividers) overwrites any pane style underneath.
@@ -450,22 +454,21 @@ fn draw_divider(buf: &mut [StyledCell], cols: u16, d: &layout::Divider, heavy: b
     }
 }
 
-/// True if divider `d` lies on an edge of the `focused` rect (so it should be
-/// drawn heavy). Adjacency = the divider's line is immediately beside the rect
-/// along the split axis AND the perpendicular ranges overlap.
-fn divider_touches(d: &layout::Divider, focused: Rect) -> bool {
-    match d.dir {
+/// True if a single divider cell at `(x, y)` along axis `dir` lies on an edge
+/// of the focused rect. For a vertical divider, the cell is heavy when its
+/// column is the focused rect's left or right edge AND its row falls within
+/// the focused rect's vertical span. Horizontal is the dual.
+fn cell_borders_focused(dir: SplitDir, x: u16, y: u16, focused: Rect) -> bool {
+    match dir {
         SplitDir::Vertical => {
-            let dx = d.rect.x;
-            let col_adjacent = dx == focused.x + focused.w || dx + 1 == focused.x;
-            let rows_overlap = d.rect.y < focused.y + focused.h && focused.y < d.rect.y + d.rect.h;
-            col_adjacent && rows_overlap
+            let col_adjacent = x == focused.x + focused.w || x + 1 == focused.x;
+            let row_inside = focused.y <= y && y < focused.y + focused.h;
+            col_adjacent && row_inside
         }
         SplitDir::Horizontal => {
-            let dy = d.rect.y;
-            let row_adjacent = dy == focused.y + focused.h || dy + 1 == focused.y;
-            let cols_overlap = d.rect.x < focused.x + focused.w && focused.x < d.rect.x + d.rect.w;
-            row_adjacent && cols_overlap
+            let row_adjacent = y == focused.y + focused.h || y + 1 == focused.y;
+            let col_inside = focused.x <= x && x < focused.x + focused.w;
+            row_adjacent && col_inside
         }
     }
 }
@@ -679,17 +682,17 @@ mod tests {
             ..crate::theme::Theme::default()
         };
 
-        // Light divider (heavy = false): glyph is the light one and style is default.
-        draw_divider(&mut buf, cols, &d, false, &theme);
+        // No focused rect: every cell is light (default glyph + default style).
+        draw_divider(&mut buf, cols, &d, None, &theme);
         assert_eq!(buf[at(0, 2)].ch, '│');
         assert_eq!(buf[at(1, 2)].ch, '│');
         assert_eq!(buf[at(0, 2)].style, CellStyle::default());
         assert_eq!(buf[at(1, 2)].style, CellStyle::default());
 
-        // Heavy divider (heavy = true): glyph is the heavy one AND the fg
-        // carries the active accent (Color::Rgb(99, 99, 99)). All other style
-        // fields stay default (no bg, no bold).
-        draw_divider(&mut buf, cols, &d, true, &theme);
+        // Focused rect immediately to the right of the divider, spanning both
+        // rows: every cell of the divider is heavy with the active accent fg.
+        let focused = Rect { x: 3, y: 0, w: 2, h: 2 };
+        draw_divider(&mut buf, cols, &d, Some(focused), &theme);
         assert_eq!(buf[at(0, 2)].ch, '┃');
         assert_eq!(buf[at(1, 2)].ch, '┃');
         assert_eq!(buf[at(0, 2)].style.fg, Color::Rgb(99, 99, 99));
@@ -699,39 +702,43 @@ mod tests {
     }
 
     #[test]
-    fn divider_touches_detects_adjacency() {
-        // Two panes side by side in a width-11 area: left x0..=4, divider x5, right x6..=10.
-        let div = Divider {
-            rect: Rect {
-                x: 5,
-                y: 0,
-                w: 1,
-                h: 4,
-            },
+    fn draw_divider_only_heavy_in_focused_segment() {
+        // Regression: a vertical divider that spans three stacked panes used to
+        // go fully heavy whenever any of those panes was focused, because the
+        // adjacency check was per-divider, not per-cell. With the focused pane
+        // being the middle slab, only the middle three rows of the divider
+        // should be heavy; the rows adjacent to the top and bottom slabs stay
+        // light.
+        let cols: u16 = 5;
+        let mut buf = vec![StyledCell::default(); 5 * 9];
+        // Vertical divider 1 col wide x 9 tall at x=2. Three slabs to its left:
+        // top y=0..3, middle y=3..6, bottom y=6..9. Focus = middle slab.
+        let d = Divider {
+            rect: Rect { x: 2, y: 0, w: 1, h: 9 },
             path: vec![],
             dir: SplitDir::Vertical,
         };
-        let left = Rect {
-            x: 0,
-            y: 0,
-            w: 5,
-            h: 4,
+        let focused_middle = Rect { x: 0, y: 3, w: 2, h: 3 };
+        let theme = crate::theme::Theme {
+            active_tab_bg: Color::Rgb(99, 99, 99),
+            ..crate::theme::Theme::default()
         };
-        let right = Rect {
-            x: 6,
-            y: 0,
-            w: 5,
-            h: 4,
-        };
-        assert!(divider_touches(&div, left)); // divider is on left pane's right edge
-        assert!(divider_touches(&div, right)); // divider is on right pane's left edge
-        let elsewhere = Rect {
-            x: 0,
-            y: 10,
-            w: 5,
-            h: 4,
-        };
-        assert!(!divider_touches(&div, elsewhere)); // no row overlap
+        let at = |r: usize, c: usize| r * cols as usize + c;
+
+        draw_divider(&mut buf, cols, &d, Some(focused_middle), &theme);
+
+        for y in 0..3 {
+            assert_eq!(buf[at(y, 2)].ch, '│', "y={y} (top slab) should be light");
+            assert_eq!(buf[at(y, 2)].style, CellStyle::default(), "y={y} default style");
+        }
+        for y in 3..6 {
+            assert_eq!(buf[at(y, 2)].ch, '┃', "y={y} (focused middle) should be heavy");
+            assert_eq!(buf[at(y, 2)].style.fg, Color::Rgb(99, 99, 99), "y={y} carries accent");
+        }
+        for y in 6..9 {
+            assert_eq!(buf[at(y, 2)].ch, '│', "y={y} (bottom slab) should be light");
+            assert_eq!(buf[at(y, 2)].style, CellStyle::default(), "y={y} default style");
+        }
     }
 
     #[test]
