@@ -452,6 +452,13 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub fn dialog_clear_for_test(&mut self) {
+        if let Some(d) = self.dialog.as_mut() {
+            d.buffer.clear();
+        }
+    }
+
     /// Open the New Window dialog. Closes any open menu (mutual exclusion).
     pub fn open_new_window_dialog(&mut self) {
         self.menu = None;
@@ -3816,5 +3823,28 @@ mod tests {
         // The new window is auto: a refresh CAN rename it.
         s.refresh_window_names(|_| Some("zsh".to_string()));
         assert_eq!(*s.window_names_for_test().last().unwrap(), "zsh");
+    }
+
+    #[tokio::test]
+    async fn rename_submit_pins_and_empty_submit_unpins() {
+        let mut s = test_session();
+        // Pin window 0 to "api" via the rename dialog.
+        s.open_rename_dialog(0);
+        // Clear the pre-filled buffer first.
+        s.dialog_clear_for_test();
+        for c in "api".chars() {
+            s.dialog_insert_for_test(c);
+        }
+        s.submit_dialog();
+        assert_eq!(s.window_names_for_test()[0], "api");
+        s.refresh_window_names(|_| Some("zsh".to_string()));
+        assert_eq!(s.window_names_for_test()[0], "api", "pinned, not overwritten");
+
+        // Now open rename again, clear to empty, submit → un-pin, re-derive.
+        s.open_rename_dialog(0);
+        s.dialog_clear_for_test();
+        s.submit_dialog();
+        s.refresh_window_names(|_| Some("zsh".to_string()));
+        assert_eq!(s.window_names_for_test()[0], "zsh", "un-pinned, now auto again");
     }
 }
