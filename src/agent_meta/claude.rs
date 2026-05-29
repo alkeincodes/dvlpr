@@ -1,8 +1,9 @@
 //! Derive a display label for a Claude session, scraping
 //! `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. Priority: a
-//! `custom-title` event from `/rename`, then the first user message,
-//! then the JSONL filename's last 8 characters as a UUID-tail
-//! fallback.
+//! `custom-title` event from `/rename`, then the LATEST user message
+//! (so the label tracks what the session is currently working on, not
+//! the opening prompt frozen forever), then the JSONL filename's last
+//! 8 characters as a UUID-tail fallback.
 
 use std::path::{Path, PathBuf};
 
@@ -85,12 +86,13 @@ fn read_capped(path: &Path, cap: usize, head_tail: usize) -> std::io::Result<Str
 }
 
 fn scan_label(text: &str) -> Option<String> {
-    // Pass 1: any custom-title event (highest priority).
+    // Pass 1: any custom-title event (highest priority — explicit /rename).
     if let Some(title) = scan_custom_title(text) {
         return Some(title);
     }
-    // Pass 2: first user message whose content is a non-empty string.
-    scan_first_user_message(text)
+    // Pass 2: the LATEST user message whose content is a non-empty,
+    // non-meta string — so the label follows the current topic.
+    scan_latest_user_message(text)
 }
 
 fn scan_custom_title(text: &str) -> Option<String> {
@@ -115,7 +117,11 @@ fn scan_custom_title(text: &str) -> Option<String> {
     None
 }
 
-fn scan_first_user_message(text: &str) -> Option<String> {
+fn scan_latest_user_message(text: &str) -> Option<String> {
+    // Walk every line and keep the LAST qualifying user message. We can't
+    // early-return on first match here — the newest prompt is at the end of
+    // the JSONL (and, for capped reads, inside the tail chunk).
+    let mut latest: Option<String> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -123,24 +129,43 @@ fn scan_first_user_message(text: &str) -> Option<String> {
         }
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => continue, // partial line from a head+tail read, etc.
         };
         if v.get("type").and_then(|t| t.as_str()) != Some("user") {
             continue;
         }
         // Look for `message.content` as a string. Skip when it's a
-        // structured object (tool-call payloads etc.).
-        let content = v.pointer("/message/content").or_else(|| v.get("content"))?;
+        // structured object (tool_result payloads etc.).
+        let Some(content) = v.pointer("/message/content").or_else(|| v.get("content")) else {
+            continue;
+        };
         if let Some(s) = content.as_str() {
+            if is_meta_user_content(s) {
+                continue;
+            }
             // Strip leading whitespace; collapse runs of whitespace
             // into single spaces.
             let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
             if !collapsed.is_empty() {
-                return Some(collapsed);
+                latest = Some(collapsed);
             }
         }
     }
-    None
+    latest
+}
+
+/// True when a string-content user message is a harness-generated meta
+/// entry rather than something the user typed — slash-command invocations
+/// (`<command-message>…`/`<command-name>…`), local command stdout, memory
+/// inputs, system reminders, and the trust-folder caveat banner. These
+/// would make noisy titles, so they never win the "latest message" slot.
+fn is_meta_user_content(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("<command-")
+        || t.starts_with("<local-command-")
+        || t.starts_with("<user-memory-")
+        || t.starts_with("<system-reminder")
+        || t.starts_with("Caveat:")
 }
 
 fn uuid_tail_from_path(path: &Path) -> Option<String> {
@@ -223,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn session_label_falls_back_to_first_user_message_when_no_custom_title() {
+    fn session_label_falls_back_to_user_message_when_no_custom_title() {
         with_home(|home| {
             let project = Path::new("/tmp/project-b");
             make_fixture(
@@ -239,6 +264,51 @@ mod tests {
             assert_eq!(
                 session_label_with_home(project, home).as_deref(),
                 Some("refactor the auth flow")
+            );
+        });
+    }
+
+    #[test]
+    fn session_label_tracks_latest_user_message_not_first() {
+        with_home(|home| {
+            let project = Path::new("/tmp/project-latest");
+            make_fixture(
+                home,
+                project,
+                "deadbee2.jsonl",
+                concat!(
+                    "{\"type\":\"user\",\"message\":{\"content\":\"first prompt\"}}\n",
+                    "{\"type\":\"assistant\",\"message\":{\"content\":\"ok\"}}\n",
+                    // tool_result echo (structured) — must be ignored.
+                    "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\"}]}}\n",
+                    "{\"type\":\"user\",\"message\":{\"content\":\"second prompt\"}}\n",
+                ),
+            );
+            assert_eq!(
+                session_label_with_home(project, home).as_deref(),
+                Some("second prompt")
+            );
+        });
+    }
+
+    #[test]
+    fn session_label_skips_meta_command_entries_for_latest() {
+        with_home(|home| {
+            let project = Path::new("/tmp/project-meta");
+            make_fixture(
+                home,
+                project,
+                "deadbee3.jsonl",
+                concat!(
+                    "{\"type\":\"user\",\"message\":{\"content\":\"fix the sidebar\"}}\n",
+                    // A slash-command invocation logs as a string user message —
+                    // it must NOT become the title.
+                    "{\"type\":\"user\",\"message\":{\"content\":\"<command-message>codex-review</command-message>\\n<command-name>/codex-review</command-name>\"}}\n",
+                ),
+            );
+            assert_eq!(
+                session_label_with_home(project, home).as_deref(),
+                Some("fix the sidebar")
             );
         });
     }

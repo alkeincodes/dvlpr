@@ -721,9 +721,18 @@ fn draw_sidebar(
             / 2;
     write_cell(buf, rect.y, header_x, header, header_style);
 
-    // Divider on row 1.
+    // Divider on row 1. Join it to the vertical separator with a `├` tee at
+    // column rect.x so the header underline reads as one connected border
+    // (was a `│────` seam where the bar and rule merely abutted).
     let divider = "─".repeat(rect.w.saturating_sub(1) as usize);
     write_cell(buf, rect.y + 1, rect.x + 1, &divider, header_style);
+    let junction_idx = ((rect.y + 1) as usize) * (cols as usize) + (rect.x as usize);
+    if junction_idx < buf.len() {
+        buf[junction_idx] = StyledCell {
+            ch: '├',
+            style: sep_style,
+        };
+    }
 
     if entries.is_empty() {
         let empty = "(no agents)";
@@ -2008,6 +2017,25 @@ mod tests {
         draw_sidebar(&mut buf, cols, rect, &theme, &entries);
         let row0: String = (0..cols).map(|x| buf[x as usize].ch).collect();
         assert!(row0.contains("AGENTS"), "row0: {row0:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_divider_joins_vertical_separator_with_tee() {
+        // The header underline (row 1) must connect to the left border with a
+        // `├` junction — no `│────` seam.
+        let cols: u16 = 20;
+        let rows: u16 = 6;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        // Place the sidebar at a non-zero x so we exercise rect.x, not col 0.
+        let rect = layout::Rect { x: 4, y: 0, w: 16, h: rows };
+        let theme = crate::theme::Theme::default();
+        draw_sidebar(&mut buf, cols, rect, &theme, &[]);
+        let sep_row0 = buf[(0 * cols as usize) + rect.x as usize].ch;
+        let junction = buf[(1 * cols as usize) + rect.x as usize].ch;
+        let after_junction = buf[(1 * cols as usize) + (rect.x as usize) + 1].ch;
+        assert_eq!(sep_row0, '│', "vertical bar above the divider");
+        assert_eq!(junction, '├', "tee where the divider meets the bar");
+        assert_eq!(after_junction, '─', "divider continues to the right");
     }
 
     #[test]

@@ -9,15 +9,20 @@
 use super::AgentState;
 
 /// Approval / question overlay markers. Any present (case-insensitive) ⇒
-/// Blocked. The five titles are one per Codex approval kind; the footer rule
-/// (`to confirm` AND `to cancel`, both present) catches overlay variants whose
-/// title wording drifts.
+/// Blocked. The approval titles are one per Codex approval kind; the
+/// trust-directory prompt is the onboarding gate Codex shows on first run
+/// in an untrusted cwd; the footer rule (`to confirm` AND `to cancel`,
+/// both present) catches overlay variants whose title wording drifts.
 const BLOCKED_MARKERS: &[&str] = &[
     "would you like to run the following command?",
     "would you like to make the following edits?",
     "would you like to grant these permissions?",
     "do you want to approve network access to",
     "needs your approval",
+    // Onboarding trust gate: "Do you trust the contents of this directory?"
+    // with a `1. Yes, continue / 2. No, quit` menu. None of the approval
+    // titles nor the confirm/cancel footer appear, so match it directly.
+    "do you trust the contents of this directory",
 ];
 
 /// Live status-line marker ⇒ Working. Codex renders `Working (Ns • <key> to
@@ -48,7 +53,39 @@ fn is_blocked(lower: &str) -> bool {
         return true;
     }
     // Footer present on every approval overlay regardless of title wording.
-    lower.contains("to confirm") && lower.contains("to cancel")
+    if lower.contains("to confirm") && lower.contains("to cancel") {
+        return true;
+    }
+    // Structural fallback: a `› N.` selection cursor on a numbered option.
+    // Every Codex select widget (approval, trust gate, custom "ask the user"
+    // prompts) renders this, so it catches question shapes whose wording
+    // isn't enumerated above. We match ONLY Codex's `›` cursor, never
+    // Claude's `❯` — a Claude-style prompt leaking into a Codex pane must
+    // not block (see `refresh_agent_states_codex_ignores_claude_only_prompt`).
+    has_numbered_selection(lower)
+}
+
+/// A `›` selection cursor immediately followed (after optional spaces) by
+/// one or more digits and a `.` — i.e. the highlighted row of a Codex
+/// numbered menu. `to_ascii_lowercase` leaves `›`, digits, and `.`
+/// untouched, so matching on the lowercased tail is fine.
+fn has_numbered_selection(tail: &str) -> bool {
+    const CURSOR: char = '›';
+    tail.lines().any(|line| {
+        let Some(idx) = line.find(CURSOR) else {
+            return false;
+        };
+        let after = line[idx + CURSOR.len_utf8()..].trim_start();
+        let mut saw_digit = false;
+        for c in after.chars() {
+            if c.is_ascii_digit() {
+                saw_digit = true;
+            } else {
+                return saw_digit && c == '.';
+            }
+        }
+        false
+    })
 }
 
 fn is_working(lower: &str) -> bool {
@@ -81,6 +118,40 @@ mod tests {
         ] {
             assert_eq!(classify(title), AgentState::Blocked, "title: {title}");
         }
+    }
+
+    #[test]
+    fn blocked_on_trust_directory_prompt() {
+        // Codex onboarding trust gate — no approval title, no confirm/cancel
+        // footer. Regression for the sidebar showing Idle while Codex waits.
+        let tail = "You are in /Users/alkein\n\
+                    Do you trust the contents of this directory? Working with \
+                    untrusted contents comes with higher risk of prompt injection.\n\
+                    › 1. Yes, continue\n  2. No, quit\n\nPress enter to continue\n";
+        assert_eq!(classify(tail), AgentState::Blocked);
+    }
+
+    #[test]
+    fn blocked_on_numbered_selection_cursor_alone() {
+        // Structural fallback: a `› N.` menu with arbitrary wording (a custom
+        // "ask the user" prompt) must still block.
+        let tail = "Which option do you prefer?\n› 1. Option A\n  2. Option B\n";
+        assert_eq!(classify(tail), AgentState::Blocked);
+    }
+
+    #[test]
+    fn numbered_selection_requires_digit_then_dot() {
+        // A `›` cursor without a numbered option (e.g. the empty composer
+        // prompt), or a digit not followed by `.`, must NOT block.
+        assert_eq!(classify("› Ask Codex to do anything"), AgentState::Idle);
+        assert_eq!(classify("› 1 banana"), AgentState::Idle);
+    }
+
+    #[test]
+    fn claude_caret_cursor_does_not_block_codex() {
+        // Claude's `❯ N.` cursor leaking into a Codex pane must stay Idle —
+        // the structural fallback is `›`-only.
+        assert_eq!(classify("Pick:\n❯ 1. Yes\n  2. No\n"), AgentState::Idle);
     }
 
     #[test]

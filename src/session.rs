@@ -189,7 +189,11 @@ impl Session {
             rows,
             command,
             cwd,
-            sidebar_visible: false,
+            // Open by default: the agent-awareness sidebar is the product's
+            // headline feature, so it's visible on startup (toggle with the
+            // ToggleSidebar binding). `compute_regions` still suppresses it
+            // when the viewport is too narrow to keep usable content width.
+            sidebar_visible: true,
             menu: None,
             sidebar_width,
             prefix,
@@ -1727,7 +1731,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .to_string();
-        let (session, pane_id, rx) = Session::new(
+        let (mut session, pane_id, rx) = Session::new(
             "test".to_string(),
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
             cwd,
@@ -1739,6 +1743,12 @@ mod tests {
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("Session::new");
+        // Pin a hidden sidebar as the geometry baseline so pane-width / cursor
+        // assertions stay stable. The production default is now visible (see
+        // `new_session_defaults_to_visible_sidebar`); sidebar-specific tests
+        // toggle it on explicitly.
+        session.sidebar_visible = false;
+        session.relayout_all();
         (session, pane_id, rx)
     }
 
@@ -2554,12 +2564,40 @@ mod tests {
 
     #[tokio::test]
     async fn toggle_sidebar_flips_visible() {
+        // The shared helper pins the sidebar hidden as its geometry baseline.
         let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
-        assert!(!session.sidebar_visible, "default hidden");
+        assert!(!session.sidebar_visible, "helper baseline is hidden");
         session.toggle_sidebar();
         assert!(session.sidebar_visible);
         session.toggle_sidebar();
         assert!(!session.sidebar_visible);
+    }
+
+    #[tokio::test]
+    async fn new_session_defaults_to_visible_sidebar() {
+        // Production default: a freshly constructed session shows the sidebar
+        // when the viewport is wide enough to keep usable content width.
+        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let (session, _pane, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            80,
+            10,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        )
+        .expect("Session::new");
+        assert!(session.sidebar_visible, "sidebar open by default");
+        // At 80 cols the sidebar is wide enough to actually render.
+        let regions = layout::compute_regions(
+            session.viewport(),
+            session.sidebar_visible,
+            session.sidebar_width,
+        );
+        assert!(regions.sidebar.is_some(), "sidebar region present at 80 cols");
     }
 
     #[tokio::test]
