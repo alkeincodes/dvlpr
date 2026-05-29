@@ -1,3 +1,4 @@
+pub mod agent_meta;
 pub mod client;
 pub mod compositor;
 pub mod config;
@@ -12,4 +13,5 @@ pub mod procinfo;
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod sound;
 pub mod theme;

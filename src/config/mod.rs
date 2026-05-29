@@ -123,6 +123,37 @@ impl FromStr for KeySpec {
     }
 }
 
+/// Runtime configuration for the agent-awareness sidebar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarConfig {
+    pub width: u16,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        SidebarConfig {
+            width: crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        }
+    }
+}
+
+/// Runtime configuration for the blocked-notification sound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SoundConfig {
+    pub enabled: bool,
+    /// Override path. `None` means use the embedded default sound.
+    pub blocked: Option<String>,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        SoundConfig {
+            enabled: true,
+            blocked: None,
+        }
+    }
+}
+
 /// The command keymap (one binding per command; SelectWindow is implicit digits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyMap {
@@ -156,11 +187,13 @@ impl Default for KeyMap {
 /// malformed-prefix fallback in `from_toml_str` consume this.
 const DEFAULT_PREFIX: KeySpec = KeySpec::Ctrl('b');
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub prefix: KeySpec,
     pub keys: KeyMap,
     pub theme: crate::theme::Theme,
+    pub sidebar: SidebarConfig,
+    pub sound: SoundConfig,
 }
 
 impl Default for Config {
@@ -169,6 +202,8 @@ impl Default for Config {
             prefix: DEFAULT_PREFIX,
             keys: KeyMap::default(),
             theme: crate::theme::Theme::default(),
+            sidebar: SidebarConfig::default(),
+            sound: SoundConfig::default(),
         }
     }
 }
@@ -182,6 +217,21 @@ struct RawConfig {
     keys: RawKeys,
     #[serde(default)]
     theme: RawTheme,
+    #[serde(default)]
+    sidebar: RawSidebar,
+    #[serde(default)]
+    sound: RawSound,
+}
+
+#[derive(Default, Deserialize)]
+struct RawSidebar {
+    width: Option<u16>,
+}
+
+#[derive(Default, Deserialize)]
+struct RawSound {
+    enabled: Option<bool>,
+    blocked: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -238,6 +288,44 @@ fn flavor_or_default(raw: &Option<String>) -> crate::theme::Theme {
     }
 }
 
+fn sidebar_from_raw(raw: &RawSidebar) -> SidebarConfig {
+    let width = match raw.width {
+        None => crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        Some(w) => {
+            let clamped = w.clamp(
+                crate::layout::SIDEBAR_WIDTH_MIN,
+                crate::layout::SIDEBAR_WIDTH_MAX,
+            );
+            if clamped != w {
+                tracing::warn!(
+                    requested = w,
+                    clamped,
+                    "sidebar.width out of range; clamped"
+                );
+            }
+            clamped
+        }
+    };
+    SidebarConfig { width }
+}
+
+fn sound_from_raw(raw: &RawSound) -> SoundConfig {
+    let enabled = raw.enabled.unwrap_or(true);
+    let blocked = raw.blocked.as_ref().map(|s| expand_tilde(s));
+    SoundConfig { enabled, blocked }
+}
+
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_default();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        return format!("{home}/{rest}");
+    }
+    path.to_string()
+}
+
 impl Config {
     /// Load from the first existing candidate in `config_path_candidates()`.
     /// All-missing or parse failure => all defaults (logged), never fatal. A
@@ -290,6 +378,8 @@ impl Config {
                 detach: spec_or_default(&raw.keys.detach, "detach", d.detach),
             },
             theme,
+            sidebar: sidebar_from_raw(&raw.sidebar),
+            sound: sound_from_raw(&raw.sound),
         }
     }
 
@@ -552,5 +642,49 @@ flavor = "one-dark"
             candidates,
             vec![PathBuf::from("/custom/xdg/dvlpr/config.toml")]
         );
+    }
+
+    #[test]
+    fn config_default_sidebar_width_is_26() {
+        let cfg = Config::default();
+        assert_eq!(cfg.sidebar.width, 26);
+    }
+
+    #[test]
+    fn config_default_sound_is_enabled_with_no_override_path() {
+        let cfg = Config::default();
+        assert!(cfg.sound.enabled);
+        assert!(cfg.sound.blocked.is_none(), "default uses embedded sound");
+    }
+
+    #[test]
+    fn config_parses_explicit_sidebar_width() {
+        let cfg = Config::from_toml_str("[sidebar]\nwidth = 30\n");
+        assert_eq!(cfg.sidebar.width, 30);
+    }
+
+    #[test]
+    fn config_clamps_sidebar_width_above_max() {
+        let cfg = Config::from_toml_str("[sidebar]\nwidth = 99\n");
+        assert_eq!(cfg.sidebar.width, 36);
+    }
+
+    #[test]
+    fn config_clamps_sidebar_width_below_min() {
+        let cfg = Config::from_toml_str("[sidebar]\nwidth = 4\n");
+        assert_eq!(cfg.sidebar.width, 18);
+    }
+
+    #[test]
+    fn config_parses_sound_disabled() {
+        let cfg = Config::from_toml_str("[sound]\nenabled = false\n");
+        assert!(!cfg.sound.enabled);
+    }
+
+    #[test]
+    fn config_parses_sound_blocked_path_with_tilde_expansion() {
+        std::env::set_var("HOME", "/tmp/fake-home");
+        let cfg = Config::from_toml_str("[sound]\nblocked = \"~/x.aiff\"\n");
+        assert_eq!(cfg.sound.blocked.as_deref(), Some("/tmp/fake-home/x.aiff"));
     }
 }

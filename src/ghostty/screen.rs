@@ -269,6 +269,32 @@ impl GhosttyScreen {
         (cx.min(self.cols - 1), cy.min(self.rows - 1))
     }
 
+    /// Read the current OSC 0 / OSC 2 terminal title from libghostty-vt.
+    /// libghostty-vt returns a borrowed `GhosttyString` whose backing
+    /// buffer is owned by the terminal and may be overwritten on the
+    /// next OSC; we clone immediately into an owned `String`.
+    pub fn title(&self) -> Option<String> {
+        let mut out: sys::GhosttyString = unsafe { std::mem::zeroed() };
+        // SAFETY: `term` is a valid GhosttyTerminal; the out-pointer is
+        // a properly-sized GhosttyString; the tag is the documented one
+        // for OSC titles.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_TITLE,
+                (&raw mut out).cast(),
+            );
+        }
+        if out.ptr.is_null() || out.len == 0 {
+            return None;
+        }
+        // SAFETY: libghostty-vt guarantees ptr/len describe a valid UTF-8
+        // (or at worst lossy-decodable) slice for the lifetime of this
+        // call; we copy out before returning.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(out.ptr.cast::<u8>(), out.len) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -544,5 +570,27 @@ mod tests {
         for line in tail.lines() {
             assert_eq!(line, line.trim_end(), "line should be trimmed: {line:?}");
         }
+    }
+
+    #[test]
+    fn title_returns_none_when_no_osc_title_received() {
+        let s = GhosttyScreen::new(20, 5);
+        assert_eq!(s.title(), None);
+    }
+
+    #[test]
+    fn title_returns_cloned_string_after_osc_0_sequence() {
+        let mut s = GhosttyScreen::new(20, 5);
+        // OSC 0 ; my-title BEL  — sets both icon name and window title.
+        s.feed(b"\x1b]0;my-title\x07");
+        assert_eq!(s.title().as_deref(), Some("my-title"));
+    }
+
+    #[test]
+    fn title_returns_cloned_string_after_osc_2_sequence() {
+        let mut s = GhosttyScreen::new(20, 5);
+        // OSC 2 ; window-title BEL — sets only the window title.
+        s.feed(b"\x1b]2;window-title\x07");
+        assert_eq!(s.title().as_deref(), Some("window-title"));
     }
 }

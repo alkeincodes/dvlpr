@@ -38,6 +38,19 @@ struct Pane {
     /// the pane last classified as non-Idle. Resets to 0 on any non-Idle
     /// classification; clamped at 2.
     idle_streak: u8,
+    /// Cached tmux/multiplexer session label for the sidebar, populated by
+    /// `refresh_agent_meta`. None until the first successful fetch.
+    session_label: Option<String>,
+    /// Cached VCS branch for the sidebar, populated by `refresh_agent_meta`.
+    /// None until the first successful fetch.
+    branch: Option<String>,
+    /// Timestamp of the last successful `refresh_agent_meta` run for this
+    /// pane. Initialised 60 s in the past so the first tick fires immediately.
+    meta_last_refresh: std::time::Instant,
+    /// Set of `ErrorKind`s already logged for this pane's meta-refresh, so
+    /// we don't spam the log on every tick for a persistent failure.
+    #[allow(dead_code)]
+    meta_err_seen: std::collections::HashSet<std::io::ErrorKind>,
 }
 
 struct Window {
@@ -62,6 +75,12 @@ pub struct AgentEntry {
     pub pane_id: crate::layout::PaneId,
     pub agent: crate::detect::Agent,
     pub state: crate::detect::AgentState,
+    /// Cached session label from the multiplexer (e.g. tmux window name).
+    /// None until `refresh_agent_meta` populates the pane's cache.
+    pub session_label: Option<String>,
+    /// Cached VCS branch for this pane's working directory.
+    /// None until `refresh_agent_meta` populates the pane's cache.
+    pub branch: Option<String>,
 }
 
 pub struct Session {
@@ -85,6 +104,11 @@ pub struct Session {
     /// and all attached clients. See
     /// `docs/superpowers/specs/2026-05-29-pane-right-click-menu-design.md`.
     menu: Option<crate::menu::MenuState>,
+    /// Width of the sidebar in columns, as set at construction time from the
+    /// user's config. Replaces the `layout::SIDEBAR_WIDTH_DEFAULT` constant
+    /// in all layout calculations so the value propagates from config to
+    /// every relayout call.
+    sidebar_width: u16,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -112,6 +136,15 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
+/// Outcome of `Session::refresh_agent_states`. Tracks whether anything
+/// changed (gates redraws) and which pane(s) just transitioned into
+/// `Blocked` (drives the sound trigger in `server::run`).
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    pub changed: bool,
+    pub blocked_transitions: Vec<crate::layout::PaneId>,
+}
+
 impl Session {
     /// Create a session with one window holding a single pane running `command`.
     /// Returns the session, the first pane's id, and its output receiver (the
@@ -123,6 +156,7 @@ impl Session {
         cols: u16,
         rows: u16,
         theme: crate::theme::Theme,
+        sidebar_width: u16,
     ) -> io::Result<(Self, PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         // Clamp to at least 1x1 (matches GhosttyScreen/PaneRuntime resize behavior).
         let cols = cols.max(1);
@@ -141,6 +175,7 @@ impl Session {
             cwd,
             sidebar_visible: false,
             menu: None,
+            sidebar_width,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -152,6 +187,7 @@ impl Session {
                 h: rows,
             },
             session.sidebar_visible,
+            session.sidebar_width,
         )
         .content_area;
         let (id, rx) = session.spawn_pane(content)?;
@@ -185,9 +221,18 @@ impl Session {
                 agent: None,
                 agent_state: detect::AgentState::Idle,
                 idle_streak: 0,
+                session_label: None,
+                branch: None,
+                meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                meta_err_seen: std::collections::HashSet::new(),
             },
         );
         Ok((id, rx))
+    }
+
+    /// Return the configured sidebar width (columns).
+    pub fn sidebar_width(&self) -> u16 {
+        self.sidebar_width
     }
 
     fn viewport(&self) -> Rect {
@@ -247,7 +292,9 @@ impl Session {
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
     fn relayout_all(&mut self) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
             // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
@@ -305,6 +352,7 @@ impl Session {
             &self.theme,
             &refs,
             self.sidebar_visible,
+            self.sidebar_width,
             &agent_entries,
             self.menu.as_ref(),
         )
@@ -427,7 +475,9 @@ impl Session {
             return;
         };
         let focused = win.focused;
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let Some((_, rect)) = layout::pane_rects(&win.root, content)
             .into_iter()
             .find(|(id, _)| *id == focused)
@@ -476,7 +526,9 @@ impl Session {
     }
 
     fn new_window(&mut self, eff: &mut CommandEffect) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let (id, rx) = match self.spawn_pane(content) {
             Ok(v) => v,
             Err(_) => return,
@@ -573,7 +625,9 @@ impl Session {
     /// the active window is zoomed, this is just the focused pane at the full
     /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         match self.windows.get(self.active_window) {
             Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
@@ -623,7 +677,8 @@ impl Session {
         let x = col - 1;
         let y = row - 1;
 
-        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible);
+        let regions =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width);
 
         // 1. Sidebar FIRST — works in both zoomed and non-zoomed branches.
         if let Some(sb) = regions.sidebar {
@@ -637,7 +692,7 @@ impl Session {
                     })
                     .collect();
                 for r in layout::sidebar_rows(sb, &inputs) {
-                    if r.y == y {
+                    if y >= r.y && y < r.y + r.h {
                         return layout::Hit::SidebarEntry {
                             window_index: r.window_index,
                             pane_id: r.pane_id,
@@ -789,8 +844,11 @@ impl Session {
     /// `resolve_name` matches the `Fn(i32) -> Option<String>` shape that
     /// `refresh_window_names` uses, so tests can inject a deterministic
     /// resolver.
-    pub fn refresh_agent_states(&mut self, resolve_name: impl Fn(i32) -> Option<String>) -> bool {
-        let mut changed = false;
+    pub fn refresh_agent_states(
+        &mut self,
+        resolve_name: impl Fn(i32) -> Option<String>,
+    ) -> RefreshOutcome {
+        let mut outcome = RefreshOutcome::default();
         // Sentinel-file gate (vs env var): survives across server restarts you
         // don't control, and works regardless of how the server was launched.
         // `touch /tmp/dvlpr-detect.enable` to turn on, `rm` to turn off — the
@@ -840,7 +898,7 @@ impl Session {
                 Some(a) => a,
                 None => {
                     if pane.agent_state != prev_state {
-                        changed = true;
+                        outcome.changed = true;
                     }
                     continue;
                 }
@@ -863,49 +921,114 @@ impl Session {
             // structurally distinctive, so extra context can't false-match.
             let tail = pane.screen.tail_text(pane.screen.rows());
 
-            // Step 4: Classify.
-            let candidate = detect::classify(agent, &tail);
+            // Step 4: Classify — with Codex short-circuit.
+            // Codex panes stay at Idle (v1: no state model yet); only Claude
+            // panes go through the full stabilizer + blocked-transition check.
+            match agent {
+                detect::Agent::Claude => {
+                    let candidate = detect::classify(detect::Agent::Claude, &tail);
 
-            // Debug instrumentation: when DVLPR_DETECT_DEBUG is set, append
-            // every claude pane's sampled tail + classify result to
-            // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
-            // env var is unset. Use to verify what tail_text actually sees
-            // when classify disagrees with what's on screen.
-            if debug {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/dvlpr-detect.log")
-                {
-                    let _ = writeln!(
-                        f,
-                        "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
-                    );
-                }
-            }
-
-            // Step 5: Stabilize.
-            match candidate {
-                detect::AgentState::Working | detect::AgentState::Blocked => {
-                    pane.agent_state = candidate;
-                    pane.idle_streak = 0;
-                }
-                detect::AgentState::Idle => {
-                    if pane.agent_state != detect::AgentState::Idle {
-                        pane.idle_streak = pane.idle_streak.saturating_add(1);
-                        if pane.idle_streak >= 2 {
-                            pane.agent_state = detect::AgentState::Idle;
-                            pane.idle_streak = 2;
+                    // Debug instrumentation: when the sentinel file exists, append
+                    // every claude pane's sampled tail + classify result to
+                    // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
+                    // file is absent.
+                    if debug {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/dvlpr-detect.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
+                            );
                         }
-                    } else {
-                        // Already Idle — keep streak saturated at 2.
-                        pane.idle_streak = 2;
                     }
+
+                    // Step 5: Stabilize.
+                    match candidate {
+                        detect::AgentState::Working | detect::AgentState::Blocked => {
+                            pane.agent_state = candidate;
+                            pane.idle_streak = 0;
+                        }
+                        detect::AgentState::Idle => {
+                            if pane.agent_state != detect::AgentState::Idle {
+                                pane.idle_streak = pane.idle_streak.saturating_add(1);
+                                if pane.idle_streak >= 2 {
+                                    pane.agent_state = detect::AgentState::Idle;
+                                    pane.idle_streak = 2;
+                                }
+                            } else {
+                                // Already Idle — keep streak saturated at 2.
+                                pane.idle_streak = 2;
+                            }
+                        }
+                    }
+
+                    // Emit a blocked transition on the first Working→Blocked (or
+                    // Idle→Blocked) edge; subsequent Blocked→Blocked ticks do not
+                    // re-emit (prev_state == Blocked on those passes).
+                    if crate::sound::should_play_blocked(prev_state, pane.agent_state) {
+                        outcome.blocked_transitions.push(*pane_id);
+                    }
+                }
+                detect::Agent::Codex => {
+                    // v1: Codex panes stay at Idle. No classification, no transitions.
+                    pane.agent_state = detect::AgentState::Idle;
+                    pane.idle_streak = 0;
                 }
             }
 
             if pane.agent_state != prev_state {
+                outcome.changed = true;
+            }
+        }
+        outcome
+    }
+
+    /// Probe each Claude/Codex pane's session label and current git
+    /// branch from its foreground PID's cwd. Gated to once per 2 s
+    /// per pane via `meta_last_refresh`. Returns true if any cached
+    /// field changed.
+    pub fn refresh_agent_meta(
+        &mut self,
+        resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
+    ) -> bool {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            // Only Claude/Codex panes are interesting for v1.
+            let agent = match pane.agent {
+                Some(a) => a,
+                None => continue,
+            };
+            if pane.meta_last_refresh.elapsed() < INTERVAL {
+                continue;
+            }
+            pane.meta_last_refresh = std::time::Instant::now();
+
+            let pid = match pane.runtime.foreground_pid() {
+                Some(p) => p,
+                None => continue,
+            };
+            let cwd = match resolve_cwd(pid) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let new_branch = crate::agent_meta::branch::detect_branch(&cwd);
+            if new_branch != pane.branch {
+                pane.branch = new_branch;
+                changed = true;
+            }
+
+            let new_label = match agent {
+                crate::detect::Agent::Claude => crate::agent_meta::claude::session_label(&cwd),
+                crate::detect::Agent::Codex => pane.screen.title(),
+            };
+            if new_label != pane.session_label {
+                pane.session_label = new_label;
                 changed = true;
             }
         }
@@ -927,6 +1050,8 @@ impl Session {
                             pane_id,
                             agent,
                             state: pane.agent_state,
+                            session_label: pane.session_label.clone(),
+                            branch: pane.branch.clone(),
                         });
                     }
                 }
@@ -940,7 +1065,9 @@ impl Session {
     /// active one). If that window is gone or the path no longer leads to a split,
     /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
     fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let Some(win) = self.windows.get_mut(window) else {
             return;
         };
@@ -990,6 +1117,7 @@ mod tests {
             80,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("Session::new");
         (session, pane_id, rx)
@@ -999,8 +1127,8 @@ mod tests {
     async fn refresh_agent_states_marks_pane_working_after_busy_sample() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed, "first refresh should flip pane state");
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed, "first refresh should flip pane state");
         let pane = session.panes.get(&pane_id).expect("pane present");
         assert_eq!(pane.agent, Some(detect::Agent::Claude));
         assert_eq!(pane.agent_state, detect::AgentState::Working);
@@ -1010,8 +1138,8 @@ mod tests {
     async fn refresh_agent_states_marks_pane_blocked_after_blocked_sample() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed);
         let pane = session.panes.get(&pane_id).expect("pane present");
         assert_eq!(pane.agent_state, detect::AgentState::Blocked);
     }
@@ -1055,8 +1183,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_agent_states_returns_false_when_nothing_changed() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(!outcome.changed);
         let _ = pane_id;
     }
 
@@ -1064,8 +1192,8 @@ mod tests {
     async fn refresh_agent_states_ignores_non_agent_panes() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| Some("zsh".to_string()));
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("zsh".to_string()));
+        assert!(!outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert!(pane.agent.is_none());
         assert_eq!(pane.agent_state, detect::AgentState::Idle);
@@ -1075,14 +1203,14 @@ mod tests {
     async fn refresh_agent_states_retries_resolver_on_transient_failure() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| None);
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| None);
+        assert!(!outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert!(pane.agent.is_none());
         assert!(pane.agent_id_pid.is_none(), "cache key NOT poisoned");
 
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert_eq!(pane.agent_state, detect::AgentState::Working);
     }
@@ -1096,6 +1224,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1132,6 +1261,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1160,6 +1290,7 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1195,6 +1326,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
 
@@ -1222,6 +1354,7 @@ mod tests {
             40,
             3,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::SplitHorizontal);
@@ -1244,6 +1377,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::NewWindow);
@@ -1267,6 +1401,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -1291,6 +1426,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         let eff = session.apply_command(Command::Detach);
@@ -1310,6 +1446,7 @@ mod tests {
             40,
             24,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         // Two horizontal splits => three panes in one window; newest pane is focused.
@@ -1343,6 +1480,7 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         // Vertical split: left = first (focused after split is the NEW right pane).
@@ -1381,6 +1519,7 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -1442,6 +1581,7 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         let grid = session.compose();
@@ -1460,6 +1600,7 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         // First resolve to "claude": name changes -> true.
@@ -1479,6 +1620,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // now two panes
@@ -1513,6 +1655,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1531,6 +1674,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // two panes in the active window
@@ -1552,6 +1696,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         // Window 1 (index 0) gets a second pane; remember one of its pane ids.
@@ -1575,6 +1720,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1595,6 +1741,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -1614,6 +1761,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
         session.apply_command(Command::NewWindow); // 2 windows -> tab bar has tabs
@@ -1650,6 +1798,7 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
         session.apply_command(Command::NewWindow); // window 1
@@ -1742,7 +1891,8 @@ mod tests {
         let initial_cols = session.panes.get(&pane_id).unwrap().screen.cols();
         session.toggle_sidebar();
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        assert_eq!(after_cols, initial_cols - 16);
+        // Sidebar default is SIDEBAR_WIDTH_DEFAULT (26), not the old SIDEBAR_COLS (16).
+        assert_eq!(after_cols, initial_cols - layout::SIDEBAR_WIDTH_DEFAULT);
         session.toggle_sidebar();
         assert_eq!(
             session.panes.get(&pane_id).unwrap().screen.cols(),
@@ -1756,8 +1906,8 @@ mod tests {
         let _eff = session.apply_command(crate::config::Command::ToggleSidebar);
         assert!(session.sidebar_visible);
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        // initial cols from helper is 80; sidebar shrinks by 16
-        assert_eq!(after_cols, 80 - 16);
+        // initial cols from helper is 80; sidebar shrinks by SIDEBAR_WIDTH_DEFAULT (26).
+        assert_eq!(after_cols, 80 - layout::SIDEBAR_WIDTH_DEFAULT);
     }
 
     #[tokio::test]
@@ -1767,9 +1917,10 @@ mod tests {
         session.feed(pane_id, b"esc to interrupt\n");
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
 
-        // Sidebar starts at col 65 (cols 64..80, 1-based 65..80).
-        // First entry at sidebar row 2 (0-based) = row 3 1-based.
-        let hit = session.hit(70, 3);
+        // Sidebar width is SIDEBAR_WIDTH_DEFAULT (26); starts at 0-based col 54 (1-based 55..80).
+        // New layout: first entry at sidebar row 3 (0-based) = row 4 1-based (header=0, divider=1, blank=2).
+        // h=2 so rows 4 and 5 (1-based) are both clickable. Col 70 is inside the sidebar.
+        let hit = session.hit(70, 4);
         match hit {
             layout::Hit::SidebarEntry {
                 window_index,
@@ -1835,7 +1986,7 @@ mod tests {
     #[tokio::test]
     async fn session_menu_starts_as_none() {
         let (session, _pane_id, _rx) = build_session_with_one_pane().await;
-        assert_eq!(session.menu_open(), false);
+        assert!(!session.menu_open());
     }
 
     #[tokio::test]
@@ -1849,5 +2000,136 @@ mod tests {
         assert!(session.menu_open());
         session.set_menu_for_test(None);
         assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn session_new_stores_sidebar_width_argument() {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let (session, _pid, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            80,
+            10,
+            crate::theme::Theme::default(),
+            30, // sidebar_width
+        )
+        .expect("Session::new");
+        assert_eq!(session.sidebar_width(), 30);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_returns_empty_outcome_when_no_change() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        // Drive the resolver to None — pane has no agent, no transitions.
+        let outcome = session.refresh_agent_states(|_| None);
+        assert!(outcome.blocked_transitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_emits_pane_id_on_working_to_blocked() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Pass 1: classify as Working.
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+        // Pass 2: clear screen and feed a blocked-style tail.
+        session.feed(
+            pane_id,
+            b"\x1b[2J\x1b[HDo you want to proceed?\n\xe2\x9d\xaf 1. Yes\n",
+        );
+        let outcome = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert!(outcome.changed);
+        assert_eq!(outcome.blocked_transitions, vec![pane_id]);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_does_not_emit_when_already_blocked() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Two passes that both classify as Blocked → only one transition.
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        let first = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(first.blocked_transitions, vec![pane_id]);
+        let second = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert!(
+            second.blocked_transitions.is_empty(),
+            "Blocked→Blocked must not re-emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_skips_classifier_for_codex_panes() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Feed a tail that WOULD trigger Claude's blocked detector.
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        // Resolve as codex — exercises the Codex short-circuit.
+        let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
+        assert!(
+            outcome.blocked_transitions.is_empty(),
+            "Codex must not emit blocked"
+        );
+        let pane = session.panes.get(&pane_id).expect("pane");
+        assert_eq!(pane.agent, Some(crate::detect::Agent::Codex));
+        assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn agent_entries_carry_session_label_and_branch_when_cached() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // First, classify the pane as Claude so it survives the
+        // agent_entries filter.
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+        // Manually seed the cache fields the way refresh_agent_meta would.
+        {
+            let pane = session.panes.get_mut(&pane_id).expect("pane");
+            pane.session_label = Some("hello world".to_string());
+            pane.branch = Some("main".to_string());
+        }
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_label.as_deref(), Some("hello world"));
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_meta_writes_branch_for_pane_with_resolvable_cwd() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        // Classify the pane as Claude so refresh_agent_meta has work to do.
+        session.feed(_pid, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+
+        // Initialize a tempdir as a git repo to feed back to the resolver.
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canon)
+            .status()
+            .unwrap();
+        let target_cwd = canon.clone();
+
+        let changed = session.refresh_agent_meta(move |_pid| Some(target_cwd.clone()));
+        assert!(changed);
+
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_meta_skips_when_within_interval() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+
+        // First refresh forces the work (meta_last_refresh was pre-aged
+        // on Pane construction).
+        let _ = session.refresh_agent_meta(|_| Some(std::path::PathBuf::from("/")));
+        // Second refresh within 2 s skips and returns false.
+        let changed = session.refresh_agent_meta(|_| Some(std::path::PathBuf::from("/")));
+        assert!(!changed, "second refresh within 2s must be a no-op");
     }
 }

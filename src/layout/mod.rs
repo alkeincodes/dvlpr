@@ -111,12 +111,15 @@ pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
     }
 }
 
-/// Width in cols of the agent-awareness sidebar when visible. Includes
-/// the 1-col left-edge vertical separator.
-pub const SIDEBAR_COLS: u16 = 16;
+/// Default sidebar width in columns (runtime-configurable via `[sidebar] width`).
+pub const SIDEBAR_WIDTH_DEFAULT: u16 = 26;
+/// Minimum allowed sidebar width (clamped in `Config::from_toml_str`).
+pub const SIDEBAR_WIDTH_MIN: u16 = 18;
+/// Maximum allowed sidebar width (clamped in `Config::from_toml_str`).
+pub const SIDEBAR_WIDTH_MAX: u16 = 36;
 
 /// Minimum content-area width to keep the sidebar visible. If the
-/// viewport is narrower than SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS,
+/// viewport is narrower than `sidebar_width + SIDEBAR_MIN_CONTENT_COLS`,
 /// `compute_regions` silently suppresses the sidebar (returns None)
 /// even when sidebar_visible is true.
 pub const SIDEBAR_MIN_CONTENT_COLS: u16 = 20;
@@ -135,26 +138,26 @@ pub struct Regions {
     pub tab_status_row: u16,
     /// Sidebar region when visible AND viewport is wide enough. None
     /// otherwise — including when the `sidebar_visible` flag is true
-    /// but `viewport.w < SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS`.
+    /// but `viewport.w < sidebar_width + SIDEBAR_MIN_CONTENT_COLS`.
     pub sidebar: Option<Rect>,
 }
 
 /// Compute the viewport partition. Single function the compositor and
 /// hit-test both call — no API takes `(cols, rows, sidebar_visible)`
 /// elsewhere.
-pub fn compute_regions(viewport: Rect, sidebar_visible: bool) -> Regions {
+pub fn compute_regions(viewport: Rect, sidebar_visible: bool, sidebar_width: u16) -> Regions {
     let tab_status_row = viewport.y + viewport.h.saturating_sub(1);
     let content_h = viewport.h.saturating_sub(1);
 
     let effective_visible =
-        sidebar_visible && viewport.w >= SIDEBAR_COLS + SIDEBAR_MIN_CONTENT_COLS;
+        sidebar_visible && viewport.w >= sidebar_width + SIDEBAR_MIN_CONTENT_COLS;
 
     let (content_w, sidebar) = if effective_visible {
-        let content_w = viewport.w - SIDEBAR_COLS;
+        let content_w = viewport.w - sidebar_width;
         let sidebar_rect = Rect {
             x: viewport.x + content_w,
             y: viewport.y,
-            w: SIDEBAR_COLS,
+            w: sidebar_width,
             h: content_h,
         };
         (content_w, Some(sidebar_rect))
@@ -510,12 +513,13 @@ pub struct SidebarRowInput {
     pub pane_id: PaneId,
 }
 
-/// One entry's position within the sidebar region. The y coordinate is
-/// in viewport coords (not sidebar-relative), so hit-test comparisons
-/// can be done against the raw mouse row.
+/// One entry's click region within the sidebar. `y` is viewport-rooted;
+/// `h` covers both rendered rows (row a + row b). Gap row falls
+/// outside the half-open `[y, y + h)` and is not clickable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SidebarRow {
     pub y: u16,
+    pub h: u16,
     pub window_index: usize,
     pub pane_id: PaneId,
 }
@@ -524,20 +528,24 @@ pub struct SidebarRow {
 /// Layout is fixed at the top of `sidebar`:
 ///   row 0 (rect.y + 0) — "AGENTS" header (NOT a click target)
 ///   row 1 (rect.y + 1) — horizontal '─' separator
-///   row 2..N — one row per entry from `entries`, truncated to fit
-///              within `rect.h`
+///   row 2 (rect.y + 2) — leading blank row
+///   rows 3..N — 3 rows per entry (row a + row b + gap), truncated to fit
+///               within `rect.h`. Only rows a+b are clickable (h=2);
+///               the gap row is a miss zone.
 ///
-/// Used by both `Compositor::draw_sidebar` (to know where to write each
-/// row) and `Session::hit` (to translate a click to a SidebarEntry).
+/// Used by `Session::hit` to translate a click to a SidebarEntry.
 pub fn sidebar_rows(rect: Rect, entries: &[SidebarRowInput]) -> Vec<SidebarRow> {
     let mut out = Vec::with_capacity(entries.len());
-    if rect.h < 3 {
+    // 2 header rows + 1 leading blank + 3 rows per entry (a + b + gap).
+    let max_entries = (rect.h.saturating_sub(3) / 3) as usize;
+    if max_entries == 0 {
         return out;
     }
-    let max_entries = (rect.h - 2) as usize;
     for (i, e) in entries.iter().take(max_entries).enumerate() {
+        let y = rect.y + 3 + (i as u16) * 3;
         out.push(SidebarRow {
-            y: rect.y + 2 + i as u16,
+            y,
+            h: 2,
             window_index: e.window_index,
             pane_id: e.pane_id,
         });
@@ -1286,7 +1294,7 @@ mod tests {
             w: 80,
             h: 24,
         };
-        let r = compute_regions(vp, false);
+        let r = compute_regions(vp, false, 26);
         assert_eq!(r.content_area.w, 80);
         assert_eq!(r.content_area.h, 23);
         assert_eq!(r.tab_status_row, 23);
@@ -1301,27 +1309,31 @@ mod tests {
             w: 80,
             h: 24,
         };
-        let r = compute_regions(vp, true);
-        assert_eq!(r.content_area.w, 80 - SIDEBAR_COLS);
+        // Use the default width (26). Old test used SIDEBAR_COLS (16); update to match
+        // the new default so the test pins the new contract.
+        let r = compute_regions(vp, true, SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(r.content_area.w, 80 - SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(r.content_area.h, 23);
         assert_eq!(r.tab_status_row, 23);
         let sb = r.sidebar.expect("sidebar present");
-        assert_eq!(sb.x, 80 - SIDEBAR_COLS);
-        assert_eq!(sb.w, SIDEBAR_COLS);
+        assert_eq!(sb.x, 80 - SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(sb.w, SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(sb.h, 23);
     }
 
     #[test]
     fn compute_regions_suppresses_sidebar_below_threshold() {
+        // New threshold: SIDEBAR_WIDTH_DEFAULT (26) + SIDEBAR_MIN_CONTENT_COLS (20) = 46.
+        // A viewport of width 45 is below the threshold and must suppress the sidebar.
         let vp = Rect {
             x: 0,
             y: 0,
-            w: 30,
+            w: 45,
             h: 24,
         };
-        let r = compute_regions(vp, true);
+        let r = compute_regions(vp, true, SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(r.sidebar, None);
-        assert_eq!(r.content_area.w, 30, "content should keep full width");
+        assert_eq!(r.content_area.w, 45, "content should keep full width");
     }
 
     #[test]
@@ -1332,7 +1344,7 @@ mod tests {
             w: 0,
             h: 0,
         };
-        let r = compute_regions(vp, true);
+        let r = compute_regions(vp, true, 26);
         assert_eq!(r.content_area.w, 0);
         assert_eq!(r.content_area.h, 0);
         assert_eq!(r.tab_status_row, 0);
@@ -1340,77 +1352,78 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_rows_assigns_one_row_per_entry_below_header_and_separator() {
+    fn sidebar_rows_assigns_two_row_targets_per_entry_with_gaps() {
         let rect = Rect {
-            x: 64,
+            x: 0,
             y: 0,
-            w: 16,
-            h: 10,
+            w: 26,
+            h: 20,
         };
         let entries = vec![
             SidebarRowInput {
                 window_index: 0,
-                pane_id: 1,
+                pane_id: 0,
             },
             SidebarRowInput {
                 window_index: 1,
-                pane_id: 5,
+                pane_id: 1,
             },
         ];
         let rows = sidebar_rows(rect, &entries);
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].y, 2,
-            "first entry at row 2 (after header+separator)"
-        );
-        assert_eq!(rows[1].y, 3);
+        // Row 0 starts at y=3 (header=0, divider=1, blank=2).
+        assert_eq!(rows[0].y, 3);
+        assert_eq!(rows[0].h, 2);
         assert_eq!(rows[0].window_index, 0);
-        assert_eq!(rows[1].pane_id, 5);
+        // Row 1 starts at y=3 + 3 = 6 (rows a+b + gap).
+        assert_eq!(rows[1].y, 6);
+        assert_eq!(rows[1].h, 2);
+        assert_eq!(rows[1].window_index, 1);
     }
 
     #[test]
-    fn sidebar_rows_truncates_when_rect_too_short() {
+    fn sidebar_rows_max_entries_uses_saturating_sub() {
+        // rect.h = 2 → zero entries (no room for content).
         let rect = Rect {
             x: 0,
             y: 0,
-            w: 16,
-            h: 4,
-        };
-        let entries = vec![
-            SidebarRowInput {
-                window_index: 0,
-                pane_id: 1,
-            },
-            SidebarRowInput {
-                window_index: 1,
-                pane_id: 2,
-            },
-            SidebarRowInput {
-                window_index: 2,
-                pane_id: 3,
-            },
-            SidebarRowInput {
-                window_index: 3,
-                pane_id: 4,
-            },
-        ];
-        let rows = sidebar_rows(rect, &entries);
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn sidebar_rows_returns_empty_when_rect_too_short_for_chrome() {
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            w: 16,
+            w: 26,
             h: 2,
         };
         let entries = vec![SidebarRowInput {
             window_index: 0,
-            pane_id: 1,
+            pane_id: 0,
         }];
         assert!(sidebar_rows(rect, &entries).is_empty());
+    }
+
+    #[test]
+    fn sidebar_rows_truncates_when_rect_too_short_for_all_entries() {
+        // rect.h = 5 → (5 - 3) / 3 = 0 entries.
+        // rect.h = 6 → (6 - 3) / 3 = 1 entry.
+        let rect_one = Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 6,
+        };
+        let entries = vec![
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 0,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 2,
+                pane_id: 2,
+            },
+        ];
+        let rows = sidebar_rows(rect_one, &entries);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].window_index, 0);
     }
 
     #[test]
@@ -1455,11 +1468,7 @@ mod tests {
 
     #[test]
     fn tab_layout_active_chip_reserves_padding_x() {
-        let names = vec![
-            "zsh".to_string(),
-            "vim".to_string(),
-            "git".to_string(),
-        ];
+        let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         // active = 1, not zoomed. Labels: "1:zsh", "2:vim*", "3:git".
         let regions = tab_layout("default", &names, 1, false, 80);
         assert_eq!(regions.len(), 3);
@@ -1540,5 +1549,38 @@ mod tests {
         assert_eq!(r1.label, "2:vim*Z");
         // Chip width = 7 + 2 = 9 cells ⇒ x_end - x_start = 8.
         assert_eq!(r1.x_end - r1.x_start, 8);
+    }
+
+    #[test]
+    fn sidebar_width_constants_match_spec_defaults() {
+        assert_eq!(SIDEBAR_WIDTH_MIN, 18);
+        assert_eq!(SIDEBAR_WIDTH_MAX, 36);
+        assert_eq!(SIDEBAR_WIDTH_DEFAULT, 26);
+    }
+
+    #[test]
+    fn compute_regions_reserves_explicit_sidebar_width() {
+        let v = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 30,
+        };
+        let regions = compute_regions(v, true, 30);
+        assert_eq!(regions.sidebar.unwrap().w, 30);
+        assert_eq!(regions.content_area.w, 100 - 30);
+    }
+
+    #[test]
+    fn compute_regions_suppresses_sidebar_when_viewport_too_narrow_for_min_width() {
+        // 18 cell sidebar + 20 min content = 38 threshold.
+        let v = Rect {
+            x: 0,
+            y: 0,
+            w: 37,
+            h: 20,
+        };
+        let regions = compute_regions(v, true, 18);
+        assert!(regions.sidebar.is_none());
     }
 }
