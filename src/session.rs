@@ -118,6 +118,10 @@ pub struct Session {
     keys: crate::config::KeyMap,
     /// The open help overlay, if any. Shared across all attached clients.
     help: Option<crate::help::HelpState>,
+    /// The open window-name dialog, if any. At most one across the session;
+    /// mutually exclusive with `menu`. See
+    /// `docs/superpowers/specs/2026-05-29-window-tab-rename-design.md`.
+    dialog: Option<crate::dialog::WindowNameDialog>,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -191,6 +195,7 @@ impl Session {
             prefix,
             keys,
             help: None,
+            dialog: None,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -431,6 +436,26 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub fn dialog_is_open_for_test(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    /// Open the New Window dialog. Closes any open menu (mutual exclusion).
+    pub fn open_new_window_dialog(&mut self) {
+        self.menu = None;
+        self.dialog = Some(crate::dialog::WindowNameDialog::new_window());
+    }
+
+    /// Open the Rename dialog for `window`, pre-filled with its current name.
+    /// No-op if the index is out of range. Closes any open menu.
+    pub fn open_rename_dialog(&mut self, window: usize) {
+        let Some(w) = self.windows.get(window) else { return };
+        let name = w.name.clone();
+        self.menu = None;
+        self.dialog = Some(crate::dialog::WindowNameDialog::rename(window, &name));
+    }
+
+    #[cfg(test)]
     pub fn help_tab_for_test(&self) -> Option<crate::help::HelpTab> {
         self.help.as_ref().map(|h| h.tab)
     }
@@ -592,6 +617,7 @@ impl Session {
             &agent_entries,
             self.menu.as_ref(),
             help_view.as_ref(),
+            self.dialog.as_ref(),
         )
     }
 
@@ -3697,5 +3723,14 @@ mod tests {
         assert_eq!(names[0], "my-build", "pinned window keeps its custom name");
         assert_eq!(names[1], "zsh", "auto window still tracks the process");
         assert!(changed, "the auto window changed, so refresh reports true");
+    }
+
+    #[tokio::test]
+    async fn opening_new_window_dialog_sets_state_and_renders_title() {
+        let mut s = test_session();
+        s.open_new_window_dialog();
+        assert!(s.dialog_is_open_for_test());
+        let frame = String::from_utf8_lossy(&s.render()).to_string();
+        assert!(frame.contains("New Window"), "dialog title should render");
     }
 }

@@ -132,6 +132,7 @@ impl Compositor {
         agent_entries: &[crate::session::AgentEntry],
         menu: Option<&crate::menu::MenuState>,
         help: Option<&crate::help::HelpView>,
+        dialog: Option<&crate::dialog::WindowNameDialog>,
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -194,7 +195,7 @@ impl Compositor {
                 &mut buf,
                 cols,
                 m,
-                crate::menu::PANE_MENU_ITEMS,
+                m.items(),
                 theme,
                 content,
             );
@@ -205,6 +206,12 @@ impl Compositor {
         // would paint over the menu.
         if let Some(h) = help {
             draw_help(&mut buf, cols, h, theme, content);
+        }
+
+        // Dialog overlay — top-most, painted after menu and help. Caller keeps at
+        // most one of menu/help/dialog active.
+        if let Some(d) = dialog {
+            draw_dialog(&mut buf, cols, rows, d, theme, content);
         }
 
         // Cursor at the focused pane's cursor, mapped to global coordinates.
@@ -255,6 +262,7 @@ impl Compositor {
             false,
             0,
             &[],
+            None,
             None,
             None,
         ))
@@ -966,6 +974,107 @@ pub fn draw_menu(
 
             buf[idx] = cell;
         }
+    }
+}
+
+/// Paint the window-name dialog: a centered bordered box with a title, the
+/// input buffer (tail-clipped to fit, with a cursor cell), and a hint line.
+/// Pure — no I/O. Reuses `theme.menu_*` roles. Clamps to `content_area`.
+pub fn draw_dialog(
+    buf: &mut [StyledCell],
+    cols: u16,
+    _rows: u16,
+    dialog: &crate::dialog::WindowNameDialog,
+    theme: &crate::theme::Theme,
+    content_area: crate::layout::Rect,
+) {
+    use crate::layout::Rect;
+
+    let title = dialog.title();
+    let hint = match dialog.mode {
+        crate::dialog::DialogMode::NewWindow => "Enter: create   Esc: cancel",
+        crate::dialog::DialogMode::RenameWindow { .. } => "Enter: rename   Esc: cancel",
+    };
+
+    const FIELD_W: u16 = 28;
+    let inner_w = FIELD_W
+        .max(title.chars().count() as u16)
+        .max(hint.chars().count() as u16);
+    let box_w = (inner_w + 4).min(content_area.w);
+    let box_h = 5u16.min(content_area.h);
+    if box_w < 4 || box_h < 5 {
+        return;
+    }
+    let x0 = content_area.x + (content_area.w.saturating_sub(box_w)) / 2;
+    let y0 = content_area.y + (content_area.h.saturating_sub(box_h)) / 2;
+    let rect = Rect { x: x0, y: y0, w: box_w, h: box_h };
+
+    let border = CellStyle { fg: theme.menu_border_fg, bg: theme.menu_bg, ..Default::default() };
+    let label = CellStyle { fg: theme.menu_label_fg, bg: theme.menu_bg, ..Default::default() };
+
+    let put = |buf: &mut [StyledCell], x: u16, y: u16, ch: char, style: CellStyle| {
+        let idx = y as usize * cols as usize + x as usize;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch, style };
+        }
+    };
+
+    let right = rect.x + rect.w - 1;
+    let bottom = rect.y + rect.h - 1;
+
+    for y in rect.y..=bottom {
+        for x in rect.x..=right {
+            let is_top = y == rect.y;
+            let is_bottom = y == bottom;
+            let is_left = x == rect.x;
+            let is_right = x == right;
+            let ch = match (is_top, is_bottom, is_left, is_right) {
+                (true, _, true, _) => '┌',
+                (true, _, _, true) => '┐',
+                (_, true, true, _) => '└',
+                (_, true, _, true) => '┘',
+                (true, _, _, _) | (_, true, _, _) => '─',
+                (_, _, true, _) | (_, _, _, true) => '│',
+                _ => ' ',
+            };
+            put(buf, x, y, ch, if is_top || is_bottom || is_left || is_right { border } else { label });
+        }
+    }
+
+    let title_chars: Vec<char> = format!(" {title} ").chars().collect();
+    let tstart = rect.x + 1 + (rect.w.saturating_sub(2).saturating_sub(title_chars.len() as u16)) / 2;
+    for (i, &c) in title_chars.iter().enumerate() {
+        let x = tstart + i as u16;
+        if x < right { put(buf, x, rect.y, c, border); }
+    }
+
+    let field_x = rect.x + 2;
+    let field_max = rect.w.saturating_sub(4) as usize;
+    let shown: String = {
+        let v = &dialog.buffer;
+        let chars: Vec<char> = v.chars().collect();
+        let avail = field_max.saturating_sub(1);
+        if chars.len() > avail {
+            chars[chars.len() - avail..].iter().collect()
+        } else {
+            v.clone()
+        }
+    };
+    let mut col = field_x;
+    for c in shown.chars() {
+        if col >= right { break; }
+        put(buf, col, rect.y + 1, c, label);
+        col += 1;
+    }
+    if col < right {
+        put(buf, col, rect.y + 1, '▏', label);
+    }
+
+    let hint_chars: Vec<char> = hint.chars().collect();
+    let hstart = field_x;
+    for (i, &c) in hint_chars.iter().enumerate() {
+        let x = hstart + i as u16;
+        if x < right { put(buf, x, bottom - 1, c, label); }
     }
 }
 
