@@ -132,7 +132,16 @@ mod tests {
         init_repo(root, "main");
         run_git(root, &["commit", "--allow-empty", "-q", "-m", "init"]);
         let wt_dir = tmp.path().join("wt");
-        run_git(root, &["worktree", "add", wt_dir.to_str().unwrap(), "-b", "feature-x"]);
+        run_git(
+            root,
+            &[
+                "worktree",
+                "add",
+                wt_dir.to_str().unwrap(),
+                "-b",
+                "feature-x",
+            ],
+        );
         assert_eq!(detect_branch(&wt_dir), Some("feature-x".to_string()));
     }
 

@@ -218,8 +218,7 @@ impl Session {
                 idle_streak: 0,
                 session_label: None,
                 branch: None,
-                meta_last_refresh: std::time::Instant::now()
-                    - std::time::Duration::from_secs(60),
+                meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
                 meta_err_seen: std::collections::HashSet::new(),
             },
         );
@@ -254,7 +253,9 @@ impl Session {
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
     fn relayout_all(&mut self) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let mut targets: Vec<(PaneId, Rect)> = Vec::new();
         for (wi, win) in self.windows.iter().enumerate() {
             // Invariant: only the active window is ever zoomed (every active_window change unzooms first).
@@ -434,7 +435,9 @@ impl Session {
             return;
         };
         let focused = win.focused;
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let Some((_, rect)) = layout::pane_rects(&win.root, content)
             .into_iter()
             .find(|(id, _)| *id == focused)
@@ -483,7 +486,9 @@ impl Session {
     }
 
     fn new_window(&mut self, eff: &mut CommandEffect) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let (id, rx) = match self.spawn_pane(content) {
             Ok(v) => v,
             Err(_) => return,
@@ -580,7 +585,9 @@ impl Session {
     /// the active window is zoomed, this is just the focused pane at the full
     /// content rect — siblings are hidden (but still running).
     pub fn active_pane_rects(&self) -> Vec<(PaneId, Rect)> {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         match self.windows.get(self.active_window) {
             Some(win) if win.zoomed => vec![(win.focused, content)],
             Some(win) => layout::pane_rects(&win.root, content),
@@ -630,7 +637,8 @@ impl Session {
         let x = col - 1;
         let y = row - 1;
 
-        let regions = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width);
+        let regions =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width);
 
         // 1. Sidebar FIRST — works in both zoomed and non-zoomed branches.
         if let Some(sb) = regions.sidebar {
@@ -976,9 +984,7 @@ impl Session {
             }
 
             let new_label = match agent {
-                crate::detect::Agent::Claude => {
-                    crate::agent_meta::claude::session_label(&cwd)
-                }
+                crate::detect::Agent::Claude => crate::agent_meta::claude::session_label(&cwd),
                 crate::detect::Agent::Codex => pane.screen.title(),
             };
             if new_label != pane.session_label {
@@ -1019,7 +1025,9 @@ impl Session {
     /// active one). If that window is gone or the path no longer leads to a split,
     /// it is a harmless no-op (`split_area_at`/`set_ratio` return None/false).
     fn resize_divider(&mut self, window: usize, path: &SplitPath, col: u16, row: u16) {
-        let content = layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width).content_area;
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
         let Some(win) = self.windows.get_mut(window) else {
             return;
         };
@@ -1935,7 +1943,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_stores_sidebar_width_argument() {
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let (session, _pid, _rx) = Session::new(
             "test".to_string(),
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
@@ -1981,8 +1992,10 @@ mod tests {
         let first = session.refresh_agent_states(|_| Some("claude".to_string()));
         assert_eq!(first.blocked_transitions, vec![pane_id]);
         let second = session.refresh_agent_states(|_| Some("claude".to_string()));
-        assert!(second.blocked_transitions.is_empty(),
-                "Blocked→Blocked must not re-emit");
+        assert!(
+            second.blocked_transitions.is_empty(),
+            "Blocked→Blocked must not re-emit"
+        );
     }
 
     #[tokio::test]
@@ -1992,8 +2005,10 @@ mod tests {
         session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
         // Resolve as codex — exercises the Codex short-circuit.
         let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
-        assert!(outcome.blocked_transitions.is_empty(),
-                "Codex must not emit blocked");
+        assert!(
+            outcome.blocked_transitions.is_empty(),
+            "Codex must not emit blocked"
+        );
         let pane = session.panes.get(&pane_id).expect("pane");
         assert_eq!(pane.agent, Some(crate::detect::Agent::Codex));
         assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);

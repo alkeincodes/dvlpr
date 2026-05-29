@@ -213,7 +213,7 @@ pub const ONE_DARK: Palette = Palette {
     surface2: Color::Rgb(0x4b, 0x52, 0x5d),
     surface1: Color::Rgb(0x44, 0x49, 0x55),
     surface0: Color::Rgb(0x3e, 0x44, 0x51), // bg-lighter
-    base: Color::Rgb(0x28, 0x2c, 0x34), // bg
+    base: Color::Rgb(0x28, 0x2c, 0x34),     // bg
     mantle: Color::Rgb(0x24, 0x27, 0x2e),
     crust: Color::Rgb(0x21, 0x25, 0x2b), // bg-darker — drives active_tab_fg
 };
@@ -247,23 +247,23 @@ impl Theme {
     /// are uniform across flavors (e.g. `session_fg` = the flavor's `mauve`).
     pub fn from_flavor(flavor: Flavor) -> Self {
         let p: &Palette = match flavor {
-            Flavor::Latte     => &LATTE,
-            Flavor::Frappe    => &FRAPPE,
+            Flavor::Latte => &LATTE,
+            Flavor::Frappe => &FRAPPE,
             Flavor::Macchiato => &MACCHIATO,
-            Flavor::Mocha     => &MOCHA,
-            Flavor::OneDark   => &ONE_DARK,
+            Flavor::Mocha => &MOCHA,
+            Flavor::OneDark => &ONE_DARK,
         };
         let active_tab_fg = if flavor.is_light() { p.text } else { p.crust };
         Theme {
-            bar_bg:          Color::Default,
-            session_fg:      p.mauve,
-            session_bg:      Color::Default,
+            bar_bg: Color::Default,
+            session_fg: p.mauve,
+            session_bg: Color::Default,
             active_tab_fg,
-            active_tab_bg:   p.peach,
+            active_tab_bg: p.peach,
             active_tab_bold: true,
             inactive_tab_fg: p.text,
             inactive_tab_bg: Color::Default,
-            agent_idle_fg:   p.green,
+            agent_idle_fg: p.green,
             agent_working_fg: p.yellow,
             agent_blocked_fg: p.red,
         }

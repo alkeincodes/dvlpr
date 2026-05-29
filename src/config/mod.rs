@@ -292,8 +292,10 @@ fn sidebar_from_raw(raw: &RawSidebar) -> SidebarConfig {
     let width = match raw.width {
         None => crate::layout::SIDEBAR_WIDTH_DEFAULT,
         Some(w) => {
-            let clamped =
-                w.clamp(crate::layout::SIDEBAR_WIDTH_MIN, crate::layout::SIDEBAR_WIDTH_MAX);
+            let clamped = w.clamp(
+                crate::layout::SIDEBAR_WIDTH_MIN,
+                crate::layout::SIDEBAR_WIDTH_MAX,
+            );
             if clamped != w {
                 tracing::warn!(
                     requested = w,
@@ -683,9 +685,6 @@ flavor = "one-dark"
     fn config_parses_sound_blocked_path_with_tilde_expansion() {
         std::env::set_var("HOME", "/tmp/fake-home");
         let cfg = Config::from_toml_str("[sound]\nblocked = \"~/x.aiff\"\n");
-        assert_eq!(
-            cfg.sound.blocked.as_deref(),
-            Some("/tmp/fake-home/x.aiff")
-        );
+        assert_eq!(cfg.sound.blocked.as_deref(), Some("/tmp/fake-home/x.aiff"));
     }
 }

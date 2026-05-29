@@ -291,8 +291,7 @@ impl GhosttyScreen {
         // SAFETY: libghostty-vt guarantees ptr/len describe a valid UTF-8
         // (or at worst lossy-decodable) slice for the lifetime of this
         // call; we copy out before returning.
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(out.ptr.cast::<u8>(), out.len) };
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(out.ptr.cast::<u8>(), out.len) };
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
 

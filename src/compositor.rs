@@ -525,7 +525,10 @@ fn draw_tabs(
         for x in 0..cols as usize {
             let idx = ty as usize * cols as usize + x;
             if idx < buf.len() {
-                buf[idx] = StyledCell { ch: ' ', style: bar_style };
+                buf[idx] = StyledCell {
+                    ch: ' ',
+                    style: bar_style,
+                };
             }
         }
     }
@@ -542,7 +545,10 @@ fn draw_tabs(
         }
         let idx = ty as usize * cols as usize + x;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch, style: session_style };
+            buf[idx] = StyledCell {
+                ch,
+                style: session_style,
+            };
         }
     }
 
@@ -618,33 +624,43 @@ fn draw_sidebar(
     let placeholder_style = CellStyle::default();
 
     // Local helper: write `text` starting at (start_x, y), clipped to rect.
-    let write_cell = |buf: &mut [StyledCell], y: u16, start_x: u16, text: &str, style: CellStyle| {
-        let cols_u = cols as usize;
-        let mut col = start_x;
-        for ch in text.chars() {
-            if col >= rect.x + rect.w {
-                break;
+    let write_cell =
+        |buf: &mut [StyledCell], y: u16, start_x: u16, text: &str, style: CellStyle| {
+            let cols_u = cols as usize;
+            let mut col = start_x;
+            for ch in text.chars() {
+                if col >= rect.x + rect.w {
+                    break;
+                }
+                let idx = (y as usize) * cols_u + (col as usize);
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch, style };
+                }
+                col = col.saturating_add(1);
             }
-            let idx = (y as usize) * cols_u + (col as usize);
-            if idx < buf.len() {
-                buf[idx] = StyledCell { ch, style };
-            }
-            col = col.saturating_add(1);
-        }
-    };
+        };
 
     // Vertical separator on column rect.x.
     let sep_style = CellStyle::default();
     for y in rect.y..rect.y + rect.h {
         let idx = (y as usize) * (cols as usize) + (rect.x as usize);
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch: '│', style: sep_style };
+            buf[idx] = StyledCell {
+                ch: '│',
+                style: sep_style,
+            };
         }
     }
 
     // Header centered on row 0.
     let header = "AGENTS";
-    let header_x = rect.x + 1 + rect.w.saturating_sub(1).saturating_sub(header.chars().count() as u16) / 2;
+    let header_x = rect.x
+        + 1
+        + rect
+            .w
+            .saturating_sub(1)
+            .saturating_sub(header.chars().count() as u16)
+            / 2;
     write_cell(buf, rect.y, header_x, header, header_style);
 
     // Divider on row 1.
@@ -654,7 +670,13 @@ fn draw_sidebar(
     if entries.is_empty() {
         let empty = "(no agents)";
         let y = rect.y + 3;
-        let start = rect.x + 1 + rect.w.saturating_sub(1).saturating_sub(empty.chars().count() as u16) / 2;
+        let start = rect.x
+            + 1
+            + rect
+                .w
+                .saturating_sub(1)
+                .saturating_sub(empty.chars().count() as u16)
+                / 2;
         write_cell(buf, y, start, empty, placeholder_style);
         return;
     }
@@ -668,14 +690,24 @@ fn draw_sidebar(
         // Row a: " <icon> <session-label or W<n>:agent>"
         write_cell(buf, row_a_y, rect.x + 1, " ", entry_style);
         let (icon, icon_color) = icon_for(e.state, theme);
-        let icon_style = CellStyle { fg: icon_color, ..CellStyle::default() };
+        let icon_style = CellStyle {
+            fg: icon_color,
+            ..CellStyle::default()
+        };
         let mut icon_buf = [0u8; 4];
-        write_cell(buf, row_a_y, rect.x + 2, icon.encode_utf8(&mut icon_buf), icon_style);
+        write_cell(
+            buf,
+            row_a_y,
+            rect.x + 2,
+            icon.encode_utf8(&mut icon_buf),
+            icon_style,
+        );
         write_cell(buf, row_a_y, rect.x + 3, " ", entry_style);
 
         let label_x = rect.x + 4;
         let label_max = rect.w.saturating_sub(4) as usize;
-        let label = e.session_label
+        let label = e
+            .session_label
             .clone()
             .unwrap_or_else(|| format!("W{}:{}", e.window_index + 1, agent_short(e.agent)));
         let trunc = truncate_ellipsis(&label, label_max);
@@ -696,10 +728,7 @@ fn draw_sidebar(
     }
 }
 
-fn icon_for(
-    state: crate::detect::AgentState,
-    theme: &crate::theme::Theme,
-) -> (char, Color) {
+fn icon_for(state: crate::detect::AgentState, theme: &crate::theme::Theme) -> (char, Color) {
     use crate::detect::AgentState;
     match state {
         AgentState::Idle => ('○', theme.agent_idle_fg),
@@ -964,15 +993,15 @@ mod tests {
         let cols: u16 = 30;
         let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
-            bar_bg:          Color::Default,
-            session_bg:      Color::Default,
-            session_fg:      Color::Rgb(2, 2, 2),
-            active_tab_fg:   Color::Rgb(4, 4, 4),
-            active_tab_bg:   Color::Rgb(5, 5, 5),
+            bar_bg: Color::Default,
+            session_bg: Color::Default,
+            session_fg: Color::Rgb(2, 2, 2),
+            active_tab_fg: Color::Rgb(4, 4, 4),
+            active_tab_bg: Color::Rgb(5, 5, 5),
             active_tab_bold: true,
             inactive_tab_bg: Color::Default,
             inactive_tab_fg: Color::Rgb(6, 6, 6),
-            agent_idle_fg:    Color::Rgb(7, 7, 7),
+            agent_idle_fg: Color::Rgb(7, 7, 7),
             agent_working_fg: Color::Rgb(8, 8, 8),
             agent_blocked_fg: Color::Rgb(9, 9, 9),
         };
@@ -1006,7 +1035,11 @@ mod tests {
         // Inter-tab gaps and bar row beyond the last tab: cells stay default.
         let last = regions.last().unwrap().x_end;
         for x in (last + 1)..cols {
-            assert_eq!(buf[x as usize], StyledCell::default(), "gap/right tail at x={x}");
+            assert_eq!(
+                buf[x as usize],
+                StyledCell::default(),
+                "gap/right tail at x={x}"
+            );
         }
     }
 
@@ -1509,7 +1542,12 @@ mod tests {
             session_label: Some("Refactor auth flow".to_string()),
             branch: Some("main".to_string()),
         }];
-        let rect = crate::layout::Rect { x: 0, y: 0, w: 26, h: 12 };
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 12,
+        };
         let mut buf = vec![StyledCell::default(); 26 * 12];
         draw_sidebar(&mut buf, 26, rect, &theme, &entries);
 
@@ -1534,7 +1572,12 @@ mod tests {
             session_label: Some("A very long session label that won't fit".to_string()),
             branch: Some("main".to_string()),
         }];
-        let rect = crate::layout::Rect { x: 0, y: 0, w: 18, h: 12 };
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 18,
+            h: 12,
+        };
         let mut buf = vec![StyledCell::default(); 18 * 12];
         draw_sidebar(&mut buf, 18, rect, &theme, &entries);
 
@@ -1555,7 +1598,12 @@ mod tests {
             session_label: Some("x".to_string()),
             branch: None,
         }];
-        let rect = crate::layout::Rect { x: 0, y: 0, w: 26, h: 12 };
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 12,
+        };
         let mut buf = vec![StyledCell::default(); 26 * 12];
         draw_sidebar(&mut buf, 26, rect, &theme, &entries);
 
@@ -1580,7 +1628,11 @@ mod tests {
         assert_eq!(buf[2], StyledCell::default(), "prefix gap stays default");
         // Cells far past the last tab also stay default.
         for x in (cols - 3)..cols {
-            assert_eq!(buf[x as usize], StyledCell::default(), "right tail at x={x}");
+            assert_eq!(
+                buf[x as usize],
+                StyledCell::default(),
+                "right tail at x={x}"
+            );
         }
     }
 
@@ -1589,7 +1641,7 @@ mod tests {
         let cols: u16 = 20;
         let mut buf = vec![StyledCell::default(); cols as usize];
         let theme = crate::theme::Theme {
-            bar_bg:     Color::Default,
+            bar_bg: Color::Default,
             session_bg: Color::Default,
             session_fg: Color::Rgb(11, 22, 33),
             ..crate::theme::Theme::default()
@@ -1632,7 +1684,11 @@ mod tests {
         // The cell at inactive.x_end + 1 (if within bounds) must stay default.
         if (inactive.x_end + 1) < cols {
             let gap_x = (inactive.x_end + 1) as usize;
-            assert_eq!(buf[gap_x], StyledCell::default(), "trailing gap stays default");
+            assert_eq!(
+                buf[gap_x],
+                StyledCell::default(),
+                "trailing gap stays default"
+            );
         }
     }
 
@@ -1657,7 +1713,8 @@ mod tests {
 
         for x in 9..cols {
             assert_eq!(
-                buf[x as usize], StyledCell::default(),
+                buf[x as usize],
+                StyledCell::default(),
                 "x={x} is past x_end and must be untouched"
             );
         }
@@ -1707,14 +1764,26 @@ mod tests {
         // fill or session-prefix bg paint, this test fails immediately.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default(); // OneDark — transparent bgs
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names: Vec<String> = vec![];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 0, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            0,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         assert_eq!(
@@ -1735,14 +1804,26 @@ mod tests {
         // dropped active bg would push it to 0. Both fail this assertion.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default();
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names = vec!["zsh".to_string(), "vim".to_string()];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 1, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            1,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         assert_eq!(
@@ -1765,14 +1846,26 @@ mod tests {
         // skip the reset and this test would fail.
         let cols: u16 = 40;
         let rows: u16 = 3;
-        let viewport = Rect { x: 0, y: 0, w: cols, h: rows };
+        let viewport = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default();
         let root = Node::Leaf(0);
         let pane = StubScreen::new(cols, rows - 1, &[], (0, 0));
         let tab_names = vec!["zsh".to_string(), "vim".to_string()];
         let bytes = Compositor::new().render(
-            viewport, &root, "session", &tab_names, 1, 0u64, false,
-            &theme, &[(0u64, &pane as &dyn PaneCells)],
+            viewport,
+            &root,
+            "session",
+            &tab_names,
+            1,
+            0u64,
+            false,
+            &theme,
+            &[(0u64, &pane as &dyn PaneCells)],
         );
         let text = String::from_utf8_lossy(&bytes);
         let inactive_pos = text.find("1:zsh").expect("inactive label in output");

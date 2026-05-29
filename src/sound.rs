@@ -179,9 +179,9 @@ mod tests {
     fn debouncer_allows_second_fire_after_interval_expires() {
         // Avoid a real-time sleep: backdate `last_fire` past the
         // debounce window via the test-only constructor.
-        let d = SoundDebouncer::with_last_fire_for_test(
-            Some(Instant::now() - (DEBOUNCE_INTERVAL + Duration::from_millis(50))),
-        );
+        let d = SoundDebouncer::with_last_fire_for_test(Some(
+            Instant::now() - (DEBOUNCE_INTERVAL + Duration::from_millis(50)),
+        ));
         assert!(d.try_fire());
     }
 }

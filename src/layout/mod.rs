@@ -1353,10 +1353,21 @@ mod tests {
 
     #[test]
     fn sidebar_rows_assigns_two_row_targets_per_entry_with_gaps() {
-        let rect = Rect { x: 0, y: 0, w: 26, h: 20 };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 20,
+        };
         let entries = vec![
-            SidebarRowInput { window_index: 0, pane_id: 0 },
-            SidebarRowInput { window_index: 1, pane_id: 1 },
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 0,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 1,
+            },
         ];
         let rows = sidebar_rows(rect, &entries);
         assert_eq!(rows.len(), 2);
@@ -1373,10 +1384,16 @@ mod tests {
     #[test]
     fn sidebar_rows_max_entries_uses_saturating_sub() {
         // rect.h = 2 → zero entries (no room for content).
-        let rect = Rect { x: 0, y: 0, w: 26, h: 2 };
-        let entries = vec![
-            SidebarRowInput { window_index: 0, pane_id: 0 },
-        ];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 2,
+        };
+        let entries = vec![SidebarRowInput {
+            window_index: 0,
+            pane_id: 0,
+        }];
         assert!(sidebar_rows(rect, &entries).is_empty());
     }
 
@@ -1384,11 +1401,25 @@ mod tests {
     fn sidebar_rows_truncates_when_rect_too_short_for_all_entries() {
         // rect.h = 5 → (5 - 3) / 3 = 0 entries.
         // rect.h = 6 → (6 - 3) / 3 = 1 entry.
-        let rect_one = Rect { x: 0, y: 0, w: 26, h: 6 };
+        let rect_one = Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 6,
+        };
         let entries = vec![
-            SidebarRowInput { window_index: 0, pane_id: 0 },
-            SidebarRowInput { window_index: 1, pane_id: 1 },
-            SidebarRowInput { window_index: 2, pane_id: 2 },
+            SidebarRowInput {
+                window_index: 0,
+                pane_id: 0,
+            },
+            SidebarRowInput {
+                window_index: 1,
+                pane_id: 1,
+            },
+            SidebarRowInput {
+                window_index: 2,
+                pane_id: 2,
+            },
         ];
         let rows = sidebar_rows(rect_one, &entries);
         assert_eq!(rows.len(), 1);
@@ -1437,11 +1468,7 @@ mod tests {
 
     #[test]
     fn tab_layout_active_chip_reserves_padding_x() {
-        let names = vec![
-            "zsh".to_string(),
-            "vim".to_string(),
-            "git".to_string(),
-        ];
+        let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         // active = 1, not zoomed. Labels: "1:zsh", "2:vim*", "3:git".
         let regions = tab_layout("default", &names, 1, false, 80);
         assert_eq!(regions.len(), 3);
@@ -1533,7 +1560,12 @@ mod tests {
 
     #[test]
     fn compute_regions_reserves_explicit_sidebar_width() {
-        let v = Rect { x: 0, y: 0, w: 100, h: 30 };
+        let v = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 30,
+        };
         let regions = compute_regions(v, true, 30);
         assert_eq!(regions.sidebar.unwrap().w, 30);
         assert_eq!(regions.content_area.w, 100 - 30);
@@ -1542,7 +1574,12 @@ mod tests {
     #[test]
     fn compute_regions_suppresses_sidebar_when_viewport_too_narrow_for_min_width() {
         // 18 cell sidebar + 20 min content = 38 threshold.
-        let v = Rect { x: 0, y: 0, w: 37, h: 20 };
+        let v = Rect {
+            x: 0,
+            y: 0,
+            w: 37,
+            h: 20,
+        };
         let regions = compute_regions(v, true, 18);
         assert!(regions.sidebar.is_none());
     }

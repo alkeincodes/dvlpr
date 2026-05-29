@@ -185,6 +185,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
     let mut agent_tick = tokio::time::interval(Duration::from_millis(500));
     agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let sound_debouncer = crate::sound::SoundDebouncer::new();
 
     let reason: String = loop {
         tokio::select! {
@@ -327,10 +328,16 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             }
             _ = agent_tick.tick() => {
                 let outcome = session.refresh_agent_states(crate::procinfo::process_name);
-                if outcome.changed {
+                let meta_changed = session.refresh_agent_meta(crate::procinfo::pid_cwd);
+                if outcome.changed || meta_changed {
                     dirty = true;
                 }
-                // Sound triggering is added in Task 16.
+                if !outcome.blocked_transitions.is_empty()
+                    && keymap.sound.enabled
+                    && sound_debouncer.try_fire()
+                {
+                    crate::sound::play_blocked(&keymap.sound);
+                }
             }
         }
     };

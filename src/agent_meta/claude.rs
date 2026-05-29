@@ -130,9 +130,7 @@ fn scan_first_user_message(text: &str) -> Option<String> {
         }
         // Look for `message.content` as a string. Skip when it's a
         // structured object (tool-call payloads etc.).
-        let content = v
-            .pointer("/message/content")
-            .or_else(|| v.get("content"))?;
+        let content = v.pointer("/message/content").or_else(|| v.get("content"))?;
         if let Some(s) = content.as_str() {
             // Strip leading whitespace; collapse runs of whitespace
             // into single spaces.
