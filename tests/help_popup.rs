@@ -230,8 +230,10 @@ async fn any_client_can_drive_help() {
 #[tokio::test]
 async fn keybindings_tab_reflects_custom_prefix_end_to_end() {
     let path = temp_socket("custom-prefix");
-    let mut cfg = Config::default();
-    cfg.prefix = KeySpec::Ctrl('a'); // C-a
+    let cfg = Config {
+        prefix: KeySpec::Ctrl('a'), // C-a
+        ..Config::default()
+    };
     spawn_daemon_with(path.clone(), cfg);
     wait_for_socket(&path).await;
     let (mut ar, mut aw) = handshake(&path, 80, 24).await;

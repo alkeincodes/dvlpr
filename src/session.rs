@@ -155,6 +155,7 @@ impl Session {
     /// Create a session with one window holding a single pane running `command`.
     /// Returns the session, the first pane's id, and its output receiver (the
     /// caller spawns a forwarder that tags the output with the pane id).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_name: String,
         command: Vec<String>,

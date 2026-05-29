@@ -286,8 +286,10 @@ mod tests {
 
     #[test]
     fn build_view_keybindings_use_live_rebind() {
-        let mut keys = KeyMap::default();
-        keys.close_pane = KeySpec::Char('k');
+        let keys = KeyMap {
+            close_pane: KeySpec::Char('k'),
+            ..KeyMap::default()
+        };
         let v = build_view(&HelpState::default(), KeySpec::Ctrl('b'), &keys);
         assert!(v.keybindings.iter().any(|r| r.keys == "C-b k"));
     }
