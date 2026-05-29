@@ -521,6 +521,7 @@ fn cell_borders_focused(dir: SplitDir, x: u16, y: u16, focused: Rect) -> bool {
 /// are `Color::Default` the corresponding cells stay default-styled and the
 /// host terminal background shows through. The active tab paints its full
 /// `x_start..=x_end` range (including the 1-cell pads tab_layout reserves).
+#[allow(clippy::too_many_arguments)]
 fn draw_tabs(
     buf: &mut [StyledCell],
     cols: u16,
