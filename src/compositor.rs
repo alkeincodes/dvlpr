@@ -209,21 +209,24 @@ impl Compositor {
         }
 
         // Dialog overlay — top-most, painted after menu and help. Caller keeps at
-        // most one of menu/help/dialog active.
-        if let Some(d) = dialog {
-            draw_dialog(&mut buf, cols, rows, d, theme, content);
-        }
+        // most one of menu/help/dialog active. Returns the input caret so the
+        // real (blinking) terminal cursor can be parked there.
+        let dialog_caret = dialog.and_then(|d| draw_dialog(&mut buf, cols, rows, d, theme, content));
 
-        // Cursor at the focused pane's cursor, mapped to global coordinates.
-        let cursor = match focused_rect {
-            Some(fr) => {
-                let (cx, cy) = lookup(panes, focused).map_or((0, 0), |p| p.cursor());
-                (
-                    fr.x + cx.min(fr.w.saturating_sub(1)),
-                    fr.y + cy.min(fr.h.saturating_sub(1)),
-                )
-            }
-            None => (0, 0),
+        // Cursor: the dialog's input caret when a dialog is open, else the
+        // focused pane's cursor mapped to global coordinates.
+        let cursor = match dialog_caret {
+            Some(c) => c,
+            None => match focused_rect {
+                Some(fr) => {
+                    let (cx, cy) = lookup(panes, focused).map_or((0, 0), |p| p.cursor());
+                    (
+                        fr.x + cx.min(fr.w.saturating_sub(1)),
+                        fr.y + cy.min(fr.h.saturating_sub(1)),
+                    )
+                }
+                None => (0, 0),
+            },
         };
 
         Grid {
@@ -977,9 +980,14 @@ pub fn draw_menu(
     }
 }
 
-/// Paint the window-name dialog: a centered bordered box with a title, the
-/// input buffer (tail-clipped to fit, with a cursor cell), and a hint line.
+/// Paint the window-name dialog: a centered bordered box with a title, a
+/// "Name:" caption, the input buffer (tail-clipped to fit), and a hint line.
 /// Pure — no I/O. Reuses `theme.menu_*` roles. Clamps to `content_area`.
+///
+/// Returns the global `(col, row)` of the input caret so the caller can park
+/// the real terminal cursor there — the terminal blinks its hardware cursor
+/// natively, so no fake-blink glyph is painted. Returns `None` when the box is
+/// too small to render.
 pub fn draw_dialog(
     buf: &mut [StyledCell],
     cols: u16,
@@ -987,7 +995,7 @@ pub fn draw_dialog(
     dialog: &crate::dialog::WindowNameDialog,
     theme: &crate::theme::Theme,
     content_area: crate::layout::Rect,
-) {
+) -> Option<(u16, u16)> {
     use crate::layout::Rect;
 
     let title = dialog.title();
@@ -996,14 +1004,20 @@ pub fn draw_dialog(
         crate::dialog::DialogMode::RenameWindow { .. } => "Enter: rename   Esc: cancel",
     };
 
-    const FIELD_W: u16 = 28;
+    // A roomy modal: a wide input field, two columns of interior padding on
+    // each side, and a tall box with blank rows breathing around the label,
+    // input, and hint. Clamped to the content area; degrades on tiny screens.
+    const FIELD_W: u16 = 44;
+    const PAD_X: u16 = 3;
+    const DESIRED_H: u16 = 9;
     let inner_w = FIELD_W
-        .max(title.chars().count() as u16)
+        .max(title.chars().count() as u16 + 2)
         .max(hint.chars().count() as u16);
-    let box_w = (inner_w + 4).min(content_area.w);
-    let box_h = 5u16.min(content_area.h);
-    if box_w < 4 || box_h < 5 {
-        return;
+    // 2 border cols + PAD_X on each side + inner content width.
+    let box_w = (inner_w + 2 * PAD_X + 2).min(content_area.w);
+    let box_h = DESIRED_H.min(content_area.h);
+    if box_w < 8 || box_h < 5 {
+        return None;
     }
     let x0 = content_area.x + (content_area.w.saturating_sub(box_w)) / 2;
     let y0 = content_area.y + (content_area.h.saturating_sub(box_h)) / 2;
@@ -1048,8 +1062,34 @@ pub fn draw_dialog(
         if x < right { put(buf, x, rect.y, c, border); }
     }
 
-    let field_x = rect.x + 2;
-    let field_max = rect.w.saturating_sub(4) as usize;
+    // Interior rows, breathing room top and bottom. Guarded so a clamped
+    // (short) box never paints onto a border row.
+    let field_x = rect.x + 1 + PAD_X;
+    let field_max = rect.w.saturating_sub(2 + 2 * PAD_X) as usize;
+    let name_row = rect.y + 2;
+    let input_row = rect.y + 3;
+    let hint_row = bottom.saturating_sub(2);
+
+    // A small helper to paint a left-aligned string on an interior row.
+    let put_text = |buf: &mut [StyledCell], row: u16, s: &str, style: CellStyle| {
+        if row <= rect.y || row >= bottom {
+            return;
+        }
+        let mut x = field_x;
+        for c in s.chars() {
+            if x >= right {
+                break;
+            }
+            put(buf, x, row, c, style);
+            x += 1;
+        }
+    };
+
+    // "Name:" caption above the input field.
+    put_text(buf, name_row, "Name:", label);
+
+    // The input buffer, tail-clipped to the field width. The caret is the real
+    // terminal cursor (parked at `caret`), not a painted glyph, so it blinks.
     let shown: String = {
         let v = &dialog.buffer;
         let chars: Vec<char> = v.chars().collect();
@@ -1060,22 +1100,24 @@ pub fn draw_dialog(
             v.clone()
         }
     };
-    let mut col = field_x;
-    for c in shown.chars() {
-        if col >= right { break; }
-        put(buf, col, rect.y + 1, c, label);
-        col += 1;
-    }
-    if col < right {
-        put(buf, col, rect.y + 1, '▏', label);
+    let mut caret = None;
+    if input_row > rect.y && input_row < bottom {
+        let mut col = field_x;
+        for c in shown.chars() {
+            if col >= right {
+                break;
+            }
+            put(buf, col, input_row, c, label);
+            col += 1;
+        }
+        // Caret sits just past the text, clamped inside the field.
+        caret = Some((col.min(right.saturating_sub(1)), input_row));
     }
 
-    let hint_chars: Vec<char> = hint.chars().collect();
-    let hstart = field_x;
-    for (i, &c) in hint_chars.iter().enumerate() {
-        let x = hstart + i as u16;
-        if x < right { put(buf, x, bottom - 1, c, label); }
-    }
+    // Hint line near the bottom.
+    put_text(buf, hint_row, hint, label);
+
+    caret
 }
 
 /// Paint the open help overlay into `buf`. Pure function — no I/O. Mirrors
@@ -1785,6 +1827,27 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         // Bottom pane rect is {x0,y2}; its cursor (2,0) -> global (2,2) -> "\x1b[3;3H".
         assert!(s.ends_with("\x1b[3;3H"));
+    }
+
+    #[test]
+    fn draw_dialog_caret_sits_past_input_text_with_no_painted_glyph() {
+        // The caret is the real (blinking) terminal cursor, so draw_dialog must
+        // report a caret position and must NOT paint a glyph cell there.
+        let (cols, rows) = (60u16, 16u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let theme = crate::theme::Theme::default();
+        let d = crate::dialog::WindowNameDialog::rename(0, "abc");
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        let (cx, cy) = draw_dialog(&mut buf, cols, rows, &d, &theme, content)
+            .expect("dialog should render at this size");
+        let at = |x: u16, y: u16| buf[y as usize * cols as usize + x as usize].ch;
+        assert_eq!(at(cx - 1, cy), 'c', "caret sits just past the last typed char");
+        assert_eq!(at(cx, cy), ' ', "no painted caret glyph — the real cursor goes here");
     }
 
     #[test]
@@ -2868,3 +2931,4 @@ mod tests {
         assert_eq!(corner.ch, '┌');
     }
 }
+
