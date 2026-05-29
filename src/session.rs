@@ -46,7 +46,6 @@ struct Pane {
     branch: Option<String>,
     /// Timestamp of the last successful `refresh_agent_meta` run for this
     /// pane. Initialised 60 s in the past so the first tick fires immediately.
-    #[allow(dead_code)]
     meta_last_refresh: std::time::Instant,
     /// Set of `ErrorKind`s already logged for this pane's meta-refresh, so
     /// we don't spam the log on every tick for a persistent failure.
@@ -937,6 +936,56 @@ impl Session {
             }
         }
         outcome
+    }
+
+    /// Probe each Claude/Codex pane's session label and current git
+    /// branch from its foreground PID's cwd. Gated to once per 2 s
+    /// per pane via `meta_last_refresh`. Returns true if any cached
+    /// field changed.
+    pub fn refresh_agent_meta(
+        &mut self,
+        resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
+    ) -> bool {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            // Only Claude/Codex panes are interesting for v1.
+            let agent = match pane.agent {
+                Some(a) => a,
+                None => continue,
+            };
+            if pane.meta_last_refresh.elapsed() < INTERVAL {
+                continue;
+            }
+            pane.meta_last_refresh = std::time::Instant::now();
+
+            let pid = match pane.runtime.foreground_pid() {
+                Some(p) => p,
+                None => continue,
+            };
+            let cwd = match resolve_cwd(pid) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let new_branch = crate::agent_meta::branch::detect_branch(&cwd);
+            if new_branch != pane.branch {
+                pane.branch = new_branch;
+                changed = true;
+            }
+
+            let new_label = match agent {
+                crate::detect::Agent::Claude => {
+                    crate::agent_meta::claude::session_label(&cwd)
+                }
+                crate::detect::Agent::Codex => pane.screen.title(),
+            };
+            if new_label != pane.session_label {
+                pane.session_label = new_label;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Return one `AgentEntry` per Claude pane in the session, in stable
@@ -1966,5 +2015,44 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].session_label.as_deref(), Some("hello world"));
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_meta_writes_branch_for_pane_with_resolvable_cwd() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        // Classify the pane as Claude so refresh_agent_meta has work to do.
+        session.feed(_pid, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+
+        // Initialize a tempdir as a git repo to feed back to the resolver.
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&canon)
+            .status()
+            .unwrap();
+        let target_cwd = canon.clone();
+
+        let changed = session.refresh_agent_meta(move |_pid| Some(target_cwd.clone()));
+        assert!(changed);
+
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_meta_skips_when_within_interval() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+
+        // First refresh forces the work (meta_last_refresh was pre-aged
+        // on Pane construction).
+        let _ = session.refresh_agent_meta(|_| Some(std::path::PathBuf::from("/")));
+        // Second refresh within 2 s skips and returns false.
+        let changed = session.refresh_agent_meta(|_| Some(std::path::PathBuf::from("/")));
+        assert!(!changed, "second refresh within 2s must be a no-op");
     }
 }
