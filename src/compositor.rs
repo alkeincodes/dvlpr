@@ -166,16 +166,17 @@ impl Compositor {
         // Status/tab bar (always present): session prefix at the left, then tabs.
         {
             let ty = regions.tab_status_row;
-            let tab_regions =
-                layout::tab_layout(session_name, tab_names, active_window, zoomed, cols);
+            let bar =
+                layout::tab_bar_layout(session_name, tab_names, active_window, zoomed, cols);
             draw_tabs(
                 &mut buf,
                 cols,
                 ty,
                 session_name,
-                &tab_regions,
+                &bar.tabs,
                 active_window,
                 theme,
+                bar.plus.as_ref(),
             );
         }
 
@@ -528,6 +529,7 @@ fn draw_tabs(
     regions: &[layout::TabRegion],
     active_window: usize,
     theme: &crate::theme::Theme,
+    plus: Option<&layout::PlusButton>,
 ) {
     // Step 1 — row fill: only paint if bar_bg is opaque. When it's Color::Default
     // (the shipping flavors), cells stay as StyledCell::default() and the host
@@ -615,6 +617,25 @@ fn draw_tabs(
                 if idx < buf.len() {
                     buf[idx] = StyledCell { ch, style };
                 }
+            }
+        }
+    }
+
+    // Step 4 — "[+]" new-window button (inactive-tab style, clipped).
+    if let Some(b) = plus {
+        let style = CellStyle {
+            bg: theme.inactive_tab_bg,
+            fg: theme.inactive_tab_fg,
+            ..CellStyle::default()
+        };
+        for (j, ch) in layout::PLUS_LABEL.chars().enumerate() {
+            let x = b.x_start.saturating_add(j as u16);
+            if x > b.x_end || x >= cols {
+                break;
+            }
+            let idx = ty as usize * cols as usize + x as usize;
+            if idx < buf.len() {
+                buf[idx] = StyledCell { ch, style };
             }
         }
     }
@@ -1194,7 +1215,7 @@ mod tests {
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;
         let regions = layout::tab_layout("work", &names, active_window, false, cols);
-        draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme);
+        draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme, None);
 
         // Active region (window 1, "2:vim*") spans the full chip range.
         let r1 = &regions[1];
@@ -1243,6 +1264,7 @@ mod tests {
             &regions,
             0,
             &crate::theme::Theme::default(),
+            None,
         );
         // Row 1 is the tab row: its flat offset is 1*cols == cols.
         let row: String = (0..cols)
@@ -1347,12 +1369,15 @@ mod tests {
     #[test]
     fn render_includes_tab_bar_for_both_single_and_multiple_windows() {
         let tree = Node::Leaf(1);
-        let pane = StubScreen::new(20, 1, &["hello"], (0, 0));
+        // Use 30 cols so tab_bar_layout has enough room after reserving PLUS_RESERVE (5)
+        // for the "[+]" button. With w=20 the active chip "2:two*" (8 cells) would
+        // overflow the reduced tab area (20-5=15 < 3+5+1+8=17).
+        let pane = StubScreen::new(30, 1, &["hello"], (0, 0));
         let c = Compositor::new();
         let vp = Rect {
             x: 0,
             y: 0,
-            w: 20,
+            w: 30,
             h: 2,
         };
         // Two windows -> the bottom row has session prefix + tab labels.
@@ -1807,7 +1832,7 @@ mod tests {
         };
         let names = vec!["a".to_string()];
         let regions = layout::tab_layout("s", &names, 0, false, cols);
-        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme);
+        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme, None);
 
         // The cell BEFORE the active chip (after the 2-cell prefix gap) must
         // remain default — no row fill should have touched it.
@@ -1834,7 +1859,7 @@ mod tests {
         };
         let names: Vec<String> = vec![];
         let regions = layout::tab_layout("session", &names, 0, false, cols);
-        draw_tabs(&mut buf, cols, 0, "session", &regions, 0, &theme);
+        draw_tabs(&mut buf, cols, 0, "session", &regions, 0, &theme, None);
 
         // Session prefix cells carry the session_fg but bg is Color::Default.
         for (x, ch) in "session".chars().enumerate() {
@@ -1858,7 +1883,7 @@ mod tests {
         // Two tabs, active = 0 so we can inspect tab 1's inactive cells.
         let names = vec!["zsh".to_string(), "vim".to_string()];
         let regions = layout::tab_layout("s", &names, 0, false, cols);
-        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme);
+        draw_tabs(&mut buf, cols, 0, "s", &regions, 0, &theme, None);
 
         let inactive = &regions[1];
         for x in inactive.x_start..=inactive.x_end {
@@ -1895,7 +1920,7 @@ mod tests {
             x_end: 8, // chip occupies 6 cells; cells 9..30 must stay default
             label: "1:zsh*".to_string(),
         }];
-        draw_tabs(&mut buf, cols, 0, "x", &regions, 0, &theme);
+        draw_tabs(&mut buf, cols, 0, "x", &regions, 0, &theme, None);
 
         for x in 9..cols {
             assert_eq!(
@@ -1928,7 +1953,7 @@ mod tests {
         // zoomed = true ⇒ active label "2:vim*Z" (7 chars), chip 9 cells wide.
         let regions = layout::tab_layout("default", &names, 1, true, cols);
         let r1 = &regions[1];
-        draw_tabs(&mut buf, cols, 0, "default", &regions, 1, &theme);
+        draw_tabs(&mut buf, cols, 0, "default", &regions, 1, &theme, None);
 
         // The 'Z' character lands at x_start + 1 (left pad) + 6 (label offset)
         // = x_start + 7, which equals x_end - 1.
@@ -2293,6 +2318,59 @@ mod tests {
         assert_eq!(buf[pos(rect.x, rect.y)].style.bg, theme.menu_bg);
         assert_ne!(buf[pos(rect.x, rect.y)].style.bg, pane_fill.style.bg);
         assert_eq!(buf[pos(rect.x + rect.w, rect.y)], pane_fill);
+    }
+
+    #[test]
+    fn draw_tabs_paints_plus_button_glyph() {
+        let cols = 40u16;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let names = vec!["a".to_string()];
+        let bar = layout::tab_bar_layout("s", &names, 0, false, cols);
+        let pb = bar.plus.expect("button present");
+        let theme = crate::theme::Theme::default();
+        draw_tabs(&mut buf, cols, 0, "s", &bar.tabs, 0, &theme, Some(&pb));
+        let glyph: String = (pb.x_start..=pb.x_end).map(|x| buf[x as usize].ch).collect();
+        assert_eq!(glyph, "[+]");
+    }
+
+    #[test]
+    fn draw_tabs_plus_button_uses_inactive_style() {
+        let cols = 40u16;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let names = vec!["a".to_string()];
+        let bar = layout::tab_bar_layout("s", &names, 0, false, cols);
+        let pb = bar.plus.expect("button present");
+        let theme = crate::theme::Theme::default();
+        draw_tabs(&mut buf, cols, 0, "s", &bar.tabs, 0, &theme, Some(&pb));
+        let cell = buf[pb.x_start as usize];
+        assert_eq!(cell.style.fg, theme.inactive_tab_fg);
+        assert_eq!(cell.style.bg, theme.inactive_tab_bg);
+    }
+
+    #[test]
+    fn draw_tabs_without_plus_button_paints_no_glyph() {
+        let cols = 40u16;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let names = vec!["a".to_string()];
+        let bar = layout::tab_bar_layout("s", &names, 0, false, cols);
+        let pb = bar.plus.expect("button present");
+        let theme = crate::theme::Theme::default();
+        // Pass None — the button cells must remain blank.
+        draw_tabs(&mut buf, cols, 0, "s", &bar.tabs, 0, &theme, None);
+        let glyph: String = (pb.x_start..=pb.x_end).map(|x| buf[x as usize].ch).collect();
+        assert!(!glyph.contains('+'), "no glyph should be painted when plus is None");
+    }
+
+    #[test]
+    fn draw_tabs_plus_button_clipped_at_cols_does_not_panic() {
+        let cols = 10u16;
+        let mut buf = vec![StyledCell::default(); cols as usize];
+        let theme = crate::theme::Theme::default();
+        // Manually construct a button whose x_end runs past the buffer; the
+        // paint loop must clip at `cols` and not panic.
+        let pb = layout::PlusButton { x_start: cols - 1, x_end: cols + 2 };
+        draw_tabs(&mut buf, cols, 0, "x", &[], 0, &theme, Some(&pb));
+        assert_eq!(buf[(cols - 1) as usize].ch, '[');
     }
 
     #[test]
