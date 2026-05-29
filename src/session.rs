@@ -811,6 +811,9 @@ impl Session {
                 self.menu = None;
                 self.new_window(None, &mut eff)
             }
+            Command::OpenNewWindowDialog => {
+                self.open_new_window_dialog();
+            }
             Command::NextWindow => {
                 if !self.windows.is_empty() {
                     self.unzoom_active();
@@ -3952,5 +3955,22 @@ mod tests {
         assert!(consumed.is_some(), "the dialog still swallows the event");
         assert_eq!(s.dialog_buffer_for_test(), "ab", "arrow keys do not edit the name");
         assert!(s.dialog_is_open_for_test(), "an arrow key does not close the dialog");
+    }
+
+    #[tokio::test]
+    async fn open_new_window_dialog_command_opens_dialog_without_creating() {
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        let _eff = s.apply_command(Command::OpenNewWindowDialog);
+        assert!(s.dialog_is_open_for_test());
+        assert_eq!(s.window_count_for_test(), before, "no window yet — dialog only");
+    }
+
+    #[tokio::test]
+    async fn new_window_command_still_creates_directly() {
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        let _eff = s.apply_command(Command::NewWindow);
+        assert_eq!(s.window_count_for_test(), before + 1, "NewWindow stays a direct create");
     }
 }

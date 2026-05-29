@@ -22,6 +22,7 @@ pub enum Command {
     SplitVertical,
     ClosePane,
     NewWindow,
+    OpenNewWindowDialog, // prefix c: open the New Window name dialog
     NextWindow,
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
@@ -399,7 +400,7 @@ impl Config {
         } else if k.close_pane.matches(key) {
             Some(Command::ClosePane)
         } else if k.new_window.matches(key) {
-            Some(Command::NewWindow)
+            Some(Command::OpenNewWindowDialog)
         } else if k.next_window.matches(key) {
             Some(Command::NextWindow)
         } else if k.prev_window.matches(key) {
@@ -545,7 +546,7 @@ mod tests {
             Some(Command::SplitVertical)
         );
         assert_eq!(c.resolve(&Key::Char(b'x')), Some(Command::ClosePane));
-        assert_eq!(c.resolve(&Key::Char(b'c')), Some(Command::NewWindow));
+        assert_eq!(c.resolve(&Key::Char(b'c')), Some(Command::OpenNewWindowDialog));
         assert_eq!(c.resolve(&Key::Char(b'?')), Some(Command::ShowHelp));
         assert_eq!(c.resolve(&Key::Char(b'z')), None);
     }
@@ -708,5 +709,14 @@ flavor = "one-dark"
     fn malformed_help_key_falls_back_to_question_mark() {
         let c = Config::from_toml_str("[keys]\nhelp = \"Nonsense\"\n");
         assert_eq!(c.keys.help, KeySpec::Char('?'));
+    }
+
+    #[test]
+    fn new_window_key_resolves_to_open_dialog() {
+        let c = Config::default();
+        assert_eq!(
+            c.resolve(&Key::Char(b'c')),
+            Some(Command::OpenNewWindowDialog)
+        );
     }
 }
