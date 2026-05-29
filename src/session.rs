@@ -4010,6 +4010,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn right_click_tab_while_menu_open_reanchors_to_tab_menu() {
+        use crate::input::{MouseEvent, MouseKind};
+        use crate::menu::{MenuKind, MenuState};
+        let mut s = test_session();
+        let row = s.tab_status_row_1based_for_test();
+        // A menu is already open, anchored away from the target tab.
+        s.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Tab { window: 0 },
+            anchor: (1, row),
+            highlighted: 0,
+        }));
+        let regions = s.tab_regions_for_test();
+        let t0 = &regions[0];
+        let mut drag = None;
+        // Right-click a tab while a menu is open → reanchor to that tab's menu
+        // (exercises the Hit::Tab arm of handle_menu_mouse's button-2 reanchor).
+        let _ = s.handle_mouse(
+            MouseEvent {
+                button: 2,
+                col: t0.x_start + 1,
+                row,
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        match s.menu_kind_for_test() {
+            Some(MenuKind::Tab { window }) => assert_eq!(window, 0),
+            other => panic!("expected reanchored tab menu, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn right_click_on_pane_still_opens_pane_menu() {
         use crate::input::{MouseEvent, MouseKind};
         use crate::menu::MenuKind;
