@@ -326,9 +326,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 }
             }
             _ = agent_tick.tick() => {
-                if session.refresh_agent_states(crate::procinfo::process_name) {
+                let outcome = session.refresh_agent_states(crate::procinfo::process_name);
+                if outcome.changed {
                     dirty = true;
                 }
+                // Sound triggering is added in Task 16.
             }
         }
     };

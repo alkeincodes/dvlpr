@@ -133,6 +133,15 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
+/// Outcome of `Session::refresh_agent_states`. Tracks whether anything
+/// changed (gates redraws) and which pane(s) just transitioned into
+/// `Blocked` (drives the sound trigger in `server::run`).
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    pub changed: bool,
+    pub blocked_transitions: Vec<crate::layout::PaneId>,
+}
+
 impl Session {
     /// Create a session with one window holding a single pane running `command`.
     /// Returns the session, the first pane's id, and its output receiver (the
@@ -787,8 +796,11 @@ impl Session {
     /// `resolve_name` matches the `Fn(i32) -> Option<String>` shape that
     /// `refresh_window_names` uses, so tests can inject a deterministic
     /// resolver.
-    pub fn refresh_agent_states(&mut self, resolve_name: impl Fn(i32) -> Option<String>) -> bool {
-        let mut changed = false;
+    pub fn refresh_agent_states(
+        &mut self,
+        resolve_name: impl Fn(i32) -> Option<String>,
+    ) -> RefreshOutcome {
+        let mut outcome = RefreshOutcome::default();
         // Sentinel-file gate (vs env var): survives across server restarts you
         // don't control, and works regardless of how the server was launched.
         // `touch /tmp/dvlpr-detect.enable` to turn on, `rm` to turn off — the
@@ -838,7 +850,7 @@ impl Session {
                 Some(a) => a,
                 None => {
                     if pane.agent_state != prev_state {
-                        changed = true;
+                        outcome.changed = true;
                     }
                     continue;
                 }
@@ -861,53 +873,70 @@ impl Session {
             // structurally distinctive, so extra context can't false-match.
             let tail = pane.screen.tail_text(pane.screen.rows());
 
-            // Step 4: Classify.
-            let candidate = detect::classify(agent, &tail);
+            // Step 4: Classify — with Codex short-circuit.
+            // Codex panes stay at Idle (v1: no state model yet); only Claude
+            // panes go through the full stabilizer + blocked-transition check.
+            match agent {
+                detect::Agent::Claude => {
+                    let candidate = detect::classify(detect::Agent::Claude, &tail);
 
-            // Debug instrumentation: when DVLPR_DETECT_DEBUG is set, append
-            // every claude pane's sampled tail + classify result to
-            // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
-            // env var is unset. Use to verify what tail_text actually sees
-            // when classify disagrees with what's on screen.
-            if debug {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/dvlpr-detect.log")
-                {
-                    let _ = writeln!(
-                        f,
-                        "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
-                    );
-                }
-            }
-
-            // Step 5: Stabilize.
-            match candidate {
-                detect::AgentState::Working | detect::AgentState::Blocked => {
-                    pane.agent_state = candidate;
-                    pane.idle_streak = 0;
-                }
-                detect::AgentState::Idle => {
-                    if pane.agent_state != detect::AgentState::Idle {
-                        pane.idle_streak = pane.idle_streak.saturating_add(1);
-                        if pane.idle_streak >= 2 {
-                            pane.agent_state = detect::AgentState::Idle;
-                            pane.idle_streak = 2;
+                    // Debug instrumentation: when the sentinel file exists, append
+                    // every claude pane's sampled tail + classify result to
+                    // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
+                    // file is absent.
+                    if debug {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/dvlpr-detect.log")
+                        {
+                            let _ = writeln!(
+                                f,
+                                "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
+                            );
                         }
-                    } else {
-                        // Already Idle — keep streak saturated at 2.
-                        pane.idle_streak = 2;
                     }
+
+                    // Step 5: Stabilize.
+                    match candidate {
+                        detect::AgentState::Working | detect::AgentState::Blocked => {
+                            pane.agent_state = candidate;
+                            pane.idle_streak = 0;
+                        }
+                        detect::AgentState::Idle => {
+                            if pane.agent_state != detect::AgentState::Idle {
+                                pane.idle_streak = pane.idle_streak.saturating_add(1);
+                                if pane.idle_streak >= 2 {
+                                    pane.agent_state = detect::AgentState::Idle;
+                                    pane.idle_streak = 2;
+                                }
+                            } else {
+                                // Already Idle — keep streak saturated at 2.
+                                pane.idle_streak = 2;
+                            }
+                        }
+                    }
+
+                    // Emit a blocked transition on the first Working→Blocked (or
+                    // Idle→Blocked) edge; subsequent Blocked→Blocked ticks do not
+                    // re-emit (prev_state == Blocked on those passes).
+                    if crate::sound::should_play_blocked(prev_state, pane.agent_state) {
+                        outcome.blocked_transitions.push(*pane_id);
+                    }
+                }
+                detect::Agent::Codex => {
+                    // v1: Codex panes stay at Idle. No classification, no transitions.
+                    pane.agent_state = detect::AgentState::Idle;
+                    pane.idle_streak = 0;
                 }
             }
 
             if pane.agent_state != prev_state {
-                changed = true;
+                outcome.changed = true;
             }
         }
-        changed
+        outcome
     }
 
     /// Return one `AgentEntry` per Claude pane in the session, in stable
@@ -1000,8 +1029,8 @@ mod tests {
     async fn refresh_agent_states_marks_pane_working_after_busy_sample() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed, "first refresh should flip pane state");
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed, "first refresh should flip pane state");
         let pane = session.panes.get(&pane_id).expect("pane present");
         assert_eq!(pane.agent, Some(detect::Agent::Claude));
         assert_eq!(pane.agent_state, detect::AgentState::Working);
@@ -1011,8 +1040,8 @@ mod tests {
     async fn refresh_agent_states_marks_pane_blocked_after_blocked_sample() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed);
         let pane = session.panes.get(&pane_id).expect("pane present");
         assert_eq!(pane.agent_state, detect::AgentState::Blocked);
     }
@@ -1056,8 +1085,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_agent_states_returns_false_when_nothing_changed() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(!outcome.changed);
         let _ = pane_id;
     }
 
@@ -1065,8 +1094,8 @@ mod tests {
     async fn refresh_agent_states_ignores_non_agent_panes() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| Some("zsh".to_string()));
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("zsh".to_string()));
+        assert!(!outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert!(pane.agent.is_none());
         assert_eq!(pane.agent_state, detect::AgentState::Idle);
@@ -1076,14 +1105,14 @@ mod tests {
     async fn refresh_agent_states_retries_resolver_on_transient_failure() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
         session.feed(pane_id, b"esc to interrupt\n");
-        let changed = session.refresh_agent_states(|_pid| None);
-        assert!(!changed);
+        let outcome = session.refresh_agent_states(|_pid| None);
+        assert!(!outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert!(pane.agent.is_none());
         assert!(pane.agent_id_pid.is_none(), "cache key NOT poisoned");
 
-        let changed = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-        assert!(changed);
+        let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        assert!(outcome.changed);
         let pane = session.panes.get(&pane_id).unwrap();
         assert_eq!(pane.agent_state, detect::AgentState::Working);
     }
@@ -1868,6 +1897,56 @@ mod tests {
         )
         .expect("Session::new");
         assert_eq!(session.sidebar_width(), 30);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_returns_empty_outcome_when_no_change() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        // Drive the resolver to None — pane has no agent, no transitions.
+        let outcome = session.refresh_agent_states(|_| None);
+        assert!(outcome.blocked_transitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_emits_pane_id_on_working_to_blocked() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Pass 1: classify as Working.
+        session.feed(pane_id, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+        // Pass 2: clear screen and feed a blocked-style tail.
+        session.feed(
+            pane_id,
+            b"\x1b[2J\x1b[HDo you want to proceed?\n\xe2\x9d\xaf 1. Yes\n",
+        );
+        let outcome = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert!(outcome.changed);
+        assert_eq!(outcome.blocked_transitions, vec![pane_id]);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_does_not_emit_when_already_blocked() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Two passes that both classify as Blocked → only one transition.
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        let first = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(first.blocked_transitions, vec![pane_id]);
+        let second = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert!(second.blocked_transitions.is_empty(),
+                "Blocked→Blocked must not re-emit");
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_skips_classifier_for_codex_panes() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Feed a tail that WOULD trigger Claude's blocked detector.
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        // Resolve as codex — exercises the Codex short-circuit.
+        let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
+        assert!(outcome.blocked_transitions.is_empty(),
+                "Codex must not emit blocked");
+        let pane = session.panes.get(&pane_id).expect("pane");
+        assert_eq!(pane.agent, Some(crate::detect::Agent::Codex));
+        assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
     }
 
     #[tokio::test]
