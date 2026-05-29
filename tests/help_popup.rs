@@ -98,12 +98,13 @@ async fn until_frame_contains(r: &mut Reader, secs: u64, needle: &[u8]) -> bool 
     while let Ok(Ok(Some(msg))) =
         tokio::time::timeout_at(deadline, read_msg::<_, ServerMsg>(r)).await
     {
-        if let ServerMsg::Frame { data, .. } = msg {
-            if data.windows(needle.len()).any(|w| w == needle) {
-                return true;
+        match msg {
+            ServerMsg::Frame { data, .. } => {
+                if data.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
             }
-        } else {
-            break;
+            ServerMsg::Detach | ServerMsg::Closed { .. } => break,
         }
     }
     false
@@ -144,6 +145,7 @@ async fn clicking_commands_tab_switches_content() {
 
     send_input(&mut aw, PREFIX_QUESTION).await;
     assert!(until_frame_contains(&mut ar, 3, "Keybindings".as_bytes()).await);
+    let _ = collect_frames(&mut ar, 1).await;
 
     // Click the Commands tab. Geometry on an 80x24 client (derived the same way
     // the renderer lays it out, and pinned precisely by the Task 7 unit test
@@ -218,6 +220,7 @@ async fn any_client_can_drive_help() {
     // A opens.
     send_input(&mut aw, PREFIX_QUESTION).await;
     assert!(until_frame_contains(&mut br, 3, "Keybindings".as_bytes()).await);
+    let _ = collect_frames(&mut ar, 1).await;
 
     // B switches to Commands with the Right arrow.
     send_input(&mut bw, b"\x1b[C").await;
