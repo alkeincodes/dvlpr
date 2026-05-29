@@ -169,6 +169,17 @@ mod tests {
     }
 
     #[test]
+    fn done_to_blocked_rings() {
+        // A finished (Done) pane that gets a new prompt should still alert.
+        assert!(should_play_blocked(Done, Blocked));
+    }
+
+    #[test]
+    fn done_to_idle_is_silent() {
+        assert!(!should_play_blocked(Done, Idle));
+    }
+
+    #[test]
     fn debouncer_allows_first_fire_then_blocks_second() {
         let d = SoundDebouncer::new();
         assert!(d.try_fire());

@@ -3104,6 +3104,8 @@ mod tests {
     }
 
     /// Drive pane to confirmed-idle from a prior non-idle state (2 idle ticks).
+    /// The pane MUST already be Working or Blocked when called; on an already-Idle
+    /// pane this is a no-op (stays Idle, never Done).
     fn finish_after(session: &mut Session, pane: crate::layout::PaneId) {
         session.feed(pane, b"\x1b[2J\x1b[H");
         session.refresh_agent_states(|_| Some("claude".to_string())); // streak 1
@@ -3273,6 +3275,26 @@ mod tests {
         assert_eq!(
             session.panes.get(&pane_a).unwrap().agent_state,
             detect::AgentState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn done_resumes_to_working_when_agent_restarts_unfocused() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        finish_after(&mut session, pane_a); // → Done
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
+        // Agent picks up a new task while still unfocused → back to Working
+        // (Done is not sticky against real activity).
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Working
         );
     }
 
