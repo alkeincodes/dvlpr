@@ -440,6 +440,18 @@ impl Session {
         self.dialog.is_some()
     }
 
+    #[cfg(test)]
+    pub fn window_count_for_test(&self) -> usize {
+        self.windows.len()
+    }
+
+    #[cfg(test)]
+    pub fn dialog_insert_for_test(&mut self, c: char) {
+        if let Some(d) = self.dialog.as_mut() {
+            d.insert_char(c);
+        }
+    }
+
     /// Open the New Window dialog. Closes any open menu (mutual exclusion).
     pub fn open_new_window_dialog(&mut self) {
         self.menu = None;
@@ -453,6 +465,45 @@ impl Session {
         let name = w.name.clone();
         self.menu = None;
         self.dialog = Some(crate::dialog::WindowNameDialog::rename(window, &name));
+    }
+
+    /// Apply the open dialog's buffer and close it. Returns the effect (a New
+    /// Window submit spawns a pane). No-op effect if no dialog is open.
+    pub fn submit_dialog(&mut self) -> CommandEffect {
+        let mut eff = CommandEffect::default();
+        let Some(dialog) = self.dialog.take() else {
+            return eff;
+        };
+        let value = dialog.value().to_string();
+        match dialog.mode {
+            crate::dialog::DialogMode::NewWindow => {
+                self.unzoom_active();
+                let pinned = if value.is_empty() { None } else { Some(value) };
+                self.new_window(pinned, &mut eff);
+            }
+            crate::dialog::DialogMode::RenameWindow { window } => {
+                // Do NOT hold a `&mut Window` across `refresh_window_names`
+                // (that would be a mutable-borrow conflict). Index for the flag
+                // write and release the borrow before re-deriving.
+                if window < self.windows.len() {
+                    if value.is_empty() {
+                        // Un-pin: revert to auto and re-derive immediately.
+                        self.windows[window].name_pinned = false;
+                        self.refresh_window_names(crate::procinfo::process_name);
+                    } else {
+                        let w = &mut self.windows[window];
+                        w.name = value;
+                        w.name_pinned = true;
+                    }
+                }
+            }
+        }
+        eff
+    }
+
+    /// Discard the open dialog without applying it.
+    pub fn cancel_dialog(&mut self) {
+        self.dialog = None;
     }
 
     #[cfg(test)]
@@ -696,7 +747,7 @@ impl Session {
             Command::NewWindow => {
                 self.unzoom_active(); // leaving the current window
                 self.menu = None;
-                self.new_window(&mut eff)
+                self.new_window(None, &mut eff)
             }
             Command::NextWindow => {
                 if !self.windows.is_empty() {
@@ -807,7 +858,7 @@ impl Session {
         self.pane_exited(focused)
     }
 
-    fn new_window(&mut self, eff: &mut CommandEffect) {
+    fn new_window(&mut self, pinned_name: Option<String>, eff: &mut CommandEffect) {
         let content =
             layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
                 .content_area;
@@ -815,9 +866,13 @@ impl Session {
             Ok(v) => v,
             Err(_) => return,
         };
+        let (name, name_pinned) = match pinned_name {
+            Some(n) => (n, true),
+            None => (initial_window_name(&self.command), false),
+        };
         self.windows.push(Window {
-            name: initial_window_name(&self.command),
-            name_pinned: false,
+            name,
+            name_pinned,
             root: Node::Leaf(id),
             focused: id,
             zoomed: false,
@@ -3732,5 +3787,34 @@ mod tests {
         assert!(s.dialog_is_open_for_test());
         let frame = String::from_utf8_lossy(&s.render()).to_string();
         assert!(frame.contains("New Window"), "dialog title should render");
+    }
+
+    #[tokio::test]
+    async fn submitting_new_window_dialog_with_name_creates_pinned_window() {
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        s.open_new_window_dialog();
+        for c in "build".chars() {
+            s.dialog_insert_for_test(c);
+        }
+        let _eff = s.submit_dialog();
+        assert!(!s.dialog_is_open_for_test(), "submit closes the dialog");
+        assert_eq!(s.window_count_for_test(), before + 1);
+        let names = s.window_names_for_test();
+        assert_eq!(*names.last().unwrap(), "build");
+        // Pinned: a refresh must not rename it.
+        s.refresh_window_names(|_| Some("zsh".to_string()));
+        assert_eq!(*s.window_names_for_test().last().unwrap(), "build");
+    }
+
+    #[tokio::test]
+    async fn submitting_new_window_dialog_empty_creates_auto_window() {
+        let mut s = test_session();
+        s.open_new_window_dialog();
+        let _eff = s.submit_dialog();
+        assert!(!s.dialog_is_open_for_test());
+        // The new window is auto: a refresh CAN rename it.
+        s.refresh_window_names(|_| Some("zsh".to_string()));
+        assert_eq!(*s.window_names_for_test().last().unwrap(), "zsh");
     }
 }
