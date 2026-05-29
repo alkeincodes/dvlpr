@@ -469,6 +469,11 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub fn active_window_in_range_for_test(&self) -> bool {
+        self.windows.is_empty() || self.active_window < self.windows.len()
+    }
+
+    #[cfg(test)]
     pub fn dialog_buffer_for_test(&self) -> String {
         self.dialog.as_ref().map(|d| d.buffer.clone()).unwrap_or_default()
     }
@@ -3960,6 +3965,61 @@ mod tests {
         );
         assert!(s.dialog_is_open_for_test(), "[+] opens the New Window dialog");
         assert_eq!(s.window_count_for_test(), before, "no window created yet");
+    }
+
+    #[tokio::test]
+    async fn close_window_removes_window_and_returns_runtimes() {
+        let mut s = test_session();
+        s.apply_command(Command::NewWindow); // now 2 windows, active = 1
+        let before = s.window_count_for_test();
+        let closed = s.close_window(1);
+        assert_eq!(s.window_count_for_test(), before - 1);
+        assert!(!closed.is_empty(), "closing a window returns its pane runtime(s)");
+        assert!(s.active_window_in_range_for_test(), "active_window stays valid");
+        // Tear the runtimes down properly — a bare drop runs blocking kill()/wait()
+        // (see PaneRuntime::close in src/pane/mod.rs); existing tests do the same.
+        for rt in closed {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_menu_rename_action_opens_rename_dialog() {
+        use crate::input::InputEvent;
+        use crate::menu::{MenuKind, MenuState};
+        let mut s = test_session();
+        let row = s.tab_status_row_1based_for_test();
+        // Open a tab menu for window 0, highlight "Rename" (index 0), press Enter.
+        s.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Tab { window: 0 },
+            anchor: (3, row),
+            highlighted: 0,
+        }));
+        let _eff = s.try_consume_menu_event(&InputEvent::Pane(b"\r".to_vec()));
+        assert!(s.dialog_is_open_for_test(), "Rename opens the dialog");
+        assert_eq!(s.dialog_buffer_for_test(), s.window_names_for_test()[0]);
+    }
+
+    #[tokio::test]
+    async fn tab_menu_close_action_closes_window() {
+        use crate::input::InputEvent;
+        use crate::menu::{MenuKind, MenuState};
+        let mut s = test_session();
+        s.apply_command(Command::NewWindow); // 2 windows
+        let before = s.window_count_for_test();
+        let row = s.tab_status_row_1based_for_test();
+        // Tab menu for window 1, highlight "Close" (index 1), Enter.
+        s.set_menu_for_test(Some(MenuState {
+            kind: MenuKind::Tab { window: 1 },
+            anchor: (3, row),
+            highlighted: 1,
+        }));
+        let eff = s.try_consume_menu_event(&InputEvent::Pane(b"\r".to_vec()));
+        assert_eq!(s.window_count_for_test(), before - 1);
+        // Close the runtimes the dispatch returned (a bare drop blocks).
+        for rt in eff.unwrap_or_default().closed {
+            rt.close();
+        }
     }
 
     #[tokio::test]
