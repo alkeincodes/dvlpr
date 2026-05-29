@@ -17,3 +17,4 @@ pub mod server;
 pub mod session;
 pub mod sound;
 pub mod theme;
+pub mod update;

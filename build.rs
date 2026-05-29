@@ -19,6 +19,18 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendor = manifest_dir.join("vendor/libghostty-vt");
     let target = env::var("TARGET").unwrap();
+    // Expose the build-time target triple to the binary so `dvlpr --version`
+    // and `dvlpr update`'s asset selector can read it via env!().
+    println!("cargo:rustc-env=DVLPR_TARGET={}", target);
+
+    // Release-host repo — fork builds override via the DVLPR_RELEASE_REPO env
+    // var at build time. rerun-if-env-changed guarantees cargo rebuilds when
+    // the override flips.
+    println!("cargo:rerun-if-env-changed=DVLPR_RELEASE_REPO");
+    let release_repo =
+        env::var("DVLPR_RELEASE_REPO").unwrap_or_else(|_| "alkeincodes/dvlpr".into());
+    println!("cargo:rustc-env=DVLPR_RELEASE_REPO={}", release_repo);
+
     let zig_target = zig_target(&target);
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".to_string());
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());

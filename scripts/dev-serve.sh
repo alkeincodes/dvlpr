@@ -15,7 +15,7 @@ set -euo pipefail
 PORT="${1:-8080}"
 DIST="/tmp/dvlpr-installer"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TEMPLATE="${REPO_ROOT}/scripts/install.sh"
+TEMPLATE="${REPO_ROOT}/scripts/dev-install.sh"
 
 [ -f "${TEMPLATE}" ] || { echo "Missing ${TEMPLATE}" >&2; exit 1; }
 

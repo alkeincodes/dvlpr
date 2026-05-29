@@ -33,6 +33,18 @@ async fn main() {
             print!("{}", dvlpr::help::cli_help());
             std::process::exit(0);
         }
+        Cmd::Version => {
+            println!(
+                "dvlpr {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("DVLPR_TARGET")
+            );
+            Ok(())
+        }
+        Cmd::Update => {
+            let code = dvlpr::update::run();
+            std::process::exit(code);
+        }
         Cmd::Usage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
@@ -73,6 +85,10 @@ enum Cmd {
     },
     /// `dvlpr -h` / `dvlpr --help` / `dvlpr help` — print command list (exit 0)
     Help,
+    /// `dvlpr --version` / `-V` — prints `dvlpr <CARGO_PKG_VERSION> (<DVLPR_TARGET>)`.
+    Version,
+    /// `dvlpr update` — fetch the latest GH release and replace this binary.
+    Update,
     /// A usage error to print on stderr (exit 2)
     Usage(String),
 }
@@ -91,13 +107,16 @@ fn parse_args(args: &[String]) -> Cmd {
     // `help::COMMAND_ROWS` (src/help/mod.rs). When you add/rename/remove a
     // subcommand here, update that table (and its coverage test) to match.
     const USAGE: &str =
-        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name>";
+        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name> | update | --version";
     // `-h`/`--help` anywhere, or a bare `help` subcommand, prints the command
     // list. Checked before routing so `dvlpr ls --help` shows help, not an error.
     if args.iter().any(|a| a == "-h" || a == "--help")
         || args.first().map(String::as_str) == Some("help")
     {
         return Cmd::Help;
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        return Cmd::Version;
     }
     match args.first().map(String::as_str) {
         None => Cmd::Run {
@@ -142,6 +161,14 @@ fn parse_args(args: &[String]) -> Cmd {
             },
             _ => Cmd::Usage("usage: dvlpr ssh <destination> [session]".into()),
         },
+        Some("update") => match args.len() {
+            1 => Cmd::Update,
+            _ => Cmd::Usage("usage: dvlpr update".into()),
+        },
+        // `version` is not a subcommand — use `-V` or `--version`.
+        Some("version") => {
+            Cmd::Usage("use `dvlpr --version` or `dvlpr -V` (no subcommand alias)".into())
+        }
         // A single bare token is a session name (create-or-attach shorthand); extra
         // positional junk is a usage error rather than a silently-ignored typo.
         Some(name) => {
@@ -492,5 +519,26 @@ mod tests {
             session: None,
         };
         assert_eq!(nested_block(&ssh, Some("parent")), None);
+    }
+
+    #[test]
+    fn parse_args_version_flag_routes_to_version_cmd() {
+        assert_eq!(parse_args(&v(&["-V"])), Cmd::Version);
+        assert_eq!(parse_args(&v(&["--version"])), Cmd::Version);
+        // `version` is NOT a subcommand alias — only the flag forms are accepted,
+        // to keep parity with how `--help` is routed.
+        assert!(matches!(parse_args(&v(&["version"])), Cmd::Usage(_)));
+    }
+
+    #[test]
+    fn parse_args_update_routes_to_update_cmd() {
+        assert_eq!(parse_args(&v(&["update"])), Cmd::Update);
+        // Extra positional after `update` is a usage error.
+        assert!(matches!(
+            parse_args(&v(&["update", "extra"])),
+            Cmd::Usage(_)
+        ));
+        // `-h` after `update` still routes to Help (Help check runs first).
+        assert_eq!(parse_args(&v(&["update", "-h"])), Cmd::Help);
     }
 }

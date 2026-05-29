@@ -103,15 +103,35 @@ pub fn render_keyspec(k: &KeySpec) -> String {
 pub const COMMAND_ROWS: &[(&str, &str)] = &[
     ("dvlpr", "Create or attach to the 'default' session"),
     ("dvlpr <name>", "Create or attach to session <name>"),
-    ("dvlpr new -s <name>", "Create or attach to <name> (explicit form)"),
+    (
+        "dvlpr new -s <name>",
+        "Create or attach to <name> (explicit form)",
+    ),
     (
         "dvlpr attach -t <name>",
         "Attach to an existing session; error if missing (alias: a)",
     ),
     ("dvlpr ls", "List live sessions with window counts"),
-    ("dvlpr kill -t <name>", "Kill a session's daemon; error if missing"),
-    ("dvlpr ssh <dest> [name]", "SSH to <dest> and run dvlpr there"),
-    ("dvlpr server [name]", "Internal daemon entrypoint (spawned for you)"),
+    (
+        "dvlpr kill -t <name>",
+        "Kill a session's daemon; error if missing",
+    ),
+    (
+        "dvlpr ssh <dest> [name]",
+        "SSH to <dest> and run dvlpr there",
+    ),
+    (
+        "dvlpr server [name]",
+        "Internal daemon entrypoint (spawned for you)",
+    ),
+    (
+        "dvlpr update",
+        "fetch the latest release and replace this binary",
+    ),
+    (
+        "dvlpr --version / -V",
+        "print the version and build target triple",
+    ),
 ];
 
 /// The `-h` / `--help` line, appended after `COMMAND_ROWS` in the CLI help.
@@ -153,7 +173,10 @@ pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView
     };
     let keybindings = vec![
         row(&keys.split_vertical, "Split the focused pane left / right"),
-        row(&keys.split_horizontal, "Split the focused pane top / bottom"),
+        row(
+            &keys.split_horizontal,
+            "Split the focused pane top / bottom",
+        ),
         row(&keys.close_pane, "Close the focused pane"),
         row(&keys.new_window, "Open the New Window dialog"),
         row(&keys.next_window, "Switch to the next window"),
@@ -248,7 +271,11 @@ pub fn tab_regions(rect: Rect) -> Vec<HelpTabRegion> {
         let chip_w = label_w.saturating_add(2); // 1 pad + label + 1 pad
         let x_start = x;
         let x_end = x_start.saturating_add(chip_w).saturating_sub(1);
-        out.push(HelpTabRegion { tab, x_start, x_end });
+        out.push(HelpTabRegion {
+            tab,
+            x_start,
+            x_end,
+        });
         x = x_end.saturating_add(1).saturating_add(HELP_TAB_GAP);
     }
     out
@@ -332,7 +359,10 @@ mod tests {
     fn command_rows_cover_every_cli_subcommand() {
         // Coverage guard: trips if a listed subcommand string is removed/renamed.
         // Cannot auto-detect a NEWLY-added subcommand (see spec maintenance note).
-        assert_eq!(COMMAND_ROWS[0].0, "dvlpr", "first row must be the bare invocation");
+        assert_eq!(
+            COMMAND_ROWS[0].0, "dvlpr",
+            "first row must be the bare invocation"
+        );
         for needle in [
             "dvlpr <name>",
             "new -s",
@@ -361,7 +391,10 @@ mod tests {
             assert!(text.contains(desc), "cli help missing description {desc:?}");
         }
         // ...plus the help flag itself.
-        assert!(text.contains("-h, --help"), "cli help missing the help flag row");
+        assert!(
+            text.contains("-h, --help"),
+            "cli help missing the help flag row"
+        );
     }
 
     #[test]
@@ -497,7 +530,10 @@ mod tests {
         let content = area(0, 0, 80, 24);
         let rect = help_rect(content, v.active_rows().len());
         // One column left of the rect (still 1-based coords).
-        assert_eq!(help_hit(&v, content, rect.x, rect.y + 2 + 1), HelpHit::Outside);
+        assert_eq!(
+            help_hit(&v, content, rect.x, rect.y + 2 + 1),
+            HelpHit::Outside
+        );
         assert_eq!(help_hit(&v, content, 1, 1), HelpHit::Outside);
     }
 
@@ -506,6 +542,24 @@ mod tests {
         let v = view_with(HelpTab::Keybindings);
         let content = area(0, 0, 10, 3); // too small to render
         assert_eq!(help_hit(&v, content, 1, 1), HelpHit::Body);
+    }
+
+    #[test]
+    fn command_rows_includes_update_subcommand() {
+        let found = COMMAND_ROWS.iter().any(|row| row.0.contains("update"));
+        assert!(
+            found,
+            "COMMAND_ROWS must list 'update' so the help overlay shows it"
+        );
+    }
+
+    #[test]
+    fn command_rows_includes_version_flag() {
+        let found = COMMAND_ROWS.iter().any(|row| row.0.contains("--version"));
+        assert!(
+            found,
+            "COMMAND_ROWS must list '--version' so the help overlay shows it"
+        );
     }
 
     #[test]

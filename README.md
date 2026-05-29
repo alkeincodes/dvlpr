@@ -7,7 +7,52 @@ detach over a Unix socket while the panes keep running.
 > Status: in development. Implemented so far: a single-pane walking skeleton
 > (daemon + client + detach/reattach) and the `libghostty-vt` build plumbing.
 
-## Prerequisites
+## Installing
+
+For Linux x86_64, Linux aarch64, macOS x86_64, or macOS aarch64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/alkeincodes/dvlpr/main/scripts/install.sh | bash
+```
+
+The script downloads the prebuilt binary for your host from the latest
+GitHub Release, verifies its SHA-256, and installs to `/usr/local/bin/dvlpr`
+(via `sudo`) or `~/.local/bin/dvlpr` (no sudo). On macOS it strips the
+Gatekeeper quarantine attribute. Confirms with `dvlpr --version`.
+
+### Updating
+
+Once installed:
+
+```sh
+dvlpr update
+```
+
+Fetches the latest release for your host's target, verifies SHA-256, and
+atomically replaces the binary in place. If the install directory isn't
+writable, it exits with code 2 and prints `rerun as: sudo dvlpr update`
+— rerun with `sudo` and try again.
+
+Running sessions keep the old binary loaded until you `dvlpr kill -t <name>`
+and reattach.
+
+### Pre-v0.2.0 → v0.2.0 transition
+
+Source-built `0.1.0` installs do not have the `dvlpr update` subcommand
+(it was introduced in v0.2.0 along with the binary release pipeline). On
+those hosts, re-run the install script once to land v0.2.0; from there,
+`dvlpr update` handles every subsequent release.
+
+### Symlinks
+
+`dvlpr update` operates on the resolved binary path
+(`std::env::current_exe().canonicalize()`). If you've placed dvlpr behind
+a symlink — e.g. `/usr/local/bin/dvlpr` → `/opt/dvlpr-0.2.0/bin/dvlpr` —
+the update replaces the resolved file, not the symlink. The supported
+install script writes a real file at the install path; custom symlink
+layouts aren't officially tested.
+
+## Building from source (contributors)
 
 Building dvlpr requires the following on the build machine:
 
@@ -33,10 +78,12 @@ Building dvlpr requires the following on the build machine:
 The vendored `libghostty-vt` source (under `vendor/`) is self-contained, so the
 build does not need network access once the prerequisites are installed.
 
-## Building and testing
-
 ```sh
-export ZIG="$HOME/.local/zig-aarch64-macos-0.15.2/zig"   # or have zig 0.15.2 on PATH
+# build.rs reads ZIG; cargo-zigbuild reads CARGO_ZIGBUILD_ZIG_PATH.
+# Setting only one risks a silent fallback to a system 'zig' (often 0.16.x
+# via Homebrew), which our build.rs preflight rejects.
+export ZIG="$HOME/.local/zig-aarch64-macos-0.15.2/zig"
+export CARGO_ZIGBUILD_ZIG_PATH="$ZIG"
 cargo build
 cargo test
 ```
@@ -46,6 +93,39 @@ The full quality gate (formatting, lints, tests) is wrapped by `just`:
 ```sh
 just check   # cargo fmt --check + cargo clippy --all-targets -- -D warnings + cargo test
 ```
+
+### Local cross-builds (for testing release artifacts)
+
+Install `cargo-zigbuild` once:
+
+```sh
+cargo install cargo-zigbuild
+```
+
+Then build any of the supported Linux targets via cargo-zigbuild:
+
+```sh
+cargo zigbuild --release --target x86_64-unknown-linux-gnu
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+```
+
+For macOS targets, use native cargo on an Apple host (cargo-zigbuild
+cannot link libghostty-vt's seven Apple frameworks — CoreFoundation,
+CoreGraphics, CoreText, CoreVideo, QuartzCore, IOSurface, Carbon —
+because Zig's bundled headers are libc-only):
+
+```sh
+# On an Apple Silicon Mac (aarch64-apple-darwin is native):
+cargo build --release --target aarch64-apple-darwin
+
+# To produce an x86_64 darwin binary from Apple Silicon, add the target:
+rustup target add x86_64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
+```
+
+Production CI mirrors this split: ubuntu-latest + cargo-zigbuild for the
+two Linux targets, macos-14 + native cargo for the two Darwin targets.
+Cross-building to macOS from a non-Mac host is not supported by this slice.
 
 ## Line editing inside agent CLIs
 
