@@ -149,6 +149,19 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
+/// Resolve the directory a pane should actually spawn in: the stored session
+/// cwd if it still exists, else `$HOME`, else `"."`. The session cwd is captured
+/// once at creation and reused for every pane, so a directory that is later
+/// deleted degrades gracefully here instead of failing the spawn. `home` is
+/// passed in so the existence fallback can be unit-tested deterministically.
+fn effective_cwd(stored: &str, home: Option<String>) -> String {
+    if !stored.is_empty() && std::path::Path::new(stored).is_dir() {
+        return stored.to_string();
+    }
+    home.filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string())
+}
+
 /// Outcome of `Session::refresh_agent_states`. Tracks whether anything
 /// changed (gates redraws) and which pane(s) just transitioned into
 /// `Blocked` (drives the sound trigger in `server::run`).
@@ -233,7 +246,8 @@ impl Session {
     ) -> io::Result<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
-        let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h, &self.session_name)?;
+        let cwd = effective_cwd(&self.cwd, std::env::var("HOME").ok());
+        let (runtime, rx) = PaneRuntime::spawn(&self.command, &cwd, w, h, &self.session_name)?;
         let screen = GhosttyScreen::new(w, h);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -1721,6 +1735,53 @@ mod tests {
     use crate::input::{MouseEvent, MouseKind};
     use crate::layout::SplitPath;
     use std::time::Duration;
+
+    #[test]
+    fn effective_cwd_uses_existing_dir_else_home() {
+        let tmp = std::env::temp_dir();
+        let tmp_s = tmp.to_string_lossy().to_string();
+        assert_eq!(effective_cwd(&tmp_s, Some("/home".into())), tmp_s);
+        assert_eq!(effective_cwd("/nonexistent/xyz", Some("/home".into())), "/home");
+        assert_eq!(effective_cwd("", Some("/home".into())), "/home");
+        assert_eq!(effective_cwd("/nonexistent/xyz", None), ".");
+    }
+
+    /// A session created with a directory that no longer exists must not fail to
+    /// spawn its shell — it degrades to `$HOME` via `effective_cwd`.
+    #[tokio::test]
+    async fn session_spawn_falls_back_to_home_when_cwd_missing() {
+        let (_session, _pane_id, mut rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "pwd -P".to_string()],
+            "/nonexistent/dvlpr-xyz".to_string(),
+            80,
+            10,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        )
+        .expect("Session::new must not fail on a missing cwd");
+
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(o)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            match o {
+                crate::pane::PaneOutput::Bytes(b) => out.extend_from_slice(&b),
+                crate::pane::PaneOutput::Exited => break,
+            }
+        }
+        let got = String::from_utf8_lossy(&out);
+        let got = got.trim();
+        // It must not have spawned in the bogus directory.
+        assert_ne!(got, "/nonexistent/dvlpr-xyz");
+        // When HOME is set it should be there (compare physical paths).
+        if let Some(home) = std::env::var("HOME").ok().filter(|s| !s.is_empty()) {
+            if let Ok(canon) = std::path::Path::new(&home).canonicalize() {
+                assert_eq!(got, canon.to_string_lossy());
+            }
+        }
+    }
 
     async fn build_session_with_one_pane() -> (
         Session,

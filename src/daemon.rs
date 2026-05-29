@@ -33,6 +33,13 @@ pub fn spawn_detached_server(name: &str) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Hand the client's launch directory to the daemon so the session's shells
+    // open where the user ran `dvlpr`, not in the daemon's inherited cwd.
+    // ServerConfig::for_session reads it to seed the session cwd, and
+    // PaneRuntime::spawn strips it from each child so it never reaches user shells.
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.env("DVLPR_SESSION_CWD", cwd);
+    }
     unsafe {
         cmd.pre_exec(|| {
             // New session so the daemon survives the parent terminal closing.

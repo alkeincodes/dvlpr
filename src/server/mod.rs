@@ -56,6 +56,16 @@ pub struct ServerConfig {
     pub session: String,
 }
 
+/// Resolve a session's initial spawn directory from the captured-cwd env var,
+/// falling back to `$HOME`, then `"."`. Empty strings are treated as unset.
+/// Pure so it can be unit-tested without mutating the real process environment.
+fn captured_cwd(dvlpr_cwd: Option<String>, home: Option<String>) -> String {
+    dvlpr_cwd
+        .filter(|s| !s.is_empty())
+        .or_else(|| home.filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| ".".to_string())
+}
+
 impl ServerConfig {
     pub fn for_session(name: &str) -> io::Result<Self> {
         socket::validate_session_name(name)?;
@@ -66,7 +76,16 @@ impl ServerConfig {
         Ok(ServerConfig {
             socket_path,
             command: Vec::new(), // empty => default shell
-            cwd: std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+            // The client hands us its launch directory in DVLPR_SESSION_CWD (see
+            // daemon::spawn_detached_server) so the session's shells open where
+            // the user ran `dvlpr`. We only read it here — the var is stripped
+            // from each PTY child's environment in PaneRuntime::spawn so it never
+            // leaks into user shells, which keeps this a pure read (no global env
+            // mutation that would race the test suite).
+            cwd: captured_cwd(
+                std::env::var("DVLPR_SESSION_CWD").ok(),
+                std::env::var("HOME").ok(),
+            ),
             keymap: None,
             session: name.to_string(),
         })
@@ -878,6 +897,16 @@ mod tests {
             "socket path should be <runtime>/okname.sock, got {:?}",
             cfg.socket_path
         );
+    }
+
+    #[test]
+    fn captured_cwd_prefers_dvlpr_then_home_then_dot() {
+        assert_eq!(captured_cwd(Some("/a".into()), Some("/home".into())), "/a");
+        // Empty values are treated as unset.
+        assert_eq!(captured_cwd(Some("".into()), Some("/home".into())), "/home");
+        assert_eq!(captured_cwd(None, Some("/home".into())), "/home");
+        assert_eq!(captured_cwd(None, Some("".into())), ".");
+        assert_eq!(captured_cwd(None, None), ".");
     }
 
     use crate::compositor::Grid;

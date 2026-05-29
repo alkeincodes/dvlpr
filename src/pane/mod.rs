@@ -94,6 +94,10 @@ impl PaneRuntime {
         // Mark this child as living inside a dvlpr session, named for the session.
         // The CLI reads $DVLPR at startup to refuse opening a nested session.
         cmd.env("DVLPR", session_name);
+        // The daemon may carry DVLPR_SESSION_CWD (the client's launch dir, used to
+        // seed the session cwd). It is an internal handoff, not meant for user
+        // shells, so strip it from every child's environment.
+        cmd.env_remove("DVLPR_SESSION_CWD");
 
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // Slave fd no longer needed in this process once the child holds it.
@@ -264,6 +268,34 @@ mod tests {
         }
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("mysess"), "got: {text:?}");
+        drop(pane);
+    }
+
+    #[tokio::test]
+    async fn spawn_uses_given_cwd() {
+        // The child must start in the directory we pass. Use `pwd -P` (physical
+        // path) and canonicalize the expected dir so the macOS /tmp ->
+        // /private/tmp symlink does not cause a spurious mismatch.
+        let want = std::env::temp_dir().canonicalize().expect("canonicalize tmp");
+        let (pane, mut rx) = PaneRuntime::spawn(
+            &["sh".into(), "-c".into(), "pwd -P".into()],
+            want.to_str().unwrap(),
+            80,
+            24,
+            "test",
+        )
+        .expect("spawn pane");
+
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while let Ok(Some(out)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            match out {
+                PaneOutput::Bytes(b) => collected.extend_from_slice(&b),
+                PaneOutput::Exited => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&collected);
+        assert_eq!(text.trim(), want.to_string_lossy());
         drop(pane);
     }
 }
