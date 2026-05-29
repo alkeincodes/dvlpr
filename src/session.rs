@@ -3610,12 +3610,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn left_click_on_plus_button_creates_window_and_switches() {
+    async fn left_click_on_plus_button_opens_dialog_then_enter_creates_and_switches() {
         let (mut session, _p, _rx) = build_session_with_one_pane().await;
         let pb = session.tab_bar_for_test().plus.expect("button present");
         let mut drag = None;
+        // [+] now opens the New Window dialog rather than creating immediately.
         let eff = session.handle_mouse(left_press(pb.x_start + 1, 10), &mut drag);
-        assert_eq!(eff.spawned.len(), 1, "new window must spawn a pane");
+        assert!(eff.spawned.is_empty(), "[+] opens the dialog, does not spawn yet");
+        assert!(session.dialog_is_open_for_test());
+        assert_eq!(session.window_count(), 1);
+        // Submitting the (empty) dialog creates the default window and switches.
+        let eff = session.submit_dialog();
+        assert_eq!(eff.spawned.len(), 1, "submit spawns the new window's pane");
         assert_eq!(session.window_count(), 2);
         assert_eq!(session.active_window_index(), 1);
     }
