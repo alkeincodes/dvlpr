@@ -55,6 +55,9 @@ struct Pane {
 
 struct Window {
     name: String,
+    /// When true, `name` was set explicitly by the user and the periodic
+    /// auto-namer (`refresh_window_names`) must not overwrite it.
+    name_pinned: bool,
     root: Node,
     focused: PaneId,
     zoomed: bool,
@@ -205,6 +208,7 @@ impl Session {
         let (id, rx) = session.spawn_pane(content)?;
         session.windows.push(Window {
             name: initial_window_name(&session.command),
+            name_pinned: false,
             root: Node::Leaf(id),
             focused: id,
             zoomed: false,
@@ -787,6 +791,7 @@ impl Session {
         };
         self.windows.push(Window {
             name: initial_window_name(&self.command),
+            name_pinned: false,
             root: Node::Leaf(id),
             focused: id,
             zoomed: false,
@@ -1122,6 +1127,19 @@ impl Session {
         layout::tab_bar_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
     }
 
+    #[cfg(test)]
+    pub fn window_names_for_test(&self) -> Vec<String> {
+        self.windows.iter().map(|w| w.name.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub fn set_window_name_pinned_for_test(&mut self, idx: usize, name: &str) {
+        if let Some(w) = self.windows.get_mut(idx) {
+            w.name = name.to_string();
+            w.name_pinned = true;
+        }
+    }
+
     /// Refresh every window's name from its focused pane's foreground process.
     /// `resolve` maps a pid to a friendly name (injected so tests can fake it;
     /// production passes `crate::procinfo::process_name`). When `resolve` yields
@@ -1130,6 +1148,9 @@ impl Session {
     pub fn refresh_window_names(&mut self, resolve: impl Fn(i32) -> Option<String>) -> bool {
         let mut changed = false;
         for win in &mut self.windows {
+            if win.name_pinned {
+                continue; // user-set name; never auto-overwrite
+            }
             let new = self
                 .panes
                 .get(&win.focused)
@@ -1500,6 +1521,22 @@ mod tests {
         )
         .expect("Session::new");
         (session, pane_id, rx)
+    }
+
+    fn test_session() -> Session {
+        let (s, _id, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            ".".to_string(),
+            40,
+            12,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        )
+        .expect("session");
+        s
     }
 
     #[tokio::test]
@@ -3646,5 +3683,19 @@ mod tests {
             Some(HelpTab::Keybindings),
             "body click must not switch tabs"
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_window_name_survives_refresh() {
+        // Two windows; pin window 0's name, leave window 1 auto.
+        let mut s = test_session(); // see "Test harness" preamble
+        s.apply_command(Command::NewWindow); // second window (auto-named)
+        s.set_window_name_pinned_for_test(0, "my-build");
+        // A resolver that would rename everything to "zsh" if allowed.
+        let changed = s.refresh_window_names(|_pid| Some("zsh".to_string()));
+        let names = s.window_names_for_test();
+        assert_eq!(names[0], "my-build", "pinned window keeps its custom name");
+        assert_eq!(names[1], "zsh", "auto window still tracks the process");
+        assert!(changed, "the auto window changed, so refresh reports true");
     }
 }
