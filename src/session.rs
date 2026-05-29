@@ -818,7 +818,7 @@ impl Session {
                     // so a malformed/reordered mouse stream can't leave a drag
                     // dangling across the new-window switch.
                     *drag = None;
-                    return self.apply_command(crate::config::Command::NewWindow);
+                    return self.apply_command(Command::NewWindow);
                 }
                 let new_drag = self.handle_hit(hit);
                 *drag = new_drag.map(|path| (self.active_window, path));
@@ -970,29 +970,21 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
+    fn tab_bar_state(&self) -> (Vec<String>, bool) {
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let zoomed = self
-            .windows
-            .get(self.active_window)
-            .map(|w| w.zoomed)
-            .unwrap_or(false);
-        layout::tab_layout(
-            &self.session_name,
-            &names,
-            self.active_window,
-            zoomed,
-            self.cols,
-        )
+        let zoomed = self.windows.get(self.active_window).is_some_and(|w| w.zoomed);
+        (names, zoomed)
+    }
+
+    #[cfg(test)]
+    pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
+        let (names, zoomed) = self.tab_bar_state();
+        layout::tab_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
     }
 
     #[cfg(test)]
     pub fn tab_bar_for_test(&self) -> layout::TabBar {
-        let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let zoomed = self
-            .windows
-            .get(self.active_window)
-            .is_some_and(|w| w.zoomed);
+        let (names, zoomed) = self.tab_bar_state();
         layout::tab_bar_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
     }
 
