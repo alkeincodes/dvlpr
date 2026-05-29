@@ -1229,63 +1229,49 @@ impl Session {
             // structurally distinctive, so extra context can't false-match.
             let tail = pane.screen.tail_text(pane.screen.rows());
 
-            // Step 4: Classify — with Codex short-circuit.
-            // Codex panes stay at Idle (v1: no state model yet); only Claude
-            // panes go through the full stabilizer + blocked-transition check.
-            match agent {
-                detect::Agent::Claude => {
-                    let candidate = detect::classify(detect::Agent::Claude, &tail);
+            // Step 4: Classify through the real agent's classifier.
+            let candidate = detect::classify(agent, &tail);
 
-                    // Debug instrumentation: when the sentinel file exists, append
-                    // every claude pane's sampled tail + classify result to
-                    // /tmp/dvlpr-detect.log. Off by default; zero overhead when the
-                    // file is absent.
-                    if debug {
-                        use std::io::Write;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/dvlpr-detect.log")
-                        {
-                            let _ = writeln!(
-                                f,
-                                "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
-                            );
-                        }
-                    }
-
-                    // Step 5: Stabilize.
-                    match candidate {
-                        detect::AgentState::Working | detect::AgentState::Blocked => {
-                            pane.agent_state = candidate;
-                            pane.idle_streak = 0;
-                        }
-                        detect::AgentState::Idle => {
-                            if pane.agent_state != detect::AgentState::Idle {
-                                pane.idle_streak = pane.idle_streak.saturating_add(1);
-                                if pane.idle_streak >= 2 {
-                                    pane.agent_state = detect::AgentState::Idle;
-                                    pane.idle_streak = 2;
-                                }
-                            } else {
-                                // Already Idle — keep streak saturated at 2.
-                                pane.idle_streak = 2;
-                            }
-                        }
-                    }
-
-                    // Emit a blocked transition on the first Working→Blocked (or
-                    // Idle→Blocked) edge; subsequent Blocked→Blocked ticks do not
-                    // re-emit (prev_state == Blocked on those passes).
-                    if crate::sound::should_play_blocked(prev_state, pane.agent_state) {
-                        outcome.blocked_transitions.push(*pane_id);
-                    }
+            // Debug instrumentation: when the sentinel file exists, append
+            // every agent pane's sampled tail + classify result to
+            // /tmp/dvlpr-detect.log. Off by default; zero overhead when absent.
+            if debug {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/dvlpr-detect.log")
+                {
+                    let _ = writeln!(
+                        f,
+                        "--- pane={pane_id:?} agent={agent:?} prev={prev_state:?} candidate={candidate:?} ---\n{tail:?}\n",
+                    );
                 }
-                detect::Agent::Codex => {
-                    // v1: Codex panes stay at Idle. No classification, no transitions.
-                    pane.agent_state = detect::AgentState::Idle;
+            }
+
+            // Step 5: Stabilize (2-sample idle hysteresis).
+            match candidate {
+                detect::AgentState::Working | detect::AgentState::Blocked => {
+                    pane.agent_state = candidate;
                     pane.idle_streak = 0;
                 }
+                detect::AgentState::Idle => {
+                    if pane.agent_state != detect::AgentState::Idle {
+                        pane.idle_streak = pane.idle_streak.saturating_add(1);
+                        if pane.idle_streak >= 2 {
+                            pane.agent_state = detect::AgentState::Idle;
+                            pane.idle_streak = 2;
+                        }
+                    } else {
+                        // Already Idle — keep streak saturated at 2.
+                        pane.idle_streak = 2;
+                    }
+                }
+            }
+
+            // Emit a blocked transition on the first edge into Blocked.
+            if crate::sound::should_play_blocked(prev_state, pane.agent_state) {
+                outcome.blocked_transitions.push(*pane_id);
             }
 
             if pane.agent_state != prev_state {
@@ -3016,18 +3002,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_agent_states_skips_classifier_for_codex_panes() {
+    async fn refresh_agent_states_classifies_codex_working() {
         let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
-        // Feed a tail that WOULD trigger Claude's blocked detector.
-        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
-        // Resolve as codex — exercises the Codex short-circuit.
+        session.feed(pane_id, b"Working (3s \xe2\x80\xa2 esc to interrupt)\n");
         let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
-        assert!(
-            outcome.blocked_transitions.is_empty(),
-            "Codex must not emit blocked"
-        );
+        assert!(outcome.changed);
         let pane = session.panes.get(&pane_id).expect("pane");
         assert_eq!(pane.agent, Some(crate::detect::Agent::Codex));
+        assert_eq!(pane.agent_state, crate::detect::AgentState::Working);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_classifies_codex_blocked_and_emits() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(
+            pane_id,
+            b"Would you like to run the following command?\n\xe2\x80\xba 1. Yes, proceed\n",
+        );
+        let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
+        let pane = session.panes.get(&pane_id).expect("pane");
+        assert_eq!(pane.agent_state, crate::detect::AgentState::Blocked);
+        assert_eq!(
+            outcome.blocked_transitions,
+            vec![pane_id],
+            "Codex blocked edge must emit like Claude"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_codex_ignores_claude_only_prompt() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Claude-style prompt contains no Codex marker → Codex classifies Idle.
+        session.feed(pane_id, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
+        assert!(outcome.blocked_transitions.is_empty());
+        let pane = session.panes.get(&pane_id).expect("pane");
+        assert_eq!(pane.agent, Some(crate::detect::Agent::Codex));
+        assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_states_codex_clears_to_idle() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"Working (1s \xe2\x80\xa2 esc to interrupt)\n");
+        let outcome = session.refresh_agent_states(|_| Some("codex".to_string()));
+        // Precondition: Codex must actually reach Working before we test
+        // clearing — guards against false-green (pre-Task-2 the short-circuit
+        // leaves it Idle, so this assert fails → genuine RED).
+        assert!(outcome.changed);
+        assert_eq!(
+            session.panes.get(&pane_id).unwrap().agent_state,
+            crate::detect::AgentState::Working
+        );
+        session.feed(pane_id, b"\x1b[2J\x1b[H");
+        session.refresh_agent_states(|_| Some("codex".to_string())); // streak 1
+        session.refresh_agent_states(|_| Some("codex".to_string())); // streak 2 → Idle
+        // Single window → pane is focused → confirmed-idle is Idle, not Done.
+        let pane = session.panes.get(&pane_id).expect("pane");
         assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
     }
 
