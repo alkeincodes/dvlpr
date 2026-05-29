@@ -130,7 +130,7 @@ pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView
         row(&keys.split_vertical, "Split the focused pane left / right"),
         row(&keys.split_horizontal, "Split the focused pane top / bottom"),
         row(&keys.close_pane, "Close the focused pane"),
-        row(&keys.new_window, "Create a new window"),
+        row(&keys.new_window, "Open the New Window dialog"),
         row(&keys.next_window, "Switch to the next window"),
         row(&keys.prev_window, "Switch to the previous window"),
         row(&keys.detach, "Detach from the session (leave it running)"),
