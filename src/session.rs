@@ -319,9 +319,9 @@ impl Session {
                 }
                 b"\r" | b"\n" => {
                     if let Some(m) = self.menu.clone() {
-                        let cmd = m.items()[m.highlighted].command;
+                        let action = m.items()[m.highlighted].action;
                         self.menu = None;
-                        Some(self.apply_command(cmd))
+                        Some(self.dispatch_menu_action(action, m.kind))
                     } else {
                         Some(CommandEffect::default())
                     }
@@ -353,9 +353,10 @@ impl Session {
         match ev.kind {
             MouseKind::Press if ev.button == 0 => match hit {
                 MenuHit::Item(i) => {
-                    let cmd = items[i].command;
+                    let action = items[i].action;
+                    let kind = menu.kind;
                     self.menu = None;
-                    return self.apply_command(cmd);
+                    return self.dispatch_menu_action(action, kind);
                 }
                 MenuHit::Border => {}
                 MenuHit::Outside => {
@@ -409,6 +410,7 @@ impl Session {
                 .windows
                 .get(self.active_window)
                 .is_some_and(|w| layout::all_panes(&w.root).contains(&pane_id)),
+            crate::menu::MenuKind::Tab { window } => window < self.windows.len(),
         };
         if !anchor_inside || !pane_alive {
             self.menu = None;
@@ -484,6 +486,47 @@ impl Session {
         let name = w.name.clone();
         self.menu = None;
         self.dialog = Some(crate::dialog::WindowNameDialog::rename(window, &name));
+    }
+
+    /// Close every pane in `window` and remove the window. Returns the removed
+    /// `PaneRuntime`s so the caller tears them down off the async runtime.
+    /// Composes the existing per-pane teardown (`pane_exited`); no new semantics.
+    /// Closing the only window empties the session, handled by the existing
+    /// empty-session shutdown path.
+    pub fn close_window(&mut self, window: usize) -> Vec<PaneRuntime> {
+        let Some(win) = self.windows.get(window) else { return Vec::new() };
+        let pane_ids = layout::all_panes(&win.root);
+        let mut closed = Vec::new();
+        for id in pane_ids {
+            closed.extend(self.pane_exited(id));
+        }
+        closed
+    }
+
+    /// Resolve an activated menu item to its effect, given the menu's kind.
+    /// Pane items dispatch their `Command`; tab items act on the kind's window.
+    fn dispatch_menu_action(
+        &mut self,
+        action: crate::menu::MenuAction,
+        kind: crate::menu::MenuKind,
+    ) -> CommandEffect {
+        use crate::menu::{MenuAction, MenuKind};
+        match action {
+            MenuAction::Command(cmd) => self.apply_command(cmd),
+            MenuAction::RenameWindow => {
+                if let MenuKind::Tab { window } = kind {
+                    self.open_rename_dialog(window);
+                }
+                CommandEffect::default()
+            }
+            MenuAction::CloseWindow => {
+                let mut eff = CommandEffect::default();
+                if let MenuKind::Tab { window } = kind {
+                    eff.closed = self.close_window(window);
+                }
+                eff
+            }
+        }
     }
 
     /// Apply the open dialog's buffer and close it. Returns the effect (a New
@@ -1619,8 +1662,9 @@ impl Session {
 
     #[cfg(test)]
     pub fn menu_pane_for_test(&self) -> Option<PaneId> {
-        self.menu.as_ref().map(|m| match m.kind {
-            crate::menu::MenuKind::Pane { pane_id } => pane_id,
+        self.menu.as_ref().and_then(|m| match m.kind {
+            crate::menu::MenuKind::Pane { pane_id } => Some(pane_id),
+            crate::menu::MenuKind::Tab { .. } => None,
         })
     }
 

@@ -5,20 +5,29 @@
 use crate::config::Command;
 use crate::layout::PaneId;
 
-/// What the menu is anchored to. v1 only ever populates `Pane`; the enum
-/// exists so adding tab/sidebar menus later does not reshape the field on
-/// `Session`.
+/// What the menu is anchored to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuKind {
     Pane { pane_id: PaneId },
+    Tab { window: usize },
 }
 
-/// One menu row: a static label and the `Command` it dispatches via
-/// `Session::apply_command` when the user clicks or hits Enter on it.
+/// What a menu row does when activated. Pane items map to a focused-pane
+/// `Command`; tab items carry window-scoped actions resolved by `Session`
+/// against the menu's `MenuKind::Tab { window }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Command(Command),
+    RenameWindow,
+    CloseWindow,
+}
+
+/// One menu row: a static label and the `MenuAction` it dispatches when the
+/// user clicks or hits Enter on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MenuItem {
     pub label: &'static str,
-    pub command: Command,
+    pub action: MenuAction,
 }
 
 /// Open-menu state. `Session.menu: Option<MenuState>` holds at most one
@@ -35,11 +44,11 @@ pub struct MenuState {
 }
 
 impl MenuState {
-    /// The static item table for this menu's `kind`. v1 only the Pane case
-    /// is populated.
+    /// The static item table for this menu's `kind`.
     pub fn items(&self) -> &'static [MenuItem] {
         match self.kind {
             MenuKind::Pane { .. } => PANE_MENU_ITEMS,
+            MenuKind::Tab { .. } => TAB_MENU_ITEMS,
         }
     }
 
@@ -59,22 +68,17 @@ impl MenuState {
 /// The v1 pane-menu items. Order is render order; index 0 is the default
 /// initial highlight.
 pub const PANE_MENU_ITEMS: &[MenuItem] = &[
-    MenuItem {
-        label: "Split Vertically",
-        command: Command::SplitVertical,
-    },
-    MenuItem {
-        label: "Split Horizontally",
-        command: Command::SplitHorizontal,
-    },
-    MenuItem {
-        label: "Zoom",
-        command: Command::ToggleZoom,
-    },
-    MenuItem {
-        label: "Exit",
-        command: Command::ClosePane,
-    },
+    MenuItem { label: "Split Vertically", action: MenuAction::Command(Command::SplitVertical) },
+    MenuItem { label: "Split Horizontally", action: MenuAction::Command(Command::SplitHorizontal) },
+    MenuItem { label: "Zoom", action: MenuAction::Command(Command::ToggleZoom) },
+    MenuItem { label: "Exit", action: MenuAction::Command(Command::ClosePane) },
+];
+
+/// Tab context-menu items. Order is render order; index 0 is the initial
+/// highlight.
+pub const TAB_MENU_ITEMS: &[MenuItem] = &[
+    MenuItem { label: "Rename", action: MenuAction::RenameWindow },
+    MenuItem { label: "Close", action: MenuAction::CloseWindow },
 ];
 
 use crate::layout::Rect;
@@ -215,13 +219,37 @@ mod tests {
         let items = menu.items();
         assert_eq!(items.len(), 4);
         assert_eq!(items[0].label, "Split Vertically");
-        assert_eq!(items[0].command, Command::SplitVertical);
+        assert_eq!(items[0].action, MenuAction::Command(Command::SplitVertical));
         assert_eq!(items[1].label, "Split Horizontally");
-        assert_eq!(items[1].command, Command::SplitHorizontal);
+        assert_eq!(items[1].action, MenuAction::Command(Command::SplitHorizontal));
         assert_eq!(items[2].label, "Zoom");
-        assert_eq!(items[2].command, Command::ToggleZoom);
+        assert_eq!(items[2].action, MenuAction::Command(Command::ToggleZoom));
         assert_eq!(items[3].label, "Exit");
-        assert_eq!(items[3].command, Command::ClosePane);
+        assert_eq!(items[3].action, MenuAction::Command(Command::ClosePane));
+    }
+
+    #[test]
+    fn tab_kind_items_are_rename_then_close() {
+        let menu = MenuState {
+            kind: MenuKind::Tab { window: 1 },
+            anchor: (10, 24),
+            highlighted: 0,
+        };
+        let items = menu.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "Rename");
+        assert_eq!(items[0].action, MenuAction::RenameWindow);
+        assert_eq!(items[1].label, "Close");
+        assert_eq!(items[1].action, MenuAction::CloseWindow);
+    }
+
+    #[test]
+    fn tab_kind_carries_window_index() {
+        let menu = MenuState { kind: MenuKind::Tab { window: 3 }, anchor: (1, 1), highlighted: 0 };
+        match menu.kind {
+            MenuKind::Tab { window } => assert_eq!(window, 3),
+            _ => panic!("expected Tab kind"),
+        }
     }
 
     #[test]
@@ -243,6 +271,7 @@ mod tests {
         };
         match menu.kind {
             MenuKind::Pane { pane_id } => assert_eq!(pane_id, 42),
+            _ => panic!("expected Pane kind"),
         }
     }
 
