@@ -181,6 +181,7 @@ async fn q_closes_help() {
     send_input(&mut aw, b"q").await;
     // After closing, a fresh frame should NOT contain the overlay title.
     let frames = collect_frames(&mut ar, 2).await;
+    assert!(!frames.is_empty(), "closing help must trigger a redraw frame");
     assert!(
         !frames_contain(&frames, " Help ".as_bytes()),
         "help overlay title still present after q"
@@ -201,6 +202,7 @@ async fn prefix_question_again_toggles_help_closed() {
 
     send_input(&mut aw, PREFIX_QUESTION).await;
     let frames = collect_frames(&mut ar, 2).await;
+    assert!(!frames.is_empty(), "closing help must trigger a redraw frame");
     assert!(
         !frames_contain(&frames, " Help ".as_bytes()),
         "prefix ? again did not toggle help closed"
