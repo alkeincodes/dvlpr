@@ -366,7 +366,13 @@ impl Session {
             MouseKind::Press if ev.button == 2 => {
                 self.menu = None;
                 let new_hit = self.hit(ev.col, ev.row);
-                if let layout::Hit::Pane(id) = new_hit {
+                if let layout::Hit::Tab(window) = new_hit {
+                    self.menu = Some(MenuState {
+                        kind: MenuKind::Tab { window },
+                        anchor: (ev.col, ev.row),
+                        highlighted: 0,
+                    });
+                } else if let layout::Hit::Pane(id) = new_hit {
                     self.focus(id);
                     self.menu = Some(MenuState {
                         kind: MenuKind::Pane { pane_id: id },
@@ -471,6 +477,11 @@ impl Session {
     #[cfg(test)]
     pub fn active_window_in_range_for_test(&self) -> bool {
         self.windows.is_empty() || self.active_window < self.windows.len()
+    }
+
+    #[cfg(test)]
+    pub fn menu_kind_for_test(&self) -> Option<crate::menu::MenuKind> {
+        self.menu.as_ref().map(|m| m.kind)
     }
 
     #[cfg(test)]
@@ -1139,7 +1150,13 @@ impl Session {
                     return CommandEffect::default();
                 }
                 let hit = self.hit(ev.col, ev.row);
-                if let Some(id) = should_open_pane_menu(hit) {
+                if let layout::Hit::Tab(window) = hit {
+                    self.menu = Some(MenuState {
+                        kind: MenuKind::Tab { window },
+                        anchor: (ev.col, ev.row),
+                        highlighted: 0,
+                    });
+                } else if let Some(id) = should_open_pane_menu(hit) {
                     self.focus(id);
                     self.menu = Some(MenuState {
                         kind: MenuKind::Pane { pane_id: id },
@@ -3965,6 +3982,50 @@ mod tests {
         );
         assert!(s.dialog_is_open_for_test(), "[+] opens the New Window dialog");
         assert_eq!(s.window_count_for_test(), before, "no window created yet");
+    }
+
+    #[tokio::test]
+    async fn right_click_on_tab_opens_tab_menu() {
+        use crate::input::{MouseEvent, MouseKind};
+        use crate::menu::MenuKind;
+        let mut s = test_session();
+        let row = s.tab_status_row_1based_for_test();
+        // Column of tab 0 (first tab) from the real layout.
+        let regions = s.tab_regions_for_test();
+        let t0 = &regions[0];
+        let mut drag = None;
+        let _eff = s.handle_mouse(
+            MouseEvent {
+                button: 2,
+                col: t0.x_start + 1,
+                row,
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        match s.menu_kind_for_test() {
+            Some(MenuKind::Tab { window }) => assert_eq!(window, 0),
+            other => panic!("expected a tab menu, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn right_click_on_pane_still_opens_pane_menu() {
+        use crate::input::{MouseEvent, MouseKind};
+        use crate::menu::MenuKind;
+        let mut s = test_session();
+        let mut drag = None;
+        // A click in the content area (row 1 is top of content) resolves to a pane.
+        let _eff = s.handle_mouse(
+            MouseEvent {
+                button: 2,
+                col: 2,
+                row: 1,
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        assert!(matches!(s.menu_kind_for_test(), Some(MenuKind::Pane { .. })));
     }
 
     #[tokio::test]
