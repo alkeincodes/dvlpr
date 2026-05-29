@@ -1162,6 +1162,15 @@ impl Session {
         // `touch /tmp/dvlpr-detect.enable` to turn on, `rm` to turn off — the
         // next 500ms tick picks it up.
         let debug = std::path::Path::new("/tmp/dvlpr-detect.enable").exists();
+        // The set of panes in the currently-focused window. Used to decide
+        // whether a finishing agent becomes Done (unfocused) or Idle (focused),
+        // and to clear Done once its window is focused. `.get()` so a transient
+        // empty/clamped window index can never panic the daemon.
+        let focused_panes: std::collections::HashSet<crate::layout::PaneId> = self
+            .windows
+            .get(self.active_window)
+            .map(|w| layout::all_panes(&w.root).into_iter().collect())
+            .unwrap_or_default();
         for (pane_id, pane) in self.panes.iter_mut() {
             let prev_state = pane.agent_state;
 
@@ -1249,30 +1258,49 @@ impl Session {
                 }
             }
 
-            // Step 5: Stabilize (2-sample idle hysteresis).
+            // Step 5: Stabilize (2-sample idle hysteresis) + Done lifecycle.
+            let focused = focused_panes.contains(pane_id);
             match candidate {
-                detect::AgentState::Working | detect::AgentState::Blocked => {
-                    pane.agent_state = candidate;
+                detect::AgentState::Working => {
+                    pane.agent_state = detect::AgentState::Working;
                     pane.idle_streak = 0;
                 }
-                detect::AgentState::Idle => {
-                    if pane.agent_state != detect::AgentState::Idle {
+                detect::AgentState::Blocked => {
+                    pane.agent_state = detect::AgentState::Blocked;
+                    pane.idle_streak = 0;
+                }
+                detect::AgentState::Idle => match pane.agent_state {
+                    detect::AgentState::Working | detect::AgentState::Blocked => {
                         pane.idle_streak = pane.idle_streak.saturating_add(1);
                         if pane.idle_streak >= 2 {
-                            pane.agent_state = detect::AgentState::Idle;
+                            // Confirmed finish: Done if the user isn't looking,
+                            // Idle if its window is focused.
+                            pane.agent_state = if focused {
+                                detect::AgentState::Idle
+                            } else {
+                                detect::AgentState::Done
+                            };
                             pane.idle_streak = 2;
                         }
-                    } else {
-                        // Already Idle — keep streak saturated at 2.
+                    }
+                    detect::AgentState::Done => {
+                        // Sticky while unfocused; clear the instant a tick sees
+                        // the window focused. This single arm clears Done on
+                        // EVERY focus-change path (window switch, tab/sidebar
+                        // click, pane-exit clamp).
+                        if focused {
+                            pane.agent_state = detect::AgentState::Idle;
+                        }
                         pane.idle_streak = 2;
                     }
-                }
-                // classify() never returns Done; ignore rather than panic the
-                // long-running daemon. The real Done logic lands in Task 4.
+                    detect::AgentState::Idle => {
+                        pane.idle_streak = 2;
+                    }
+                },
+                // classify() never returns Done; ignore rather than panic.
                 detect::AgentState::Done => {}
             }
 
-            // Emit a blocked transition on the first edge into Blocked.
             if crate::sound::should_play_blocked(prev_state, pane.agent_state) {
                 outcome.blocked_transitions.push(*pane_id);
             }
@@ -3063,6 +3091,189 @@ mod tests {
         // Single window → pane is focused → confirmed-idle is Idle, not Done.
         let pane = session.panes.get(&pane_id).expect("pane");
         assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
+    }
+
+    /// Build a session whose first pane (window 0) is UNFOCUSED: opening a
+    /// second window moves `active_window` to index 1.
+    async fn two_windows_first_unfocused() -> (Session, crate::layout::PaneId) {
+        let (mut session, pane_a, _rx) = build_session_with_one_pane().await;
+        let eff = session.apply_command(Command::NewWindow);
+        assert_eq!(eff.spawned.len(), 1);
+        assert_eq!(session.active_window_index(), 1, "new window is focused");
+        (session, pane_a)
+    }
+
+    /// Drive pane to confirmed-idle from a prior non-idle state (2 idle ticks).
+    fn finish_after(session: &mut Session, pane: crate::layout::PaneId) {
+        session.feed(pane, b"\x1b[2J\x1b[H");
+        session.refresh_agent_states(|_| Some("claude".to_string())); // streak 1
+        session.refresh_agent_states(|_| Some("claude".to_string())); // streak 2
+    }
+
+    #[tokio::test]
+    async fn finishing_while_unfocused_becomes_done() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string())); // Working
+        finish_after(&mut session, pane_a);
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_while_focused_goes_straight_to_idle_not_done() {
+        // Single window → the only pane is always focused.
+        let (mut session, pane_a, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string())); // Working
+        finish_after(&mut session, pane_a);
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn done_is_sticky_while_unfocused() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        finish_after(&mut session, pane_a); // → Done
+        session.refresh_agent_states(|_| Some("claude".to_string())); // extra idle tick
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn done_clears_when_window_becomes_focused() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        finish_after(&mut session, pane_a);
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done,
+            "must actually be Done before we test clearing (guards false-green)"
+        );
+        // Focus window 0 (1-based 1) via SelectWindow, then a refresh tick clears.
+        session.apply_command(Command::SelectWindow(1));
+        assert_eq!(session.active_window_index(), 0);
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn done_clears_after_sidebar_entry_focus() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        finish_after(&mut session, pane_a);
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done,
+            "must actually be Done before we test clearing (guards false-green)"
+        );
+        // The path the spec originally missed: focusing via a sidebar-entry hit.
+        let _ = session.handle_hit(layout::Hit::SidebarEntry {
+            window_index: 0,
+            pane_id: pane_a,
+        });
+        assert_eq!(session.active_window_index(), 0);
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn done_clears_when_pane_exit_promotes_its_window() {
+        // The other focus-change path the spec lists (§4.5/§6): closing the
+        // focused window so `pane_exited` clamps `active_window` onto pane A's
+        // window. Written inline because we need the second window's pane id.
+        let (mut session, pane_a, _rx) = build_session_with_one_pane().await;
+        let eff = session.apply_command(Command::NewWindow);
+        let pane_b = eff.spawned[0].0;
+        assert_eq!(session.active_window_index(), 1, "window 1 focused");
+        // Pane A (window 0) finishes while unfocused → Done.
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        finish_after(&mut session, pane_a);
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
+        // Close window 1; its removal clamps active_window to 0 (pane A focused).
+        for rt in session.pane_exited(pane_b) {
+            rt.close();
+        }
+        assert_eq!(session.active_window_index(), 0);
+        // Next tick sees pane A focused → clears Done to Idle.
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn unfocused_blocked_stays_blocked_not_done() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_to_idle_while_unfocused_becomes_done() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"Do you want to proceed?\n\xe2\x9d\xaf 1. Yes\n");
+        session.refresh_agent_states(|_| Some("claude".to_string())); // Blocked
+        finish_after(&mut session, pane_a); // → Done
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn never_worked_pane_stays_idle_not_done() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        for _ in 0..3 {
+            session.refresh_agent_states(|_| Some("claude".to_string()));
+        }
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn done_transition_is_silent() {
+        let (mut session, pane_a) = two_windows_first_unfocused().await;
+        session.feed(pane_a, b"esc to interrupt\n");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        session.feed(pane_a, b"\x1b[2J\x1b[H");
+        session.refresh_agent_states(|_| Some("claude".to_string()));
+        let outcome = session.refresh_agent_states(|_| Some("claude".to_string()));
+        assert!(
+            outcome.blocked_transitions.is_empty(),
+            "Done must not ring the blocked sound"
+        );
+        assert_eq!(
+            session.panes.get(&pane_a).unwrap().agent_state,
+            detect::AgentState::Done
+        );
     }
 
     #[tokio::test]
