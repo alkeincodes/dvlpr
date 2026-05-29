@@ -264,7 +264,9 @@ async fn right_click_from_b_while_menu_is_open_reanchors_to_b() {
     let _ = collect_frames(&mut br, 1).await;
 
     send_input(&mut bw, b"\x1b[<2;60;10M").await;
-    let frames_b = collect_frames(&mut br, 2).await;
+    // Generous collect window: under the full parallel `cargo test` run this
+    // multi-client round-trip is slow; 2s flaked, 8s is robust.
+    let frames_b = collect_frames(&mut br, 8).await;
 
     let corner = "┌".as_bytes();
     assert!(
