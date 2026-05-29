@@ -73,6 +73,26 @@ pub struct TabRegion {
     pub label: String,
 }
 
+/// The clickable "[+]" new-window button in the tab bar: the inclusive
+/// 0-based x-range it occupies on the tab/status row. Single source of
+/// truth shared by the compositor's drawing and click hit-testing,
+/// mirroring `TabRegion`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlusButton {
+    pub x_start: u16,
+    pub x_end: u16,
+}
+
+/// The literal button glyph. 3 display cells.
+pub const PLUS_LABEL: &str = "[+]";
+/// Display width of the button glyph, in cells.
+pub const PLUS_WIDTH: u16 = PLUS_LABEL.len() as u16;
+/// Cells inserted before the button, on top of the tab separator (total visual blank before the button is PLUS_GAP + 1).
+pub const PLUS_GAP: u16 = 2;
+/// Total cells the button reserves at the right of the tab area:
+/// PLUS_GAP + PLUS_WIDTH.
+pub const PLUS_RESERVE: u16 = PLUS_GAP + PLUS_WIDTH;
+
 /// What a mouse click landed on.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Hit {
@@ -85,6 +105,8 @@ pub enum Hit {
         window_index: usize,
         pane_id: PaneId,
     },
+    /// Click on the tab-bar "[+]" button → create a new window.
+    NewWindowButton,
     None,
 }
 
@@ -492,6 +514,60 @@ pub fn tab_layout(
         x = x.saturating_add(chip_w).saturating_add(1); // one-space separator
     }
     out
+}
+
+/// The full tab-bar layout: window tabs plus the "[+]" new-window button.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabBar {
+    pub tabs: Vec<TabRegion>,
+    pub plus: Option<PlusButton>,
+}
+
+/// Lay out the tab bar: window tabs followed by the "[+]" new-window
+/// button. The button's width (`PLUS_RESERVE`) is reserved from the
+/// available tab width FIRST, so tabs lay out and clip within the
+/// reduced area and the button is always placed just past the last
+/// drawn tab (the "reserve button space" rule — tabs clip before the
+/// button is dropped). The button is emitted only when it fits fully
+/// within `width`; otherwise `plus` is `None` and `prefix c` is the
+/// fallback for that degenerate width.
+pub fn tab_bar_layout(
+    session_name: &str,
+    names: &[String],
+    active: usize,
+    zoomed: bool,
+    width: u16,
+) -> TabBar {
+    let prefix = session_name.chars().count() as u16 + 2;
+
+    // Reserve the button's cells so tabs clip before the button is lost.
+    let tab_width = width.saturating_sub(PLUS_RESERVE);
+    let tabs = tab_layout(session_name, names, active, zoomed, tab_width);
+
+    // Anchor: just past the last drawn tab (or just past the prefix when
+    // no tab was drawn). The +1 mirrors the one-space separator
+    // tab_layout puts between tabs.
+    let after_tabs = tabs
+        .last()
+        .map(|t| t.x_end.saturating_add(1))
+        .unwrap_or(prefix);
+    let x_start = after_tabs.saturating_add(PLUS_GAP);
+    let x_end = x_start.saturating_add(PLUS_WIDTH - 1); // "[+]" is 3 cells: x_start..=x_start+2
+
+    let plus = if x_end < width {
+        Some(PlusButton { x_start, x_end })
+    } else {
+        None
+    };
+
+    TabBar { tabs, plus }
+}
+
+/// Resolve a 0-based x within the tab row to the "[+]" button, if it
+/// landed inside the button's rect. Checked BEFORE `tab_hit` by the
+/// caller so the button's cells are never mistaken for a tab.
+pub fn plus_button_hit(plus: Option<&PlusButton>, x: u16) -> bool {
+    matches!(plus, Some(b) if x >= b.x_start && x <= b.x_end)
 }
 
 /// Truncate to `max` cells, replacing the tail with `…` when over length.
@@ -1582,5 +1658,90 @@ mod tests {
         };
         let regions = compute_regions(v, true, 18);
         assert!(regions.sidebar.is_none());
+    }
+
+    #[test]
+    fn plus_button_sits_two_cells_past_last_tab() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let bar = tab_bar_layout("s", &names, 0, false, 40);
+        let last = bar.tabs.last().expect("at least one tab");
+        let pb = bar.plus.expect("button present in a wide bar");
+        assert_eq!(pb.x_start, last.x_end + 1 + PLUS_GAP);
+        assert_eq!(pb.x_end, pb.x_start + 2, "[+] is 3 cells wide");
+    }
+
+    #[test]
+    fn plus_button_present_with_single_window() {
+        let names = vec!["only".to_string()];
+        let bar = tab_bar_layout("s", &names, 0, false, 40);
+        assert!(bar.plus.is_some());
+    }
+
+    #[test]
+    fn plus_button_space_is_reserved_so_tabs_clip_first() {
+        // Width tight enough that tabs would consume the whole row without reservation.
+        let names = vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()];
+        let width = 14;
+        let bar = tab_bar_layout("s", &names, 0, false, width);
+        let last = bar.tabs.last().expect("at least one tab fits");
+        // Tabs are bounded into width - PLUS_RESERVE, so the last tab cannot
+        // extend past (width - PLUS_RESERVE - 1).
+        assert!(last.x_end <= width.saturating_sub(PLUS_RESERVE + 1));
+        let pb = bar.plus.expect("button kept even when tabs clip");
+        assert!(pb.x_end < width);
+    }
+
+    #[test]
+    fn plus_button_fits_within_width() {
+        let names = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        for width in 8u16..=60 {
+            let bar = tab_bar_layout("sess", &names, 1, false, width);
+            if let Some(pb) = bar.plus {
+                assert!(pb.x_end < width, "button overflowed at width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn plus_button_dropped_only_when_bar_too_narrow() {
+        let names = vec!["x".to_string()];
+        let bar = tab_bar_layout("s", &names, 0, false, 6);
+        assert!(bar.plus.is_none(), "no room for the button after the prefix");
+    }
+
+    #[test]
+    fn plus_button_hit_true_inside_rect_false_outside() {
+        let pb = PlusButton { x_start: 15, x_end: 17 };
+        assert!(plus_button_hit(Some(&pb), 15));
+        assert!(plus_button_hit(Some(&pb), 16));
+        assert!(plus_button_hit(Some(&pb), 17));
+        assert!(!plus_button_hit(Some(&pb), 14));
+        assert!(!plus_button_hit(Some(&pb), 18));
+        assert!(!plus_button_hit(None, 16));
+    }
+
+    #[test]
+    fn plus_button_and_tab_ranges_never_overlap() {
+        let names = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        let bar = tab_bar_layout("s", &names, 0, false, 40);
+        let pb = bar.plus.expect("button present");
+        for t in &bar.tabs {
+            assert!(
+                pb.x_start > t.x_end,
+                "button x_start {} overlaps tab ending at {}",
+                pb.x_start,
+                t.x_end
+            );
+        }
+    }
+
+    #[test]
+    fn plus_button_anchors_past_prefix_when_no_tabs() {
+        // No windows → no tabs drawn; button anchors just past the prefix.
+        let bar = tab_bar_layout("sess", &[], 0, false, 40);
+        assert!(bar.tabs.is_empty());
+        let pb = bar.plus.expect("button present in a wide empty bar");
+        // prefix = "sess".len() + 2 = 6; x_start = prefix + PLUS_GAP.
+        assert_eq!(pb.x_start, 6 + PLUS_GAP);
     }
 }

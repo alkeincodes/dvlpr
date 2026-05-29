@@ -135,6 +135,7 @@ the `bindkey` lines above are not strictly needed in a Ghostty session.
   **Split Horizontally**, **Zoom** (toggle), **Exit** (close this pane).
   Navigate with `↑` / `↓` (or hover); confirm with `Enter` or a left-click;
   dismiss with `Esc` or by clicking outside the menu.
+- Click the `[+]` button just after the last tab to open a new window (same as `prefix c`).
 
 ## License
 

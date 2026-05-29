@@ -813,6 +813,13 @@ impl Session {
         match ev.kind {
             MouseKind::Press => {
                 let hit = self.hit(ev.col, ev.row);
+                if let layout::Hit::NewWindowButton = hit {
+                    // Clear any stale divider-drag before creating the window,
+                    // so a malformed/reordered mouse stream can't leave a drag
+                    // dangling across the new-window switch.
+                    *drag = None;
+                    return self.apply_command(Command::NewWindow);
+                }
                 let new_drag = self.handle_hit(hit);
                 *drag = new_drag.map(|path| (self.active_window, path));
             }
@@ -867,14 +874,17 @@ impl Session {
                 .windows
                 .get(self.active_window)
                 .is_some_and(|w| w.zoomed);
-            let tabs = layout::tab_layout(
+            let bar = layout::tab_bar_layout(
                 &self.session_name,
                 &tab_names,
                 self.active_window,
                 win_zoomed,
                 self.cols,
             );
-            return match layout::tab_hit(&tabs, x) {
+            if layout::plus_button_hit(bar.plus.as_ref(), x) {
+                return layout::Hit::NewWindowButton;
+            }
+            return match layout::tab_hit(&bar.tabs, x) {
                 Some(w) => layout::Hit::Tab(w),
                 None => layout::Hit::None,
             };
@@ -941,6 +951,10 @@ impl Session {
                 self.relayout_all();
                 None
             }
+            // Dispatched in handle_mouse (needs a CommandEffect); never
+            // reached here in production. Defensive no-op for match
+            // exhaustiveness and direct test calls.
+            layout::Hit::NewWindowButton => None,
             layout::Hit::None => None,
         };
         self.reconcile_menu();
@@ -956,20 +970,22 @@ impl Session {
     }
 
     #[cfg(test)]
-    pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
+    fn tab_bar_state(&self) -> (Vec<String>, bool) {
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let zoomed = self
-            .windows
-            .get(self.active_window)
-            .map(|w| w.zoomed)
-            .unwrap_or(false);
-        layout::tab_layout(
-            &self.session_name,
-            &names,
-            self.active_window,
-            zoomed,
-            self.cols,
-        )
+        let zoomed = self.windows.get(self.active_window).is_some_and(|w| w.zoomed);
+        (names, zoomed)
+    }
+
+    #[cfg(test)]
+    pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
+        let (names, zoomed) = self.tab_bar_state();
+        layout::tab_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
+    }
+
+    #[cfg(test)]
+    pub fn tab_bar_for_test(&self) -> layout::TabBar {
+        let (names, zoomed) = self.tab_bar_state();
+        layout::tab_bar_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
     }
 
     /// Refresh every window's name from its focused pane's foreground process.
@@ -1291,10 +1307,10 @@ impl Session {
 
 /// Pure decision function: does the closed-menu right-click branch open
 /// a pane menu for this hit? Returns `Some(pane_id)` only for
-/// `Hit::Pane(_)`; every other hit (Tab, Divider, SidebarEntry, None)
-/// returns `None`. Extracted so the four-variant drop rule is
-/// unit-testable without requiring a real `Hit::SidebarEntry` (which
-/// depends on detected agent state).
+/// `Hit::Pane(_)`; every other hit (Tab, Divider, SidebarEntry,
+/// NewWindowButton, None) returns `None`. Extracted so the variant
+/// drop rule is unit-testable without requiring a real
+/// `Hit::SidebarEntry` (which depends on detected agent state).
 pub fn should_open_pane_menu(hit: layout::Hit) -> Option<layout::PaneId> {
     if let layout::Hit::Pane(id) = hit {
         Some(id)
@@ -2891,5 +2907,53 @@ mod tests {
         // Second refresh within 2 s skips and returns false.
         let changed = session.refresh_agent_meta(|_| Some(std::path::PathBuf::from("/")));
         assert!(!changed, "second refresh within 2s must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn hit_on_plus_button_returns_new_window_button() {
+        let (session, _p, _rx) = build_session_with_one_pane().await;
+        let pb = session.tab_bar_for_test().plus.expect("button present");
+        // 80x10 viewport → bottom row 0-based 9 → 1-based 10.
+        let hit = session.hit_for_test(pb.x_start + 1, 10);
+        assert_eq!(hit, crate::layout::Hit::NewWindowButton);
+    }
+
+    #[tokio::test]
+    async fn hit_on_tab_still_returns_tab() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        session.apply_command(Command::NewWindow); // now 2 tabs
+        let tabs = session.tab_regions_for_test();
+        let target = &tabs[0];
+        let hit = session.hit_for_test(target.x_start + 1, 10);
+        assert_eq!(hit, crate::layout::Hit::Tab(target.window));
+    }
+
+    #[tokio::test]
+    async fn left_click_on_plus_button_creates_window_and_switches() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        let pb = session.tab_bar_for_test().plus.expect("button present");
+        let mut drag = None;
+        let eff = session.handle_mouse(left_press(pb.x_start + 1, 10), &mut drag);
+        assert_eq!(eff.spawned.len(), 1, "new window must spawn a pane");
+        assert_eq!(session.window_count(), 2);
+        assert_eq!(session.active_window_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn right_click_on_plus_button_is_noop() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        let pb = session.tab_bar_for_test().plus.expect("button present");
+        let mut drag = None;
+        let _ = session.handle_mouse(right_press(pb.x_start + 1, 10), &mut drag);
+        assert_eq!(session.window_count(), 1);
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn handle_hit_new_window_button_is_noop() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        let out = session.handle_hit(crate::layout::Hit::NewWindowButton);
+        assert!(out.is_none());
+        assert_eq!(session.window_count(), 1);
     }
 }
