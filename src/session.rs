@@ -459,6 +459,11 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub fn dialog_buffer_for_test(&self) -> String {
+        self.dialog.as_ref().map(|d| d.buffer.clone()).unwrap_or_default()
+    }
+
     /// Open the New Window dialog. Closes any open menu (mutual exclusion).
     pub fn open_new_window_dialog(&mut self) {
         self.menu = None;
@@ -511,6 +516,56 @@ impl Session {
     /// Discard the open dialog without applying it.
     pub fn cancel_dialog(&mut self) {
         self.dialog = None;
+    }
+
+    /// If a dialog is open, consume `ev` into it and return the resulting effect
+    /// (Enter may spawn a window). Returns `None` when no dialog is open, so the
+    /// caller falls through to normal routing. Mouse/Command/Focus events are
+    /// swallowed (return a default effect) so they do not reach the focused pane
+    /// while the modal is up.
+    pub fn try_consume_dialog_event(
+        &mut self,
+        ev: &crate::input::InputEvent,
+    ) -> Option<CommandEffect> {
+        use crate::input::InputEvent;
+        self.dialog.as_ref()?;
+        match ev {
+            InputEvent::Mouse(_) | InputEvent::FocusIn | InputEvent::Command(_) => {
+                Some(CommandEffect::default())
+            }
+            InputEvent::Pane(bytes) => match bytes.as_slice() {
+                b"\x1b" => {
+                    self.cancel_dialog();
+                    Some(CommandEffect::default())
+                }
+                b"\r" | b"\n" => Some(self.submit_dialog()),
+                b"\x7f" | b"\x08" => {
+                    if let Some(d) = self.dialog.as_mut() {
+                        d.backspace();
+                    }
+                    Some(CommandEffect::default())
+                }
+                other => {
+                    // Ignore anything that begins with ESC. The parser forwards a
+                    // completed CSI/escape sequence (arrow keys etc.) as ONE Pane
+                    // chunk starting with 0x1b. Only ESC itself is a control char,
+                    // so naive is_control filtering would insert the literal "[A"
+                    // of an arrow key. Skip ESC-led chunks; else append printable
+                    // chars (cursor pinned at end; minimal editing for v1).
+                    if other.first() != Some(&0x1b) {
+                        let text = String::from_utf8_lossy(other);
+                        if let Some(d) = self.dialog.as_mut() {
+                            for c in text.chars() {
+                                if !c.is_control() {
+                                    d.insert_char(c);
+                                }
+                            }
+                        }
+                    }
+                    Some(CommandEffect::default())
+                }
+            },
+        }
     }
 
     #[cfg(test)]
@@ -3846,5 +3901,56 @@ mod tests {
         s.submit_dialog();
         s.refresh_window_names(|_| Some("zsh".to_string()));
         assert_eq!(s.window_names_for_test()[0], "zsh", "un-pinned, now auto again");
+    }
+
+    #[tokio::test]
+    async fn dialog_consumes_keys_and_enter_submits() {
+        use crate::input::InputEvent;
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        s.open_new_window_dialog();
+        for b in b"hey" {
+            let consumed = s.try_consume_dialog_event(&InputEvent::Pane(vec![*b]));
+            assert!(consumed.is_some(), "dialog must consume key events while open");
+        }
+        assert_eq!(s.dialog_buffer_for_test(), "hey");
+        s.try_consume_dialog_event(&InputEvent::Pane(vec![0x7f]));
+        assert_eq!(s.dialog_buffer_for_test(), "he");
+        let eff = s.try_consume_dialog_event(&InputEvent::Pane(vec![b'\r']));
+        assert!(eff.is_some());
+        assert!(!s.dialog_is_open_for_test());
+        assert_eq!(s.window_count_for_test(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn dialog_escape_cancels_without_creating() {
+        use crate::input::InputEvent;
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        s.open_new_window_dialog();
+        s.try_consume_dialog_event(&InputEvent::Pane(vec![0x1b]));
+        assert!(!s.dialog_is_open_for_test());
+        assert_eq!(s.window_count_for_test(), before, "Esc creates nothing");
+    }
+
+    #[tokio::test]
+    async fn dialog_event_ignored_when_closed() {
+        use crate::input::InputEvent;
+        let mut s = test_session();
+        assert!(s.try_consume_dialog_event(&InputEvent::Pane(vec![b'x'])).is_none());
+    }
+
+    #[tokio::test]
+    async fn dialog_ignores_arrow_key_escape_sequences() {
+        use crate::input::InputEvent;
+        let mut s = test_session();
+        s.open_new_window_dialog();
+        for c in "ab".chars() {
+            s.try_consume_dialog_event(&InputEvent::Pane(vec![c as u8]));
+        }
+        let consumed = s.try_consume_dialog_event(&InputEvent::Pane(b"\x1b[A".to_vec()));
+        assert!(consumed.is_some(), "the dialog still swallows the event");
+        assert_eq!(s.dialog_buffer_for_test(), "ab", "arrow keys do not edit the name");
+        assert!(s.dialog_is_open_for_test(), "an arrow key does not close the dialog");
     }
 }
