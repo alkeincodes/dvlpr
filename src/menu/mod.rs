@@ -59,10 +59,22 @@ impl MenuState {
 /// The v1 pane-menu items. Order is render order; index 0 is the default
 /// initial highlight.
 pub const PANE_MENU_ITEMS: &[MenuItem] = &[
-    MenuItem { label: "Split Vertically",   command: Command::SplitVertical   },
-    MenuItem { label: "Split Horizontally", command: Command::SplitHorizontal },
-    MenuItem { label: "Zoom",               command: Command::ToggleZoom      },
-    MenuItem { label: "Exit",               command: Command::ClosePane       },
+    MenuItem {
+        label: "Split Vertically",
+        command: Command::SplitVertical,
+    },
+    MenuItem {
+        label: "Split Horizontally",
+        command: Command::SplitHorizontal,
+    },
+    MenuItem {
+        label: "Zoom",
+        command: Command::ToggleZoom,
+    },
+    MenuItem {
+        label: "Exit",
+        command: Command::ClosePane,
+    },
 ];
 
 use crate::layout::Rect;
@@ -76,10 +88,14 @@ const MENU_BORDER: u16 = 1;
 /// so `compositor::draw_menu` can reproduce the natural unclipped rect
 /// for cell→item mapping. Kept as a function (not a `pub const`) so it
 /// behaves identically across crate boundaries with no `const` import.
-pub fn menu_pad_x() -> u16 { MENU_PAD_X }
+pub fn menu_pad_x() -> u16 {
+    MENU_PAD_X
+}
 
 /// The border cell count on each side. See `menu_pad_x` for rationale.
-pub fn menu_border() -> u16 { MENU_BORDER }
+pub fn menu_border() -> u16 {
+    MENU_BORDER
+}
 
 /// Resolve the menu's paint rect given the click anchor, the available
 /// `content_area`, and the menu's item count + label width. The algorithm:
@@ -93,12 +109,7 @@ pub fn menu_border() -> u16 { MENU_BORDER }
 ///    caller is responsible for truncating cells gracefully.
 ///
 /// The returned rect is always fully inside `content_area`.
-pub fn menu_rect(
-    anchor: (u16, u16),
-    content_area: Rect,
-    items_len: usize,
-    label_w: u16,
-) -> Rect {
+pub fn menu_rect(anchor: (u16, u16), content_area: Rect, items_len: usize, label_w: u16) -> Rect {
     let w = label_w
         .saturating_add(2 * MENU_PAD_X)
         .saturating_add(2 * MENU_BORDER);
@@ -122,19 +133,13 @@ pub fn menu_rect(
             .max(content_area.x);
     }
     if tly.saturating_add(h.saturating_sub(1)) > bottom {
-        tly = ay
-            .saturating_sub(h.saturating_sub(1))
-            .max(content_area.y);
+        tly = ay.saturating_sub(h.saturating_sub(1)).max(content_area.y);
     }
 
     let x0 = tlx.max(content_area.x);
     let y0 = tly.max(content_area.y);
-    let x1 = tlx
-        .saturating_add(w.saturating_sub(1))
-        .min(right);
-    let y1 = tly
-        .saturating_add(h.saturating_sub(1))
-        .min(bottom);
+    let x1 = tlx.saturating_add(w.saturating_sub(1)).min(right);
+    let y1 = tly.saturating_add(h.saturating_sub(1)).min(bottom);
 
     Rect {
         x: x0,
@@ -294,7 +299,15 @@ mod tests {
     #[test]
     fn menu_rect_no_clip_when_anchor_fits() {
         let r = menu_rect((10, 5), area(0, 0, 80, 24), 4, 18);
-        assert_eq!(r, Rect { x: 9, y: 4, w: 22, h: 6 });
+        assert_eq!(
+            r,
+            Rect {
+                x: 9,
+                y: 4,
+                w: 22,
+                h: 6
+            }
+        );
     }
 
     #[test]
@@ -398,14 +411,7 @@ mod tests {
         );
         // Bottom-right corner.
         assert_eq!(
-            menu_hit(
-                &menu,
-                4,
-                18,
-                content,
-                r.x + r.w - 1 + 1,
-                r.y + r.h - 1 + 1
-            ),
+            menu_hit(&menu, 4, 18, content, r.x + r.w - 1 + 1, r.y + r.h - 1 + 1),
             MenuHit::Border
         );
     }
@@ -431,10 +437,7 @@ mod tests {
             MenuHit::Outside
         );
         // Origin (1, 1) when menu is anchored far away.
-        assert_eq!(
-            menu_hit(&menu, 4, 18, content, 1, 1),
-            MenuHit::Outside
-        );
+        assert_eq!(menu_hit(&menu, 4, 18, content, 1, 1), MenuHit::Outside);
     }
 
     #[test]

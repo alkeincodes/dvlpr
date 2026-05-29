@@ -162,13 +162,16 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     // The session owns all windows/panes and the compositor; start with one pane.
     let runtime_cfg: Config = config.keymap.unwrap_or_else(Config::load);
+    // Extract the Copy-able theme before moving runtime_cfg into `keymap` below.
+    let initial_theme = runtime_cfg.theme;
     let (mut session, first_pane, first_rx) = Session::new(
         config.session.clone(),
         config.command.clone(),
         config.cwd.clone(),
         80,
         24,
-        runtime_cfg.theme,
+        initial_theme,
+        runtime_cfg.sidebar.width,
     )?;
     spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
 
@@ -203,6 +206,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
     let mut agent_tick = tokio::time::interval(Duration::from_millis(500));
     agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let sound_debouncer = crate::sound::SoundDebouncer::new();
 
     let reason: String = loop {
         tokio::select! {
@@ -344,8 +348,16 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 }
             }
             _ = agent_tick.tick() => {
-                if session.refresh_agent_states(crate::procinfo::process_name) {
+                let outcome = session.refresh_agent_states(crate::procinfo::process_name);
+                let meta_changed = session.refresh_agent_meta(crate::procinfo::pid_cwd);
+                if outcome.changed || meta_changed {
                     dirty = true;
+                }
+                if !outcome.blocked_transitions.is_empty()
+                    && keymap.sound.enabled
+                    && sound_debouncer.try_fire()
+                {
+                    crate::sound::play_blocked(&keymap.sound);
                 }
             }
         }

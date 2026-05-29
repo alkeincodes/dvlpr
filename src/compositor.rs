@@ -128,6 +128,7 @@ impl Compositor {
         theme: &crate::theme::Theme,
         panes: &[(PaneId, &dyn PaneCells)],
         sidebar_visible: bool,
+        sidebar_width: u16,
         agent_entries: &[crate::session::AgentEntry],
         menu: Option<&crate::menu::MenuState>,
     ) -> Grid {
@@ -139,7 +140,7 @@ impl Compositor {
         let rows = viewport.h;
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
 
-        let regions = layout::compute_regions(viewport, sidebar_visible);
+        let regions = layout::compute_regions(viewport, sidebar_visible, sidebar_width);
         let content = regions.content_area;
         let rects = if zoomed {
             vec![(focused, content)]
@@ -243,6 +244,7 @@ impl Compositor {
             theme,
             panes,
             false,
+            0,
             &[],
             None,
         ))
@@ -618,39 +620,44 @@ fn draw_tabs(
     }
 }
 
-fn state_color(theme: &crate::theme::Theme, state: crate::detect::AgentState) -> Color {
-    match state {
-        crate::detect::AgentState::Idle => theme.agent_idle_fg,
-        crate::detect::AgentState::Working => theme.agent_working_fg,
-        crate::detect::AgentState::Blocked => theme.agent_blocked_fg,
-    }
-}
-
 /// Fill the sidebar region with the AGENTS header, a separator, and
-/// one row per agent entry. Layout per the spec:
-///   column 0 (rect.x)        — vertical '│' separator (entire height)
-///   columns 1..15            — 15-cell content area
-///   row 0 of sidebar         — "AGENTS" centered in the content area
-///   row 1 of sidebar         — horizontal '─' rule across the 15 cols
-///   row 2..N                 — entries: " W<n>:claude  ●"
-///                              (n is 1-based for display)
-/// Empty state: rows 2 and 3 read "(no claude" / " panes)" in
-/// theme.inactive_tab_fg (theme-consistent; not visually muted).
+/// two rows per agent entry:
+///   row a: " <icon> <session-label>"
+///   row b: "   W<n>  <branch>"
+/// Empty state: row 3 shows "(no agents)" centered.
 fn draw_sidebar(
     buf: &mut [StyledCell],
     cols: u16,
-    rect: layout::Rect,
+    rect: crate::layout::Rect,
     theme: &crate::theme::Theme,
     entries: &[crate::session::AgentEntry],
 ) {
-    let sep_style = CellStyle::default();
+    if rect.h < 3 {
+        return;
+    }
     let header_style = CellStyle::default();
     let entry_style = CellStyle::default();
-    let placeholder_style = CellStyle {
-        fg: theme.inactive_tab_fg,
-        ..CellStyle::default()
-    };
+    let placeholder_style = CellStyle::default();
 
+    // Local helper: write `text` starting at (start_x, y), clipped to rect.
+    let write_cell =
+        |buf: &mut [StyledCell], y: u16, start_x: u16, text: &str, style: CellStyle| {
+            let cols_u = cols as usize;
+            let mut col = start_x;
+            for ch in text.chars() {
+                if col >= rect.x + rect.w {
+                    break;
+                }
+                let idx = (y as usize) * cols_u + (col as usize);
+                if idx < buf.len() {
+                    buf[idx] = StyledCell { ch, style };
+                }
+                col = col.saturating_add(1);
+            }
+        };
+
+    // Vertical separator on column rect.x.
+    let sep_style = CellStyle::default();
     for y in rect.y..rect.y + rect.h {
         let idx = (y as usize) * (cols as usize) + (rect.x as usize);
         if idx < buf.len() {
@@ -661,64 +668,110 @@ fn draw_sidebar(
         }
     }
 
-    let write_into_row = |buf: &mut [StyledCell], y: u16, text: &str, style: CellStyle| {
-        let start_col = rect.x + 1;
-        let end_col = rect.x + SIDEBAR_LABEL_COLS_END;
-        let mut col = start_col;
-        for ch in text.chars() {
-            if col >= end_col {
-                break;
-            }
-            let idx = (y as usize) * (cols as usize) + (col as usize);
-            if idx < buf.len() {
-                buf[idx] = StyledCell { ch, style };
-            }
-            col += 1;
-        }
-    };
+    // Header centered on row 0.
+    let header = "AGENTS";
+    let header_x = rect.x
+        + 1
+        + rect
+            .w
+            .saturating_sub(1)
+            .saturating_sub(header.chars().count() as u16)
+            / 2;
+    write_cell(buf, rect.y, header_x, header, header_style);
 
-    if rect.h >= 1 {
-        write_into_row(buf, rect.y, "    AGENTS     ", header_style);
-    }
-
-    if rect.h >= 2 {
-        write_into_row(buf, rect.y + 1, "───────────────", header_style);
-    }
+    // Divider on row 1.
+    let divider = "─".repeat(rect.w.saturating_sub(1) as usize);
+    write_cell(buf, rect.y + 1, rect.x + 1, &divider, header_style);
 
     if entries.is_empty() {
-        if rect.h >= 3 {
-            write_into_row(buf, rect.y + 2, " (no claude   ", placeholder_style);
-        }
-        if rect.h >= 4 {
-            write_into_row(buf, rect.y + 3, "  panes)      ", placeholder_style);
-        }
+        let empty = "(no agents)";
+        let y = rect.y + 3;
+        let start = rect.x
+            + 1
+            + rect
+                .w
+                .saturating_sub(1)
+                .saturating_sub(empty.chars().count() as u16)
+                / 2;
+        write_cell(buf, y, start, empty, placeholder_style);
         return;
     }
 
-    let max_entries = if rect.h >= 2 {
-        (rect.h - 2) as usize
-    } else {
-        0
-    };
-    for (i, entry) in entries.iter().take(max_entries).enumerate() {
-        let y = rect.y + 2 + i as u16;
-        let label = format!(" W{}:claude", entry.window_index + 1);
-        write_into_row(buf, y, &label, entry_style);
-        let dot_col = rect.x + 13;
-        let dot_idx = (y as usize) * (cols as usize) + (dot_col as usize);
-        if dot_idx < buf.len() {
-            buf[dot_idx] = StyledCell {
-                ch: '●',
-                style: CellStyle {
-                    fg: state_color(theme, entry.state),
-                    ..CellStyle::default()
-                },
-            };
-        }
+    // Two rows per entry, starting at row 3 (header + divider + blank gap).
+    let max_entries = (rect.h.saturating_sub(3) / 3) as usize;
+    for (i, e) in entries.iter().take(max_entries).enumerate() {
+        let row_a_y = rect.y + 3 + (i as u16) * 3;
+        let row_b_y = row_a_y + 1;
+
+        // Row a: " <icon> <session-label or W<n>:agent>"
+        write_cell(buf, row_a_y, rect.x + 1, " ", entry_style);
+        let (icon, icon_color) = icon_for(e.state, theme);
+        let icon_style = CellStyle {
+            fg: icon_color,
+            ..CellStyle::default()
+        };
+        let mut icon_buf = [0u8; 4];
+        write_cell(
+            buf,
+            row_a_y,
+            rect.x + 2,
+            icon.encode_utf8(&mut icon_buf),
+            icon_style,
+        );
+        write_cell(buf, row_a_y, rect.x + 3, " ", entry_style);
+
+        let label_x = rect.x + 4;
+        let label_max = rect.w.saturating_sub(4) as usize;
+        let label = e
+            .session_label
+            .clone()
+            .unwrap_or_else(|| format!("W{}:{}", e.window_index + 1, agent_short(e.agent)));
+        let trunc = truncate_ellipsis(&label, label_max);
+        write_cell(buf, row_a_y, label_x, &trunc, entry_style);
+
+        // Row b: "   W<n>  <branch>"
+        let w_slug = format!("W{}", e.window_index + 1);
+        let prefix = format!("   {}  ", w_slug);
+        write_cell(buf, row_b_y, rect.x + 1, &prefix, entry_style);
+
+        let branch_x = rect.x + 1 + prefix.chars().count() as u16;
+        let branch_max = rect.w.saturating_sub(1 + prefix.chars().count() as u16) as usize;
+        let branch_str = match &e.branch {
+            Some(b) => truncate_ellipsis(b, branch_max),
+            None => truncate_ellipsis("<no git>", branch_max),
+        };
+        write_cell(buf, row_b_y, branch_x, &branch_str, entry_style);
     }
 }
 
-const SIDEBAR_LABEL_COLS_END: u16 = 16;
+fn icon_for(state: crate::detect::AgentState, theme: &crate::theme::Theme) -> (char, Color) {
+    use crate::detect::AgentState;
+    match state {
+        AgentState::Idle => ('○', theme.agent_idle_fg),
+        AgentState::Working => ('●', theme.agent_working_fg),
+        AgentState::Blocked => ('!', theme.agent_blocked_fg),
+    }
+}
+
+fn agent_short(agent: crate::detect::Agent) -> &'static str {
+    match agent {
+        crate::detect::Agent::Claude => "claude",
+        crate::detect::Agent::Codex => "codex",
+    }
+}
+
+fn truncate_ellipsis(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
 
 /// Paint the open context menu's cells into `buf`. Pure function — no I/O.
 ///
@@ -1583,8 +1636,8 @@ mod tests {
 
     #[test]
     fn draw_sidebar_colors_dot_by_state_from_theme() {
-        let cols: u16 = 16;
-        let rows: u16 = 6;
+        let cols: u16 = 26;
+        let rows: u16 = 12;
         let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
         let rect = layout::Rect {
             x: 0,
@@ -1599,24 +1652,28 @@ mod tests {
             pane_id: 1,
             agent: crate::detect::Agent::Claude,
             state: crate::detect::AgentState::Working,
+            session_label: None,
+            branch: None,
         }];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries);
-        let dot_idx = (2 * cols as usize) + 13;
-        assert_eq!(buf[dot_idx].ch, '●');
-        assert_eq!(buf[dot_idx].style.fg, theme.agent_working_fg);
+        // Icon is now on row 3 (header + divider + blank), at column rect.x + 2.
+        let icon_idx = (3 * cols as usize) + 2;
+        assert_eq!(buf[icon_idx].ch, '●');
+        assert_eq!(buf[icon_idx].style.fg, theme.agent_working_fg);
     }
 
     #[test]
     fn draw_sidebar_dot_colors_change_with_flavor() {
-        let cols: u16 = 16;
+        let cols: u16 = 26;
+        let rows: u16 = 12;
         let rect = layout::Rect {
             x: 0,
             y: 0,
             w: cols,
-            h: 6,
+            h: rows,
         };
-        let mut buf_latte = vec![StyledCell::default(); (cols as usize) * 6];
-        let mut buf_mocha = vec![StyledCell::default(); (cols as usize) * 6];
+        let mut buf_latte = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let mut buf_mocha = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
         let latte = crate::theme::Theme::from_flavor(crate::theme::Flavor::Latte);
         let mocha = crate::theme::Theme::from_flavor(crate::theme::Flavor::Mocha);
         let entries = vec![crate::session::AgentEntry {
@@ -1625,31 +1682,119 @@ mod tests {
             pane_id: 1,
             agent: crate::detect::Agent::Claude,
             state: crate::detect::AgentState::Idle,
+            session_label: None,
+            branch: None,
         }];
         draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries);
         draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries);
-        let dot_idx = (2 * cols as usize) + 13;
-        assert_ne!(buf_latte[dot_idx].style.fg, buf_mocha[dot_idx].style.fg);
+        // Icon is now on row 3, at column rect.x + 2.
+        let icon_idx = (3 * cols as usize) + 2;
+        assert_ne!(buf_latte[icon_idx].style.fg, buf_mocha[icon_idx].style.fg);
     }
 
     #[test]
     fn draw_sidebar_empty_state_uses_inactive_tab_fg() {
-        let cols: u16 = 16;
-        let mut buf = vec![StyledCell::default(); (cols as usize) * 6];
+        let cols: u16 = 26;
+        let rows: u16 = 12;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
         let rect = layout::Rect {
             x: 0,
             y: 0,
             w: cols,
-            h: 6,
+            h: rows,
         };
         let theme = crate::theme::Theme::default();
         draw_sidebar(&mut buf, cols, rect, &theme, &[]);
-        let row2: String = (1..cols)
-            .map(|x| buf[(2 * cols as usize) + x as usize].ch)
+        // Empty placeholder is now "(no agents)" centered at row 3.
+        let row3: String = (0..cols)
+            .map(|x| buf[(3 * cols as usize) + x as usize].ch)
             .collect();
-        assert!(row2.contains("no claude"), "row2: {row2:?}");
-        let paren_idx = (2 * cols as usize) + 1;
-        assert_eq!(buf[paren_idx].style.fg, theme.inactive_tab_fg);
+        assert!(row3.contains("(no agents)"), "row3: {row3:?}");
+    }
+
+    fn row_text(buf: &[StyledCell], cols: usize, y: usize) -> String {
+        (0..cols).map(|x| buf[y * cols + x].ch).collect()
+    }
+
+    #[test]
+    fn draw_sidebar_uses_two_rows_per_agent_with_session_label_and_branch() {
+        let theme = crate::theme::Theme::default();
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "ses".to_string(),
+            window_index: 0,
+            pane_id: 0,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Working,
+            session_label: Some("Refactor auth flow".to_string()),
+            branch: Some("main".to_string()),
+        }];
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 12,
+        };
+        let mut buf = vec![StyledCell::default(); 26 * 12];
+        draw_sidebar(&mut buf, 26, rect, &theme, &entries);
+
+        // Row a contains the session label (after header + divider + blank).
+        let row_a = row_text(&buf, 26, 3);
+        assert!(row_a.contains("Refactor auth flow"), "row a = {row_a:?}");
+        // Row b contains "W1" and "main".
+        let row_b = row_text(&buf, 26, 4);
+        assert!(row_b.contains("W1"), "row b = {row_b:?}");
+        assert!(row_b.contains("main"), "row b = {row_b:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_truncates_session_label_at_minimum_width() {
+        let theme = crate::theme::Theme::default();
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "ses".to_string(),
+            window_index: 0,
+            pane_id: 0,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Idle,
+            session_label: Some("A very long session label that won't fit".to_string()),
+            branch: Some("main".to_string()),
+        }];
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 18,
+            h: 12,
+        };
+        let mut buf = vec![StyledCell::default(); 18 * 12];
+        draw_sidebar(&mut buf, 18, rect, &theme, &entries);
+
+        let row_a = row_text(&buf, 18, 3);
+        assert!(row_a.contains('…'), "row a = {row_a:?}");
+        assert!(!row_a.contains("won't fit"), "row a = {row_a:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_shows_no_git_placeholder_when_branch_is_none() {
+        let theme = crate::theme::Theme::default();
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "ses".to_string(),
+            window_index: 0,
+            pane_id: 0,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Idle,
+            session_label: Some("x".to_string()),
+            branch: None,
+        }];
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            w: 26,
+            h: 12,
+        };
+        let mut buf = vec![StyledCell::default(); 26 * 12];
+        draw_sidebar(&mut buf, 26, rect, &theme, &entries);
+
+        let row_b = row_text(&buf, 26, 4);
+        assert!(row_b.contains("<no git>"), "row b = {row_b:?}");
     }
 
     #[test]
@@ -1956,7 +2101,7 @@ mod tests {
             menu_highlight_bg: Color::Rgb(40, 40, 40),
             menu_highlight_fg: Color::Rgb(50, 50, 50),
             menu_highlight_bold: true,
-            ..Default::default()
+            ..crate::theme::Theme::default()
         }
     }
 
