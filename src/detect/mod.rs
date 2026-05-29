@@ -3,6 +3,7 @@
 //! Each pane's bottom-of-buffer text is sampled periodically and matched
 //! against known agent output patterns to classify state.
 
+mod codex;
 mod spinner_verbs;
 use spinner_verbs::SPINNER_VERBS;
 
@@ -38,7 +39,7 @@ pub fn agent_for(process_name: &str) -> Option<Agent> {
 pub fn classify(agent: Agent, tail: &str) -> AgentState {
     match agent {
         Agent::Claude => classify_claude(tail),
-        Agent::Codex => AgentState::Idle,
+        Agent::Codex => codex::classify(tail),
     }
 }
 
@@ -506,5 +507,18 @@ mod tests {
                     ❯ Combobulating…\n\
                     ─────────────────────────\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_dispatches_codex_to_codex_module() {
+        assert_eq!(
+            classify(Agent::Codex, "Working (1s • esc to interrupt)"),
+            AgentState::Working
+        );
+        assert_eq!(
+            classify(Agent::Codex, "Would you like to run the following command?"),
+            AgentState::Blocked
+        );
+        assert_eq!(classify(Agent::Codex, "Ask Codex to do anything"), AgentState::Idle);
     }
 }
