@@ -85,11 +85,13 @@ pub struct PlusButton {
 
 /// The literal button glyph. 3 display cells.
 pub const PLUS_LABEL: &str = "[+]";
-/// Spaces between the last tab and the button.
+/// Display width of the button glyph, in cells.
+pub const PLUS_WIDTH: u16 = PLUS_LABEL.len() as u16;
+/// Cells inserted before the button, on top of the tab separator (total visual blank before the button is PLUS_GAP + 1).
 pub const PLUS_GAP: u16 = 2;
 /// Total cells the button reserves at the right of the tab area:
-/// PLUS_GAP (2) + PLUS_LABEL width (3) = 5.
-pub const PLUS_RESERVE: u16 = PLUS_GAP + 3;
+/// PLUS_GAP + PLUS_WIDTH.
+pub const PLUS_RESERVE: u16 = PLUS_GAP + PLUS_WIDTH;
 
 /// What a mouse click landed on.
 #[derive(Clone, Debug, PartialEq)]
@@ -515,6 +517,7 @@ pub fn tab_layout(
 }
 
 /// The full tab-bar layout: window tabs plus the "[+]" new-window button.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TabBar {
     pub tabs: Vec<TabRegion>,
     pub plus: Option<PlusButton>,
@@ -549,7 +552,7 @@ pub fn tab_bar_layout(
         .map(|t| t.x_end.saturating_add(1))
         .unwrap_or(prefix);
     let x_start = after_tabs.saturating_add(PLUS_GAP);
-    let x_end = x_start.saturating_add(2); // "[+]" is 3 cells: x_start..=x_start+2
+    let x_end = x_start.saturating_add(PLUS_WIDTH - 1); // "[+]" is 3 cells: x_start..=x_start+2
 
     let plus = if x_end < width {
         Some(PlusButton { x_start, x_end })
@@ -1683,7 +1686,7 @@ mod tests {
         let last = bar.tabs.last().expect("at least one tab fits");
         // Tabs are bounded into width - PLUS_RESERVE, so the last tab cannot
         // extend past (width - PLUS_RESERVE - 1).
-        assert!(last.x_end <= width - PLUS_RESERVE - 1);
+        assert!(last.x_end <= width.saturating_sub(PLUS_RESERVE + 1));
         let pb = bar.plus.expect("button kept even when tabs clip");
         assert!(pb.x_end < width);
     }
@@ -1730,5 +1733,15 @@ mod tests {
                 t.x_end
             );
         }
+    }
+
+    #[test]
+    fn plus_button_anchors_past_prefix_when_no_tabs() {
+        // No windows → no tabs drawn; button anchors just past the prefix.
+        let bar = tab_bar_layout("sess", &[], 0, false, 40);
+        assert!(bar.tabs.is_empty());
+        let pb = bar.plus.expect("button present in a wide empty bar");
+        // prefix = "sess".len() + 2 = 6; x_start = prefix + PLUS_GAP.
+        assert_eq!(pb.x_start, 6 + PLUS_GAP);
     }
 }
