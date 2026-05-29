@@ -193,6 +193,72 @@ pub fn max_scroll(rows_len: usize, rect: Rect) -> u16 {
     rows_len.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
 
+/// The two tab labels, in display order. Single source of truth for the tab
+/// header (renderer + hit-test).
+pub const HELP_TAB_LABELS: [(HelpTab, &str); 2] = [
+    (HelpTab::Keybindings, "Keybindings"),
+    (HelpTab::Commands, "Commands"),
+];
+
+const HELP_TAB_GAP: u16 = 2; // blank cells between adjacent tab chips
+const HELP_TAB_LEFT_PAD: u16 = 1; // interior pad before the first chip
+
+/// A tab chip's clickable x-range (inclusive), 0-based, including a 1-cell pad
+/// on each side of the label. The renderer paints the highlight over exactly
+/// this range; `help_hit` tests against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelpTabRegion {
+    pub tab: HelpTab,
+    pub x_start: u16,
+    pub x_end: u16,
+}
+
+/// Lay out the tab chips inside `rect`'s header row.
+pub fn tab_regions(rect: Rect) -> Vec<HelpTabRegion> {
+    let mut out = Vec::new();
+    // Interior begins at rect.x + 1 (after the left border).
+    let mut x = rect.x.saturating_add(1).saturating_add(HELP_TAB_LEFT_PAD);
+    for (tab, label) in HELP_TAB_LABELS {
+        let label_w = label.chars().count() as u16;
+        let chip_w = label_w.saturating_add(2); // 1 pad + label + 1 pad
+        let x_start = x;
+        let x_end = x_start.saturating_add(chip_w).saturating_sub(1);
+        out.push(HelpTabRegion { tab, x_start, x_end });
+        x = x_end.saturating_add(1).saturating_add(HELP_TAB_GAP);
+    }
+    out
+}
+
+/// Result of `help_hit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelpHit {
+    Tab(usize),
+    Body,
+    Outside,
+}
+
+/// Classify a 1-based `(col, row)` click against the open overlay.
+pub fn help_hit(view: &HelpView, content_area: Rect, col: u16, row: u16) -> HelpHit {
+    let rect = help_rect(content_area, view.active_rows().len());
+    if !help_renderable(rect) {
+        // Not shown → swallow clicks (don't close an invisible overlay).
+        return HelpHit::Body;
+    }
+    let x = col.saturating_sub(1);
+    let y = row.saturating_sub(1);
+    if !rect.contains(x, y) {
+        return HelpHit::Outside;
+    }
+    if y == rect.y + 1 {
+        for r in tab_regions(rect) {
+            if x >= r.x_start && x <= r.x_end {
+                return HelpHit::Tab(r.tab.index());
+            }
+        }
+    }
+    HelpHit::Body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +416,80 @@ mod tests {
         let tiny = area(0, 0, 60, 3); // h < chrome
         assert_eq!(visible_body_rows(tiny), 0);
         assert_eq!(max_scroll(10, tiny), 10);
+    }
+
+    fn view_with(tab: HelpTab) -> HelpView {
+        let cfg = Config::default();
+        build_view(&HelpState { tab, scroll: 0 }, cfg.prefix, &cfg.keys)
+    }
+
+    #[test]
+    fn help_hit_returns_tab_for_header_label_cells() {
+        let v = view_with(HelpTab::Keybindings);
+        let content = area(0, 0, 80, 24);
+        let rect = help_rect(content, v.active_rows().len());
+        let regs = tab_regions(rect);
+        // Click the middle of each tab's chip; expect that tab's index.
+        for r in &regs {
+            let mid = (r.x_start + r.x_end) / 2;
+            let row_1based = (rect.y + 1) + 1;
+            assert_eq!(
+                help_hit(&v, content, mid + 1, row_1based),
+                HelpHit::Tab(r.tab.index())
+            );
+        }
+    }
+
+    #[test]
+    fn help_hit_returns_body_for_borders_and_body() {
+        let v = view_with(HelpTab::Keybindings);
+        let content = area(0, 0, 80, 24);
+        let rect = help_rect(content, v.active_rows().len());
+        // Top-left border corner.
+        assert_eq!(help_hit(&v, content, rect.x + 1, rect.y + 1), HelpHit::Body);
+        // A body row interior cell.
+        let body_row = (rect.y + 3) + 1;
+        assert_eq!(help_hit(&v, content, rect.x + 3, body_row), HelpHit::Body);
+    }
+
+    #[test]
+    fn help_hit_returns_outside_past_rect() {
+        let v = view_with(HelpTab::Keybindings);
+        let content = area(0, 0, 80, 24);
+        let rect = help_rect(content, v.active_rows().len());
+        // One column left of the rect (still 1-based coords).
+        assert_eq!(help_hit(&v, content, rect.x, rect.y + 2 + 1), HelpHit::Outside);
+        assert_eq!(help_hit(&v, content, 1, 1), HelpHit::Outside);
+    }
+
+    #[test]
+    fn help_hit_returns_body_when_not_renderable() {
+        let v = view_with(HelpTab::Keybindings);
+        let content = area(0, 0, 10, 3); // too small to render
+        assert_eq!(help_hit(&v, content, 1, 1), HelpHit::Body);
+    }
+
+    #[test]
+    fn tab_regions_match_help_hit_targets() {
+        let rect = area(10, 4, 60, 16);
+        let regs = tab_regions(rect);
+        assert_eq!(regs.len(), 2);
+        assert_eq!(regs[0].tab, HelpTab::Keybindings);
+        assert_eq!(regs[1].tab, HelpTab::Commands);
+        // Regions are ordered left-to-right and non-overlapping.
+        assert!(regs[0].x_end < regs[1].x_start);
+    }
+
+    #[test]
+    fn help_hit_returns_body_for_inter_tab_gap() {
+        let v = view_with(HelpTab::Keybindings);
+        let content = area(0, 0, 80, 24);
+        let rect = help_rect(content, v.active_rows().len());
+        let regs = tab_regions(rect);
+        // A column strictly between the two chips, on the tab header row.
+        let gap_x = regs[0].x_end + 1; // first cell of the gap (0-based)
+        assert!(gap_x < regs[1].x_start, "there must be a gap between chips");
+        let row_1based = (rect.y + 1) + 1;
+        assert_eq!(help_hit(&v, content, gap_x + 1, row_1based), HelpHit::Body);
     }
 }
