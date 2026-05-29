@@ -941,6 +941,10 @@ impl Session {
                 self.relayout_all();
                 None
             }
+            // Dispatched in handle_mouse (needs a CommandEffect); never
+            // reached here in production. Defensive no-op for match
+            // exhaustiveness and direct test calls.
+            layout::Hit::NewWindowButton => None,
             layout::Hit::None => None,
         };
         self.reconcile_menu();
