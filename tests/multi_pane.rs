@@ -107,7 +107,12 @@ async fn prefix_c_creates_a_window_and_shows_the_tab_bar() {
     spawn_daemon(sock.clone());
     wait_for_socket(&sock).await;
     let (mut r, mut w) = handshake(&sock, 40, 12).await;
-    send_input(&mut w, &[0x02, b'c']).await; // prefix c => new window
+    send_input(&mut w, &[0x02, b'c']).await; // prefix c => open New Window dialog
+    assert!(
+        until_frame(&mut r, 5, |f| f.contains("New Window")).await,
+        "prefix c should open the New Window dialog"
+    );
+    send_input(&mut w, b"\r").await; // Enter => create the default window
     assert!(
         until_frame(&mut r, 5, |f| f.contains("1:")
             && f.contains("2:")

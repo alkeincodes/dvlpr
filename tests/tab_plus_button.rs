@@ -130,13 +130,20 @@ async fn clicking_plus_button_in_tab_bar_creates_window() {
     let click = format!("\x1b[<0;{};{}M", col, rows);
     send_input(&mut w, click.as_bytes()).await;
 
-    // The new window (named "cat", index 1) becomes active, so its tab
-    // renders as "2:cat*" — the active marker `*` proves it exists AND is
-    // active. The active chip is painted in a single uniform style, so the
-    // serializer emits the label as a contiguous byte run (no interleaved
+    // Clicking [+] now opens the New Window dialog instead of creating directly.
+    assert!(
+        until_frame_contains(&mut r, 2, b"New Window").await,
+        "clicking [+] should open the New Window dialog"
+    );
+
+    // Enter creates the default window (named "cat", index 1) and activates it,
+    // so its tab renders as "2:cat*" — the active marker `*` proves it exists
+    // AND is active. The active chip is painted in a single uniform style, so
+    // the serializer emits the label as a contiguous byte run (no interleaved
     // per-cell SGR), making this substring assertion robust.
+    send_input(&mut w, b"\r").await;
     assert!(
         until_frame_contains(&mut r, 2, b"2:cat*").await,
-        "clicking [+] should create and activate a second window (a '2:cat*' tab)"
+        "Enter in the dialog should create and activate a second window (a '2:cat*' tab)"
     );
 }
