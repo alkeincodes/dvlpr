@@ -73,6 +73,9 @@ fn parse_args(args: &[String]) -> Cmd {
             _ => None,
         }
     };
+    // NOTE: the in-app help overlay's Commands tab mirrors these subcommands in
+    // `help::COMMAND_ROWS` (src/help/mod.rs). When you add/rename/remove a
+    // subcommand here, update that table (and its coverage test) to match.
     const USAGE: &str =
         "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name>";
     match args.first().map(String::as_str) {

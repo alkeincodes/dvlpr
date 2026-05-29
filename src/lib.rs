@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod detect;
 pub mod ghostty;
+pub mod help;
 pub mod input;
 pub mod layout;
 pub mod menu;
