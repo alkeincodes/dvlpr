@@ -4,6 +4,7 @@ pub mod compositor;
 pub mod config;
 pub mod daemon;
 pub mod detect;
+pub mod dialog;
 pub mod ghostty;
 pub mod help;
 pub mod input;
