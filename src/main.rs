@@ -43,6 +43,14 @@ async fn main() {
         eprintln!("dvlpr: {e}");
         std::process::exit(1);
     }
+    // Exit explicitly instead of falling through to the `#[tokio::main]` runtime
+    // drop. `tokio::io::stdin()` runs its `read()` on a blocking-pool thread that
+    // can't be cancelled when the client's select! loop exits on detach; dropping
+    // the runtime joins that thread and would hang until the parked `read()`
+    // returns (which, with the terminal already restored to canonical mode, needs
+    // an Enter keypress). The scoped terminal guards have already restored state
+    // by the time any client command returns, so there is nothing left to flush.
+    std::process::exit(0);
 }
 
 /// A parsed CLI command.
