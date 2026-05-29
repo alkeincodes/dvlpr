@@ -131,6 +131,7 @@ impl Compositor {
         sidebar_width: u16,
         agent_entries: &[crate::session::AgentEntry],
         menu: Option<&crate::menu::MenuState>,
+        help: Option<&crate::help::HelpView>,
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -199,6 +200,13 @@ impl Compositor {
             );
         }
 
+        // Help overlay — painted after the menu (top-most). The caller (Session)
+        // passes at most one of menu/help open at a time; if both were Some, help
+        // would paint over the menu.
+        if let Some(h) = help {
+            draw_help(&mut buf, cols, h, theme, content);
+        }
+
         // Cursor at the focused pane's cursor, mapped to global coordinates.
         let cursor = match focused_rect {
             Some(fr) => {
@@ -247,6 +255,7 @@ impl Compositor {
             false,
             0,
             &[],
+            None,
             None,
         ))
     }
@@ -956,6 +965,173 @@ pub fn draw_menu(
 
             buf[idx] = cell;
         }
+    }
+}
+
+/// Paint the open help overlay into `buf`. Pure function — no I/O. Mirrors
+/// `draw_menu`. Reuses the `theme.menu_*` roles. Returns without touching `buf`
+/// when the rect is too small to render (`help_renderable` is false).
+pub fn draw_help(
+    buf: &mut [StyledCell],
+    cols: u16,
+    view: &crate::help::HelpView,
+    theme: &crate::theme::Theme,
+    content_area: crate::layout::Rect,
+) {
+    use crate::help::{
+        help_rect, help_renderable, max_scroll, tab_regions, visible_body_rows, HELP_TAB_LABELS,
+    };
+
+    let rows = view.active_rows();
+    let rect = help_rect(content_area, rows.len());
+    if !help_renderable(rect) {
+        return;
+    }
+
+    let menu_bg = theme.menu_bg;
+    let label = CellStyle {
+        fg: theme.menu_label_fg,
+        bg: menu_bg,
+        ..CellStyle::default()
+    };
+    let border = CellStyle {
+        fg: theme.menu_border_fg,
+        bg: menu_bg,
+        ..CellStyle::default()
+    };
+    let active = CellStyle {
+        fg: theme.menu_highlight_fg,
+        bg: theme.menu_highlight_bg,
+        bold: theme.menu_highlight_bold,
+        ..CellStyle::default()
+    };
+    let cols_usize = cols as usize;
+    let put = |buf: &mut [StyledCell], x: u16, y: u16, ch: char, style: CellStyle| {
+        let idx = y as usize * cols_usize + x as usize;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch, style };
+        }
+    };
+
+    let x0 = rect.x;
+    let x1 = rect.x + rect.w - 1;
+    let y0 = rect.y;
+    let y1 = rect.y + rect.h - 1;
+
+    // Opaque interior fill (so partial rows never show pane content through).
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            put(buf, x, y, ' ', label);
+        }
+    }
+
+    // Top border + title.
+    put(buf, x0, y0, '┌', border);
+    put(buf, x1, y0, '┐', border);
+    for x in (x0 + 1)..x1 {
+        put(buf, x, y0, '─', border);
+    }
+    let mut tx = x0 + 2;
+    for ch in " Help ".chars() {
+        if tx >= x1 {
+            break;
+        }
+        put(buf, tx, y0, ch, border);
+        tx += 1;
+    }
+
+    // Separator (y0 + 2) and side borders.
+    let sep_y = y0 + 2;
+    put(buf, x0, sep_y, '├', border);
+    put(buf, x1, sep_y, '┤', border);
+    for x in (x0 + 1)..x1 {
+        put(buf, x, sep_y, '─', border);
+    }
+    for y in (y0 + 1)..y1 {
+        if y == sep_y {
+            continue;
+        }
+        put(buf, x0, y, '│', border);
+        put(buf, x1, y, '│', border);
+    }
+
+    // Bottom border.
+    put(buf, x0, y1, '└', border);
+    put(buf, x1, y1, '┘', border);
+    for x in (x0 + 1)..x1 {
+        put(buf, x, y1, '─', border);
+    }
+
+    // Tab header (y0 + 1).
+    let tab_y = y0 + 1;
+    for (region, (tab, lbl)) in tab_regions(rect).into_iter().zip(HELP_TAB_LABELS) {
+        let style = if tab == view.tab { active } else { label };
+        for x in region.x_start..=region.x_end {
+            if x <= x0 || x >= x1 {
+                continue;
+            }
+            put(buf, x, tab_y, ' ', style);
+        }
+        let mut lx = region.x_start + 1;
+        for ch in lbl.chars() {
+            if lx >= x1 {
+                break;
+            }
+            put(buf, lx, tab_y, ch, style);
+            lx += 1;
+        }
+    }
+
+    // Body.
+    let body_top = y0 + 3;
+    let vis = visible_body_rows(rect);
+    let scroll = view.scroll.min(max_scroll(rows.len(), rect));
+    let interior_w = rect.w.saturating_sub(2);
+    let key_w_raw = rows.iter().map(|r| r.keys.chars().count()).max().unwrap_or(0) as u16;
+    // interior_w >= 22 here (help_renderable guarantees w >= HELP_MIN_W = 24),
+    // so the desc column always keeps >= 6 cells; the -8 reserves the gap+min desc.
+    let key_w = key_w_raw.min(interior_w.saturating_sub(8));
+    for j in 0..vis {
+        let ri = scroll as usize + j as usize;
+        if ri >= rows.len() {
+            break;
+        }
+        let row = &rows[ri];
+        let y = body_top + j;
+        // " " (border+pad already filled) + keys at x0+2.
+        let mut x = x0 + 2;
+        for (k, ch) in row.keys.chars().enumerate() {
+            if k as u16 >= key_w || x >= x1 {
+                break;
+            }
+            put(buf, x, y, ch, label);
+            x += 1;
+        }
+        // Desc starts after the key column + a 2-cell gap.
+        let mut x = x0 + 2 + key_w + 2;
+        let desc_avail = if x < x1 { (x1 - x) as usize } else { 0 };
+        for ch in truncate_ellipsis(&row.desc, desc_avail).chars() {
+            if x >= x1 {
+                break;
+            }
+            put(buf, x, y, ch, label);
+            x += 1;
+        }
+    }
+
+    // Footer hint (y1 - 1).
+    let footer_y = y1 - 1;
+    let hint = truncate_ellipsis(
+        "←/→·Tab switch   ↑/↓ scroll   q/Esc/? close",
+        interior_w.saturating_sub(2) as usize,
+    );
+    let mut fx = x0 + 2;
+    for ch in hint.chars() {
+        if fx >= x1 {
+            break;
+        }
+        put(buf, fx, footer_y, ch, label);
+        fx += 1;
     }
 }
 
@@ -2399,5 +2575,163 @@ mod tests {
         let rect = menu_rect(menu.anchor, content, items.len(), label_w);
         assert!(rect.x + rect.w <= cols);
         assert!(rect.y + rect.h <= rows);
+    }
+
+    fn help_view_for_test(tab: crate::help::HelpTab, scroll: u16) -> crate::help::HelpView {
+        let cfg = crate::config::Config::default();
+        crate::help::build_view(
+            &crate::help::HelpState { tab, scroll },
+            cfg.prefix,
+            &cfg.keys,
+        )
+    }
+
+    fn theme() -> crate::theme::Theme {
+        crate::theme::Theme::default()
+    }
+
+    #[test]
+    fn draw_help_paints_box_drawing_border_with_title() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let rect = crate::help::help_rect(content, v.active_rows().len());
+        let at = |x: u16, y: u16| buf[y as usize * cols as usize + x as usize].ch;
+        assert_eq!(at(rect.x, rect.y), '┌');
+        assert_eq!(at(rect.x + rect.w - 1, rect.y), '┐');
+        assert_eq!(at(rect.x, rect.y + rect.h - 1), '└');
+        assert_eq!(at(rect.x + rect.w - 1, rect.y + rect.h - 1), '┘');
+        // Title present on the top border.
+        let top: String = (rect.x..rect.x + rect.w)
+            .map(|x| at(x, rect.y))
+            .collect();
+        assert!(top.contains("Help"));
+    }
+
+    #[test]
+    fn draw_help_active_tab_chip_uses_highlight_roles() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let rect = crate::help::help_rect(content, v.active_rows().len());
+        let regs = crate::help::tab_regions(rect);
+        let tab_y = rect.y + 1;
+        // Active (Keybindings) chip cell carries the highlight bg.
+        let active_cell = buf[tab_y as usize * cols as usize + regs[0].x_start as usize];
+        assert_eq!(active_cell.style.bg, theme().menu_highlight_bg);
+        // Inactive (Commands) chip label cell uses the label fg, not highlight.
+        let inactive_cell = buf[tab_y as usize * cols as usize + (regs[1].x_start + 1) as usize];
+        assert_eq!(inactive_cell.style.bg, theme().menu_bg);
+    }
+
+    #[test]
+    fn draw_help_body_renders_keys_and_truncated_desc() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let rect = crate::help::help_rect(content, v.active_rows().len());
+        // First body row should contain the first keybinding's chord "C-b →".
+        let row_y = rect.y + 3;
+        let line: String = (rect.x..rect.x + rect.w)
+            .map(|x| buf[row_y as usize * cols as usize + x as usize].ch)
+            .collect();
+        assert!(line.contains("C-b"));
+    }
+
+    #[test]
+    fn draw_help_respects_scroll_offset() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf0 = vec![StyledCell::default(); cols as usize * rows as usize];
+        let mut buf1 = vec![StyledCell::default(); cols as usize * rows as usize];
+        // Force scrolling: a short content area so not all rows fit.
+        let content = Rect { x: 0, y: 0, w: cols, h: 12 };
+        let v0 = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        let v1 = help_view_for_test(crate::help::HelpTab::Keybindings, 1);
+        draw_help(&mut buf0, cols, &v0, &theme(), content);
+        draw_help(&mut buf1, cols, &v1, &theme(), content);
+        let rect = crate::help::help_rect(content, v0.active_rows().len());
+        let first_line = |buf: &[StyledCell]| -> String {
+            let y = rect.y + 3;
+            (rect.x..rect.x + rect.w)
+                .map(|x| buf[y as usize * cols as usize + x as usize].ch)
+                .collect()
+        };
+        assert_ne!(first_line(&buf0), first_line(&buf1), "scroll must shift rows");
+    }
+
+    #[test]
+    fn draw_help_paints_nothing_when_content_too_small() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let snapshot = buf.clone();
+        let content = Rect { x: 0, y: 0, w: 80, h: 0 }; // degenerate
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content); // must not panic
+        assert_eq!(buf, snapshot, "no cells should change");
+    }
+
+    #[test]
+    fn draw_help_clamps_scroll_defensively_when_overflowing() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: 12 }; // forces overflow
+        // scroll wildly past the end; draw_help must clamp (show the last page),
+        // not panic.
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 99);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let text: String = buf.iter().map(|c| c.ch).collect();
+        assert!(
+            text.contains("1-9"),
+            "clamped scroll should land on the final keybinding rows"
+        );
+    }
+
+    #[test]
+    fn draw_help_never_writes_outside_resolved_rect() {
+        let (cols, rows) = (80u16, 24u16);
+        let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let rect = crate::help::help_rect(content, v.active_rows().len());
+        for y in 0..rows {
+            for x in 0..cols {
+                let inside = x >= rect.x
+                    && x < rect.x + rect.w
+                    && y >= rect.y
+                    && y < rect.y + rect.h;
+                if !inside {
+                    assert_eq!(
+                        buf[y as usize * cols as usize + x as usize],
+                        StyledCell::default(),
+                        "cell ({x},{y}) outside the rect was modified"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draw_help_overwrites_pane_cells_in_its_footprint() {
+        let (cols, rows) = (80u16, 24u16);
+        // Pre-fill the whole buffer with a sentinel "pane" glyph.
+        let sentinel = StyledCell {
+            ch: 'X',
+            style: CellStyle::default(),
+        };
+        let mut buf = vec![sentinel; cols as usize * rows as usize];
+        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
+        draw_help(&mut buf, cols, &v, &theme(), content);
+        let rect = crate::help::help_rect(content, v.active_rows().len());
+        // The top-left corner is now the box glyph, not the sentinel (z-order).
+        let corner = buf[rect.y as usize * cols as usize + rect.x as usize];
+        assert_eq!(corner.ch, '┌');
     }
 }

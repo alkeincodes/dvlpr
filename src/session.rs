@@ -466,6 +466,7 @@ impl Session {
             self.sidebar_width,
             &agent_entries,
             self.menu.as_ref(),
+            None, // help view — wired in Task 6
         )
     }
 
