@@ -52,10 +52,10 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
 
     let theme = Theme::default();
     let grid = session.compose();
-    // Sidebar rect: cols (80-26)=54..79, rows 0..22. Dot at column 54+13 = 67,
-    // row 2 (first entry, after AGENTS header + separator).
+    // Sidebar rect: cols (80-26)=54..79, rows 0..22. Icon at column 54+2 = 56,
+    // row 3 (header + divider + blank + first entry row a).
     // grid.cols = 80 (full viewport width).
-    let dot_idx = (2 * grid.cols as usize) + 67;
+    let dot_idx = (3 * grid.cols as usize) + 56;
     assert_eq!(
         grid.cells[dot_idx].style.fg, theme.agent_working_fg,
         "dot should be theme.agent_working_fg (the default flavor's yellow)"
@@ -106,7 +106,7 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
     // 7. Toggle off; content area returns to full width.
     let _ = session.apply_command(Command::ToggleSidebar);
     let grid = session.compose();
-    let cell = grid.cells[(2 * grid.cols as usize) + 67];
+    let cell = grid.cells[(3 * grid.cols as usize) + 56];
     assert_ne!(
         cell.style.fg, theme.agent_idle_fg,
         "sidebar should be gone after toggle off"

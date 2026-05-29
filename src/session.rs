@@ -312,6 +312,7 @@ impl Session {
             &self.theme,
             &refs,
             self.sidebar_visible,
+            self.sidebar_width,
             &agent_entries,
         )
     }
