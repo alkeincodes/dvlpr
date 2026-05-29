@@ -420,6 +420,104 @@ impl Session {
         self.help = help;
     }
 
+    #[cfg(test)]
+    pub fn help_open_for_test(&self) -> bool {
+        self.help.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn help_tab_for_test(&self) -> Option<crate::help::HelpTab> {
+        self.help.as_ref().map(|h| h.tab)
+    }
+
+    #[cfg(test)]
+    pub fn help_scroll_for_test(&self) -> Option<u16> {
+        self.help.as_ref().map(|h| h.scroll)
+    }
+
+    /// Post-parser keyboard intercept for the help overlay. Returns `None`
+    /// (passthrough) when help is closed, for mouse and `FocusIn` events, and for the
+    /// `ShowHelp` command (so `apply_command` can toggle help closed). All other
+    /// commands and keystrokes are swallowed (`Some(CommandEffect::default())`)
+    /// while help is open; recognised keys drive it.
+    pub fn try_consume_help_event(
+        &mut self,
+        ev: &crate::input::InputEvent,
+    ) -> Option<crate::session::CommandEffect> {
+        use crate::input::InputEvent;
+        self.help.as_ref()?;
+        match ev {
+            InputEvent::Mouse(_) | InputEvent::FocusIn => None,
+            InputEvent::Command(crate::config::Command::ShowHelp) => None,
+            InputEvent::Command(_) => Some(CommandEffect::default()),
+            InputEvent::Pane(bytes) => {
+                match bytes.as_slice() {
+                    b"q" | b"\x1b" | b"?" => self.help = None,
+                    b"\x1b[C" | b"\t" => self.help_switch_tab(crate::help::HelpTab::next),
+                    b"\x1b[D" => self.help_switch_tab(crate::help::HelpTab::prev),
+                    b"\x1b[A" => self.help_scroll(-1),
+                    b"\x1b[B" => self.help_scroll(1),
+                    _ => {}
+                }
+                Some(CommandEffect::default())
+            }
+        }
+    }
+
+    fn help_switch_tab(&mut self, f: fn(crate::help::HelpTab) -> crate::help::HelpTab) {
+        if let Some(state) = self.help {
+            self.help = Some(crate::help::HelpState {
+                tab: f(state.tab),
+                scroll: 0,
+            });
+        }
+    }
+
+    fn help_scroll(&mut self, delta: i16) {
+        let Some(state) = self.help else { return };
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
+        let view = self.build_help_view(&state);
+        let rect = crate::help::help_rect(content, view.active_rows().len());
+        let max = crate::help::max_scroll(view.active_rows().len(), rect);
+        let new = if delta < 0 {
+            state.scroll.saturating_sub((-delta) as u16)
+        } else {
+            state.scroll.saturating_add(delta as u16).min(max)
+        };
+        self.help = Some(crate::help::HelpState { scroll: new, ..state });
+    }
+
+    /// Mouse dispatch when the help overlay is open. Press-only; right-button
+    /// and motion are no-ops.
+    fn handle_help_mouse(&mut self, ev: crate::input::MouseEvent) -> CommandEffect {
+        use crate::help::{help_hit, HelpHit, HelpState, HelpTab};
+        use crate::input::MouseKind;
+        let Some(state) = self.help else {
+            return CommandEffect::default();
+        };
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
+        let view = self.build_help_view(&state);
+        if let MouseKind::Press = ev.kind {
+            if ev.button == 0 {
+                match help_hit(&view, content, ev.col, ev.row) {
+                    HelpHit::Tab(i) => {
+                        self.help = Some(HelpState {
+                            tab: HelpTab::from_index(i),
+                            scroll: 0,
+                        });
+                    }
+                    HelpHit::Outside => self.help = None,
+                    HelpHit::Body => {}
+                }
+            }
+        }
+        CommandEffect::default()
+    }
+
     /// Resize every pane's PTY + screen to the rect the current geometry assigns
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
@@ -609,7 +707,13 @@ impl Session {
                 self.menu = None;
             }
             Command::ShowHelp => {
-                // Wired in Task 7 (needs the `help` field added in Task 6).
+                self.help = match self.help {
+                    Some(_) => None,
+                    None => {
+                        self.menu = None; // mutual exclusion (defensive)
+                        Some(crate::help::HelpState::default())
+                    }
+                };
             }
         }
         self.reconcile_menu();
@@ -816,6 +920,9 @@ impl Session {
     ) -> CommandEffect {
         use crate::menu::{MenuKind, MenuState};
 
+        if self.help.is_some() {
+            return self.handle_help_mouse(ev);
+        }
         if self.menu.is_some() {
             return self.handle_menu_mouse(ev);
         }
@@ -3050,5 +3157,226 @@ mod tests {
         let frame = session.render();
         let needle = "C-b".as_bytes();
         assert!(frame.windows(needle.len()).any(|w| w == needle), "help keybindings must render the C-b prefix");
+    }
+
+    use crate::help::{HelpState, HelpTab};
+
+    #[tokio::test]
+    async fn try_consume_help_event_returns_none_when_help_closed() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        assert!(session.try_consume_help_event(&pane_event(b"q")).is_none());
+        assert!(session.try_consume_help_event(&InputEvent::FocusIn).is_none());
+    }
+
+    #[tokio::test]
+    async fn show_help_command_opens_when_closed() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        let _ = session.apply_command(Command::ShowHelp);
+        assert!(session.help_open_for_test());
+        // Defensive: menu stays cleared.
+        assert!(!session.menu_open());
+    }
+
+    #[tokio::test]
+    async fn prefix_question_while_menu_open_is_noop() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        session.set_menu_for_test(Some(crate::menu::MenuState {
+            kind: crate::menu::MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        // While the menu is open, the menu swallows ALL commands, including ShowHelp.
+        let consumed = session.try_consume_menu_event(&InputEvent::Command(Command::ShowHelp));
+        assert!(consumed.is_some(), "menu must swallow the command");
+        assert!(!session.help_open_for_test(), "help must not open");
+        assert!(session.menu_open(), "menu must stay open");
+    }
+
+    #[tokio::test]
+    async fn show_help_command_toggles_closed_when_open() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        // ShowHelp passes through try_consume_help_event so apply_command toggles.
+        assert!(session
+            .try_consume_help_event(&InputEvent::Command(Command::ShowHelp))
+            .is_none());
+        let _ = session.apply_command(Command::ShowHelp);
+        assert!(!session.help_open_for_test());
+    }
+
+    #[tokio::test]
+    async fn q_escape_or_question_closes_help() {
+        for key in [&b"q"[..], &b"\x1b"[..], &b"?"[..]] {
+            let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+            session.set_help_for_test(Some(HelpState::default()));
+            assert!(session.try_consume_help_event(&pane_event(key)).is_some());
+            assert!(!session.help_open_for_test(), "key {:?} must close help", key);
+        }
+    }
+
+    #[tokio::test]
+    async fn right_left_tab_switch_active_tab_and_reset_scroll() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState { tab: HelpTab::Keybindings, scroll: 3 }));
+        assert!(session.try_consume_help_event(&pane_event(b"\x1b[C")).is_some());
+        assert_eq!(session.help_tab_for_test(), Some(HelpTab::Commands));
+        assert_eq!(session.help_scroll_for_test(), Some(0));
+        // Tab key also switches.
+        assert!(session.try_consume_help_event(&pane_event(b"\t")).is_some());
+        assert_eq!(session.help_tab_for_test(), Some(HelpTab::Keybindings));
+    }
+
+    #[tokio::test]
+    async fn up_down_scroll_clamps_at_bounds() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.resize(80, 24); // 80x24 fits all keybinding rows, so max_scroll == 0 → Down is a no-op.
+        session.set_help_for_test(Some(HelpState::default()));
+        assert!(session.try_consume_help_event(&pane_event(b"\x1b[B")).is_some());
+        assert_eq!(session.help_scroll_for_test(), Some(0));
+        // Up from 0 stays at 0.
+        assert!(session.try_consume_help_event(&pane_event(b"\x1b[A")).is_some());
+        assert_eq!(session.help_scroll_for_test(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn arbitrary_key_with_help_open_is_swallowed() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        assert!(session.try_consume_help_event(&pane_event(b"z")).is_some());
+        assert!(session.help_open_for_test());
+    }
+
+    #[tokio::test]
+    async fn command_other_than_show_help_is_swallowed_while_help_open() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        assert!(session
+            .try_consume_help_event(&InputEvent::Command(Command::ClosePane))
+            .is_some());
+        assert_eq!(session.window_pane_ids(0).len(), 1, "pane must not close");
+    }
+
+    #[tokio::test]
+    async fn focus_in_passes_through_while_help_open() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        assert!(session.try_consume_help_event(&InputEvent::FocusIn).is_none());
+    }
+
+    #[tokio::test]
+    async fn mouse_event_passes_through_try_consume_help_event() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        let mouse = InputEvent::Mouse(MouseEvent {
+            button: 0,
+            col: 1,
+            row: 1,
+            kind: MouseKind::Press,
+        });
+        assert!(session.try_consume_help_event(&mouse).is_none());
+    }
+
+    #[tokio::test]
+    async fn left_click_on_tab_switches_tab() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        // Compute the Commands tab's chip center.
+        let content = session.content_area_for_test();
+        let view = crate::help::build_view(
+            &HelpState::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            &crate::config::KeyMap::default(),
+        );
+        let rect = crate::help::help_rect(content, view.active_rows().len());
+        let regs = crate::help::tab_regions(rect);
+        let mid = (regs[1].x_start + regs[1].x_end) / 2;
+        let row_1based = (rect.y + 1) + 1;
+        let mut drag = None;
+        let _ = session.handle_mouse(left_press(mid + 1, row_1based), &mut drag);
+        assert_eq!(session.help_tab_for_test(), Some(HelpTab::Commands));
+    }
+
+    #[tokio::test]
+    async fn left_click_outside_closes_help() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        let mut drag = None;
+        // (1,1) is outside the centered overlay on an 80x24 viewport.
+        let _ = session.handle_mouse(left_press(1, 1), &mut drag);
+        assert!(!session.help_open_for_test());
+    }
+
+    #[tokio::test]
+    async fn bare_question_mark_with_help_closed_is_not_intercepted() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        // Help closed → '?' is not consumed; it would flow to the focused pane.
+        assert!(session.try_consume_help_event(&pane_event(b"?")).is_none());
+    }
+
+    #[tokio::test]
+    async fn help_gate_precedes_menu_gate_in_handle_mouse() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        let panes = session.window_pane_ids(0);
+        // Artificially set BOTH (never both in production) to pin that
+        // handle_mouse checks help FIRST.
+        session.set_menu_for_test(Some(crate::menu::MenuState {
+            kind: crate::menu::MenuKind::Pane { pane_id: panes[0] },
+            anchor: (10, 5),
+            highlighted: 0,
+        }));
+        session.set_help_for_test(Some(HelpState::default()));
+        let mut drag = None;
+        // Left-click outside the help overlay → help path closes help; menu untouched.
+        let _ = session.handle_mouse(left_press(1, 1), &mut drag);
+        assert!(!session.help_open_for_test(), "help gate must run first, closing help");
+        assert!(session.menu_open(), "menu must be untouched by the help gate");
+    }
+
+    #[tokio::test]
+    async fn help_survives_resize_and_scroll_reclamps() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState {
+            tab: HelpTab::Keybindings,
+            scroll: 5,
+        }));
+        session.resize(40, 8); // tiny viewport — no auto-close (help has no anchor)
+        assert!(session.help_open_for_test(), "help must survive resize");
+        // A scroll re-clamps the stored offset to the new (smaller) max. On a
+        // 40x8 viewport content is 40x7 → visible body = 2 → max_scroll = 11-2 = 9.
+        // From a stale scroll of 5, one Down clamps to min(6, 9) = 6.
+        let _ = session.try_consume_help_event(&pane_event(b"\x1b[B"));
+        assert_eq!(
+            session.help_scroll_for_test(),
+            Some(6),
+            "scroll must re-clamp against the resized geometry"
+        );
+        // Rendering with the small viewport must not panic.
+        let _ = session.render();
+        assert!(session.help_open_for_test());
+    }
+
+    #[tokio::test]
+    async fn left_click_on_body_or_border_is_noop() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(HelpState::default()));
+        let content = session.content_area_for_test();
+        let view = crate::help::build_view(
+            &HelpState::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            &crate::config::KeyMap::default(),
+        );
+        let rect = crate::help::help_rect(content, view.active_rows().len());
+        // Click a body interior cell (1-based): a row below the tab header/separator.
+        let body_col = rect.x + 3 + 1;
+        let body_row = (rect.y + 3) + 1;
+        let mut drag = None;
+        let _ = session.handle_mouse(left_press(body_col, body_row), &mut drag);
+        assert!(session.help_open_for_test(), "body click must not close help");
+        assert_eq!(
+            session.help_tab_for_test(),
+            Some(HelpTab::Keybindings),
+            "body click must not switch tabs"
+        );
     }
 }
