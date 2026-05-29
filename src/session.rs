@@ -1267,6 +1267,9 @@ impl Session {
                         pane.idle_streak = 2;
                     }
                 }
+                // classify() never returns Done; ignore rather than panic the
+                // long-running daemon. The real Done logic lands in Task 4.
+                detect::AgentState::Done => {}
             }
 
             // Emit a blocked transition on the first edge into Blocked.

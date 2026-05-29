@@ -21,6 +21,10 @@ pub enum AgentState {
     Idle,
     Working,
     Blocked,
+    /// Finished a task while its window was unfocused — set only by the
+    /// session stabilizer, never returned by `classify`. Clears to `Idle`
+    /// when the window is focused.
+    Done,
 }
 
 /// Map a foreground process's friendly name to an Agent, or None if the

@@ -781,6 +781,7 @@ fn icon_for(state: crate::detect::AgentState, theme: &crate::theme::Theme) -> (c
         AgentState::Idle => ('○', theme.agent_idle_fg),
         AgentState::Working => ('●', theme.agent_working_fg),
         AgentState::Blocked => ('!', theme.agent_blocked_fg),
+        AgentState::Done => ('✓', theme.agent_done_fg),
     }
 }
 
@@ -1382,6 +1383,7 @@ mod tests {
             agent_idle_fg: Color::Rgb(7, 7, 7),
             agent_working_fg: Color::Rgb(8, 8, 8),
             agent_blocked_fg: Color::Rgb(9, 9, 9),
+            agent_done_fg: Color::Rgb(10, 10, 10),
             menu_bg: Color::Default,
             menu_border_fg: Color::Default,
             menu_label_fg: Color::Default,
@@ -1892,6 +1894,28 @@ mod tests {
         // Icon is now on row 3, at column rect.x + 2.
         let icon_idx = (3 * cols as usize) + 2;
         assert_ne!(buf_latte[icon_idx].style.fg, buf_mocha[icon_idx].style.fg);
+    }
+
+    #[test]
+    fn draw_sidebar_renders_done_with_check_and_done_color() {
+        let cols: u16 = 26;
+        let rows: u16 = 12;
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let theme = crate::theme::Theme::default();
+        let entries = vec![crate::session::AgentEntry {
+            session_name: "test".into(),
+            window_index: 0,
+            pane_id: 1,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Done,
+            session_label: None,
+            branch: None,
+        }];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        let icon_idx = (3 * cols as usize) + 2;
+        assert_eq!(buf[icon_idx].ch, '✓');
+        assert_eq!(buf[icon_idx].style.fg, theme.agent_done_fg);
     }
 
     #[test]

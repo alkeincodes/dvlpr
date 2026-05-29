@@ -235,6 +235,7 @@ pub struct Theme {
     pub agent_idle_fg: Color,
     pub agent_working_fg: Color,
     pub agent_blocked_fg: Color,
+    pub agent_done_fg: Color,
     pub menu_bg: Color,
     pub menu_border_fg: Color,
     pub menu_label_fg: Color,
@@ -272,6 +273,7 @@ impl Theme {
             agent_idle_fg: p.green,
             agent_working_fg: p.yellow,
             agent_blocked_fg: p.red,
+            agent_done_fg: p.blue,
             menu_bg: p.crust,
             menu_border_fg: p.peach,
             menu_label_fg: p.text,
@@ -544,5 +546,26 @@ mod tests {
         assert_eq!(t.menu_highlight_bg, one_dark.menu_highlight_bg);
         assert_eq!(t.menu_highlight_fg, one_dark.menu_highlight_fg);
         assert_eq!(t.menu_highlight_bold, one_dark.menu_highlight_bold);
+    }
+
+    #[test]
+    fn agent_done_fg_is_blue_for_every_flavor() {
+        for flavor in [
+            Flavor::Latte,
+            Flavor::Frappe,
+            Flavor::Macchiato,
+            Flavor::Mocha,
+            Flavor::OneDark,
+        ] {
+            let t = Theme::from_flavor(flavor);
+            let p = match flavor {
+                Flavor::Latte => &LATTE,
+                Flavor::Frappe => &FRAPPE,
+                Flavor::Macchiato => &MACCHIATO,
+                Flavor::Mocha => &MOCHA,
+                Flavor::OneDark => &ONE_DARK,
+            };
+            assert_eq!(t.agent_done_fg, p.blue, "flavor {flavor:?}");
+        }
     }
 }
