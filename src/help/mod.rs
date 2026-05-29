@@ -156,6 +156,43 @@ pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView
     }
 }
 
+/// Fixed chrome rows: top border + tab header + separator + footer + bottom.
+pub const HELP_CHROME_ROWS: u16 = 5;
+/// Maximum overlay width; clamped down to `content.w` when narrower.
+pub const HELP_MAX_W: u16 = 72;
+/// Smallest legible box width: 2 border cols + interior room for the tab
+/// header chips and a usable two-column body. Below this, draw_help bails.
+pub const HELP_MIN_W: u16 = 24;
+
+/// Centered, strictly-clamped overlay rect. NO `.max(1)` floor — the rect is
+/// always inside `content_area`, even for a degenerate (h == 0 / w == 0) area.
+/// A too-small area yields a rect rejected by `help_renderable`.
+pub fn help_rect(content: Rect, body_rows: usize) -> Rect {
+    let desired_h = HELP_CHROME_ROWS.saturating_add(body_rows as u16);
+    let h = desired_h.min(content.h);
+    let w = content.w.min(HELP_MAX_W);
+    let x = content.x + content.w.saturating_sub(w) / 2;
+    let y = content.y + content.h.saturating_sub(h) / 2;
+    Rect { x, y, w, h }
+}
+
+/// True iff the rect can paint chrome + body safely. Guards every
+/// `rect.y + rect.h - 2` / `- 1` index and the body window.
+pub fn help_renderable(rect: Rect) -> bool {
+    rect.h >= HELP_CHROME_ROWS && rect.w >= HELP_MIN_W
+}
+
+/// Number of body rows visible inside the rect (0 when too short).
+pub fn visible_body_rows(rect: Rect) -> u16 {
+    rect.h.saturating_sub(HELP_CHROME_ROWS)
+}
+
+/// Largest valid scroll offset for `rows_len` rows in `rect`.
+pub fn max_scroll(rows_len: usize, rect: Rect) -> u16 {
+    let visible = visible_body_rows(rect) as usize;
+    rows_len.saturating_sub(visible).min(u16::MAX as usize) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +280,75 @@ mod tests {
         );
         assert_eq!(kb.active_rows().len(), 8 + 3); // 8 KeyMap bindings + 3 implicit (0/s/1-9)
         assert_eq!(cmds.active_rows().len(), COMMAND_ROWS.len());
+    }
+
+    fn area(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn help_rect_centers_within_content_area() {
+        let r = help_rect(area(0, 0, 80, 23), 8);
+        assert_eq!(r.h, HELP_CHROME_ROWS + 8);
+        assert_eq!(r.w, HELP_MAX_W);
+        assert_eq!(r.x, (80 - HELP_MAX_W) / 2);
+        assert_eq!(r.y, (23 - (HELP_CHROME_ROWS + 8)) / 2);
+    }
+
+    #[test]
+    fn help_rect_shrinks_to_body_when_list_is_short() {
+        let r = help_rect(area(0, 0, 80, 40), 3);
+        assert_eq!(r.h, HELP_CHROME_ROWS + 3);
+    }
+
+    #[test]
+    fn help_rect_clamps_height_to_content_and_relies_on_scroll() {
+        // 100 rows can't fit in 12 rows of content; rect.h is capped at content.h.
+        let r = help_rect(area(0, 0, 80, 12), 100);
+        assert_eq!(r.h, 12);
+        assert!(max_scroll(100, r) > 0);
+    }
+
+    #[test]
+    fn help_rect_clamps_width_to_content_when_narrower() {
+        let r = help_rect(area(0, 0, 40, 24), 8);
+        assert_eq!(r.w, 40);
+    }
+
+    #[test]
+    fn help_rect_is_strictly_inside_content_for_degenerate_viewport() {
+        // zero-height content area (e.g. terminal too small after reserving the status row)
+        let content = area(0, 0, 80, 0);
+        let r = help_rect(content, 8);
+        assert_eq!(r.h, 0);
+        assert!(r.x >= content.x && r.y >= content.y);
+        assert!(r.x + r.w <= content.x + content.w);
+    }
+
+    #[test]
+    fn help_renderable_false_for_tiny_rect_true_for_normal() {
+        assert!(!help_renderable(area(0, 0, 80, 4))); // < HELP_CHROME_ROWS rows
+        assert!(!help_renderable(area(0, 0, 10, 24))); // < HELP_MIN_W cols
+        assert!(help_renderable(area(0, 0, 60, 20)));
+    }
+
+    #[test]
+    fn help_renderable_at_chrome_height_has_zero_body() {
+        let r = area(0, 0, 60, HELP_CHROME_ROWS); // exactly chrome height
+        assert!(help_renderable(r));
+        assert_eq!(visible_body_rows(r), 0);
+        let r1 = area(0, 0, 60, HELP_CHROME_ROWS + 1);
+        assert_eq!(visible_body_rows(r1), 1);
+    }
+
+    #[test]
+    fn visible_body_rows_and_max_scroll_are_consistent() {
+        let r = area(0, 0, 60, 20); // body = 15
+        assert_eq!(visible_body_rows(r), 15);
+        assert_eq!(max_scroll(10, r), 0); // fewer rows than body
+        assert_eq!(max_scroll(20, r), 5); // 20 - 15
+        let tiny = area(0, 0, 60, 3); // h < chrome
+        assert_eq!(visible_body_rows(tiny), 0);
+        assert_eq!(max_scroll(10, tiny), 10);
     }
 }
