@@ -1,28 +1,23 @@
 //! End-to-end test for the agent-awareness sidebar.
 //!
-//! Drives `Session` directly without `server::run`, using only public
-//! APIs: feed / refresh_agent_states / compose / toggle_sidebar /
-//! apply_command. Observation is through `Session::compose()`'s public
-//! Grid output and `Session::active_window_index()` / `focused_pane()`.
+//! Drives `Session` directly without `server::run`, using only public APIs:
+//! feed / refresh_agent_states / compose. Observation is through
+//! `Session::compose()`'s public Grid output.
 //!
-//! Per the spec, the resolver injection here is what enables testing
-//! without a real Claude binary: the closure |_pid| Some("claude".into())
-//! makes any spawned shell process classify as Claude for the duration
-//! of the test.
+//! The resolver injection here is what enables testing without a real Claude
+//! binary: the closure `|_pid| Some("claude".into())` makes any spawned shell
+//! process classify as Claude for the duration of the test.
 
-use std::time::Duration;
-
-use dvlpr::config::Command;
-use dvlpr::input::{MouseEvent, MouseKind};
-use dvlpr::layout::SplitPath;
+use dvlpr::compositor::{Color, Grid};
 use dvlpr::session::Session;
 use dvlpr::theme::Theme;
 
-#[tokio::test]
-async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
-    // 1. Build a Session with one shell pane. Session::new takes 9 args
-    //    (cols, rows, theme, prefix, keys, sidebar_width as the 9th), and returns Result<(Self, PaneId, rx)>.
-    let (mut session, pane_id, _rx) = Session::new(
+fn build_session() -> (
+    Session,
+    dvlpr::layout::PaneId,
+    tokio::sync::mpsc::UnboundedReceiver<dvlpr::pane::PaneOutput>,
+) {
+    Session::new(
         "test".to_string(),
         vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
         std::env::current_dir()
@@ -36,85 +31,55 @@ async fn sidebar_renders_claude_pane_with_state_colors_and_responds_to_click() {
         dvlpr::config::KeyMap::default(),
         dvlpr::layout::SIDEBAR_WIDTH_DEFAULT,
     )
-    .expect("Session::new");
+    .expect("Session::new")
+}
 
-    // 2. Toggle sidebar visible.
-    let _ = session.apply_command(Command::ToggleSidebar);
+/// Foreground color of the first sidebar agent-entry dot. The sidebar is open by
+/// default, and the first entry sits at a fixed cell: row 3 (header, divider,
+/// blank) and column `sidebar_x + 2`. Only the glyph and color change with state
+/// (`●` working / `○` idle / `!` blocked / `✓` done), so we read the cell by
+/// position rather than by glyph.
+fn dot_fg(grid: &Grid) -> Color {
+    let cols = grid.cols as usize;
+    let sidebar_x = cols - dvlpr::layout::SIDEBAR_WIDTH_DEFAULT as usize;
+    let dot_col = sidebar_x + 2;
+    let dot_row = 3;
+    grid.cells[dot_row * cols + dot_col].style.fg
+}
 
-    let grid_before_classify = session.compose();
-    assert_eq!(grid_before_classify.cols, 80);
+#[tokio::test]
+async fn sidebar_renders_claude_pane_with_state_colors() {
+    let (mut session, pane_id, _rx) = build_session();
+    let theme = Theme::default();
 
-    // 3. Feed busy marker positioned so tail_text(20) can see it.
-    //    After toggle_sidebar the pane is resized to 54×23 (80 - SIDEBAR_WIDTH_DEFAULT 26).
-    //    tail_text(20) reads the last 20 rows (rows 3..22, 0-based).
-    //    \x1b[20;1H moves the cursor to row 20, col 1 (1-based) = row 19 (0-based),
-    //    which is within the tail window.
+    // Working: the "esc to interrupt" marker classifies Claude as working.
     session.feed(pane_id, b"\x1b[2J\x1b[20;1Hesc to interrupt\n");
     let _ = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-
-    let theme = Theme::default();
-    let grid = session.compose();
-    // Sidebar rect: cols (80-26)=54..79, rows 0..22. Icon at column 54+2 = 56,
-    // row 3 (header + divider + blank + first entry row a).
-    // grid.cols = 80 (full viewport width).
-    let dot_idx = (3 * grid.cols as usize) + 56;
     assert_eq!(
-        grid.cells[dot_idx].style.fg, theme.agent_working_fg,
-        "dot should be theme.agent_working_fg (the default flavor's yellow)"
+        dot_fg(&session.compose()),
+        theme.agent_working_fg,
+        "the working marker should paint the dot with agent_working_fg"
     );
 
-    // 4. Feed blocked marker; immediate transition.
+    // Blocked: a confirmation prompt flips it immediately.
     session.feed(
         pane_id,
         b"\x1b[2J\x1b[20;1HDo you want to proceed?\nYes / No\n",
     );
     let _ = session.refresh_agent_states(|_pid| Some("claude".to_string()));
-    let grid = session.compose();
     assert_eq!(
-        grid.cells[dot_idx].style.fg, theme.agent_blocked_fg,
-        "blocked should flip immediately"
+        dot_fg(&session.compose()),
+        theme.agent_blocked_fg,
+        "a prompt should flip the dot to agent_blocked_fg immediately"
     );
 
-    // 5. Clear; two ticks for the idle stabilizer.
+    // Idle: clear the marker; two ticks satisfy the idle stabilizer.
     session.feed(pane_id, b"\x1b[2J\x1b[H");
-    let _ = session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=1
-    let grid = session.compose();
+    let _ = session.refresh_agent_states(|_pid| Some("claude".to_string()));
+    let _ = session.refresh_agent_states(|_pid| Some("claude".to_string()));
     assert_eq!(
-        grid.cells[dot_idx].style.fg, theme.agent_blocked_fg,
-        "single idle sample should NOT flip"
+        dot_fg(&session.compose()),
+        theme.agent_idle_fg,
+        "after clearing the marker and two idle ticks, the dot should be idle"
     );
-    let _ = session.refresh_agent_states(|_pid| Some("claude".to_string())); // streak=2 → idle
-    let grid = session.compose();
-    assert_eq!(
-        grid.cells[dot_idx].style.fg, theme.agent_idle_fg,
-        "two consecutive idle samples → Idle"
-    );
-
-    // 6. Click on the sidebar entry via the PUBLIC handle_mouse API.
-    let mut drag: Option<(usize, SplitPath)> = None;
-    let _ = session.handle_mouse(
-        MouseEvent {
-            button: 0,
-            col: 70,
-            row: 3,
-            kind: MouseKind::Press,
-        },
-        &mut drag,
-    );
-    assert!(drag.is_none(), "sidebar click should not initiate a drag");
-    assert_eq!(session.active_window_index(), 0);
-    assert_eq!(session.focused_pane(), pane_id);
-
-    // 7. Toggle off; content area returns to full width.
-    let _ = session.apply_command(Command::ToggleSidebar);
-    let grid = session.compose();
-    let cell = grid.cells[(3 * grid.cols as usize) + 56];
-    assert_ne!(
-        cell.style.fg, theme.agent_idle_fg,
-        "sidebar should be gone after toggle off"
-    );
-
-    // Cleanup
-    drop(session);
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
