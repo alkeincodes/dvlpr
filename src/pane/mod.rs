@@ -94,6 +94,7 @@ impl PaneRuntime {
         // Mark this child as living inside a dvlpr session, named for the session.
         // The CLI reads $DVLPR at startup to refuse opening a nested session.
         cmd.env("DVLPR", session_name);
+        cmd.env_remove("DVLPR_SESSION_CWD");
         // The daemon may carry DVLPR_SESSION_CWD (the client's launch dir, used to
         // seed the session cwd). It is an internal handoff, not meant for user
         // shells, so strip it from every child's environment.

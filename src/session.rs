@@ -149,19 +149,6 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
-/// Resolve the directory a pane should actually spawn in: the stored session
-/// cwd if it still exists, else `$HOME`, else `"."`. The session cwd is captured
-/// once at creation and reused for every pane, so a directory that is later
-/// deleted degrades gracefully here instead of failing the spawn. `home` is
-/// passed in so the existence fallback can be unit-tested deterministically.
-fn effective_cwd(stored: &str, home: Option<String>) -> String {
-    if !stored.is_empty() && std::path::Path::new(stored).is_dir() {
-        return stored.to_string();
-    }
-    home.filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ".".to_string())
-}
-
 /// Outcome of `Session::refresh_agent_states`. Tracks whether anything
 /// changed (gates redraws) and which pane(s) just transitioned into
 /// `Blocked` (drives the sound trigger in `server::run`).
@@ -246,8 +233,7 @@ impl Session {
     ) -> io::Result<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
-        let cwd = effective_cwd(&self.cwd, std::env::var("HOME").ok());
-        let (runtime, rx) = PaneRuntime::spawn(&self.command, &cwd, w, h, &self.session_name)?;
+        let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h, &self.session_name)?;
         let screen = GhosttyScreen::new(w, h);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
@@ -1735,16 +1721,6 @@ mod tests {
     use crate::input::{MouseEvent, MouseKind};
     use crate::layout::SplitPath;
     use std::time::Duration;
-
-    #[test]
-    fn effective_cwd_uses_existing_dir_else_home() {
-        let tmp = std::env::temp_dir();
-        let tmp_s = tmp.to_string_lossy().to_string();
-        assert_eq!(effective_cwd(&tmp_s, Some("/home".into())), tmp_s);
-        assert_eq!(effective_cwd("/nonexistent/xyz", Some("/home".into())), "/home");
-        assert_eq!(effective_cwd("", Some("/home".into())), "/home");
-        assert_eq!(effective_cwd("/nonexistent/xyz", None), ".");
-    }
 
     // NOTE: the missing-cwd fallback is intentionally NOT covered by a
     // spawn-based integration test. Exercising it end-to-end requires spawning a

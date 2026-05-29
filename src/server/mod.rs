@@ -56,14 +56,21 @@ pub struct ServerConfig {
     pub session: String,
 }
 
-/// Resolve a session's initial spawn directory from the captured-cwd env var,
-/// falling back to `$HOME`, then `"."`. Empty strings are treated as unset.
-/// Pure so it can be unit-tested without mutating the real process environment.
+/// Resolve a session's initial spawn directory: the client's launch dir
+/// (`DVLPR_SESSION_CWD`) when it is set and still an existing directory, else
+/// `$HOME`, else `"."`. Empty strings are treated as unset. The existence check
+/// happens here — once, at daemon startup, off the async spawn path — so a
+/// stale/deleted launch dir degrades to `$HOME` rather than failing pane spawns
+/// (and without touching the per-pane spawn hot path). `$HOME` is trusted and
+/// returned unchecked, matching the previous behavior.
 fn captured_cwd(dvlpr_cwd: Option<String>, home: Option<String>) -> String {
-    dvlpr_cwd
-        .filter(|s| !s.is_empty())
-        .or_else(|| home.filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| ".".to_string())
+    let home = home.filter(|s| !s.is_empty());
+    if let Some(c) = dvlpr_cwd.filter(|s| !s.is_empty()) {
+        if std::path::Path::new(&c).is_dir() {
+            return c;
+        }
+    }
+    home.unwrap_or_else(|| ".".to_string())
 }
 
 impl ServerConfig {
@@ -900,11 +907,19 @@ mod tests {
     }
 
     #[test]
-    fn captured_cwd_prefers_dvlpr_then_home_then_dot() {
-        assert_eq!(captured_cwd(Some("/a".into()), Some("/home".into())), "/a");
-        // Empty values are treated as unset.
+    fn captured_cwd_uses_existing_launch_dir_else_home_else_dot() {
+        let tmp = std::env::temp_dir().to_string_lossy().to_string();
+        // An existing launch dir wins.
+        assert_eq!(captured_cwd(Some(tmp.clone()), Some("/home".into())), tmp);
+        // A missing launch dir degrades to $HOME (returned unchecked).
+        assert_eq!(
+            captured_cwd(Some("/nonexistent/dvlpr-xyz".into()), Some("/home".into())),
+            "/home"
+        );
+        // Empty / absent launch dir → $HOME.
         assert_eq!(captured_cwd(Some("".into()), Some("/home".into())), "/home");
         assert_eq!(captured_cwd(None, Some("/home".into())), "/home");
+        // No usable home → ".".
         assert_eq!(captured_cwd(None, Some("".into())), ".");
         assert_eq!(captured_cwd(None, None), ".");
     }
