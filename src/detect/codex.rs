@@ -17,13 +17,14 @@ const BLOCKED_MARKERS: &[&str] = &[
     "would you like to make the following edits?",
     "would you like to grant these permissions?",
     "do you want to approve network access to",
-    "needs your approval.",
+    "needs your approval",
 ];
 
-/// Live status-line markers ⇒ Working. `to interrupt)` is primary: it survives
-/// the user rebinding the interrupt key away from Esc (only the suffix is
-/// constant). `esc to interrupt` is a redundant safety net.
-const WORKING_MARKERS: &[&str] = &["to interrupt)", "esc to interrupt"];
+/// Live status-line marker ⇒ Working. Codex renders `Working (Ns • <key> to
+/// interrupt)`. Matching the bare `to interrupt` (no surrounding paren or key
+/// prefix) survives both rebinding the interrupt key away from Esc AND the
+/// closing paren being truncated on a narrow terminal.
+const WORKING_MARKERS: &[&str] = &["to interrupt"];
 
 /// Classify a Codex pane's state from its screen tail.
 ///
@@ -122,5 +123,11 @@ mod tests {
         let tail = "Working (2s • esc to interrupt)\n...\n\
                     Would you like to run the following command?\n› 1. Yes, proceed\n";
         assert_eq!(classify(tail), AgentState::Blocked);
+    }
+
+    #[test]
+    fn working_survives_truncated_status_line() {
+        // Narrow terminal clipped the closing paren AND the key was rebound.
+        assert_eq!(classify("Working (12s • ctrl-x to interrupt"), AgentState::Working);
     }
 }
