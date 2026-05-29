@@ -28,6 +28,7 @@ pub enum Command {
     ToggleZoom,          // C-b 0: fullscreen the focused pane (toggle)
     ToggleSidebar,       // C-b s: show/hide agent-awareness sidebar
     Detach,
+    ShowHelp, // C-b ?: open/close the help overlay (toggle)
 }
 
 /// The four named special keys the keymap supports (v1).
@@ -164,6 +165,7 @@ pub struct KeyMap {
     pub next_window: KeySpec,
     pub prev_window: KeySpec,
     pub detach: KeySpec,
+    pub help: KeySpec,
 }
 
 impl Default for KeyMap {
@@ -176,6 +178,7 @@ impl Default for KeyMap {
             next_window: KeySpec::Char('n'),
             prev_window: KeySpec::Char('p'),
             detach: KeySpec::Char('d'),
+            help: KeySpec::Char('?'),
         }
     }
 }
@@ -249,6 +252,7 @@ struct RawKeys {
     #[serde(rename = "prev-window")]
     prev_window: Option<String>,
     detach: Option<String>,
+    help: Option<String>,
 }
 
 /// Raw `[theme]` table. Only `flavor` exists in v1; missing/unknown falls back
@@ -376,6 +380,7 @@ impl Config {
                 next_window: spec_or_default(&raw.keys.next_window, "next-window", d.next_window),
                 prev_window: spec_or_default(&raw.keys.prev_window, "prev-window", d.prev_window),
                 detach: spec_or_default(&raw.keys.detach, "detach", d.detach),
+                help: spec_or_default(&raw.keys.help, "help", d.help),
             },
             theme,
             sidebar: sidebar_from_raw(&raw.sidebar),
@@ -401,6 +406,8 @@ impl Config {
             Some(Command::PrevWindow)
         } else if k.detach.matches(key) {
             Some(Command::Detach)
+        } else if k.help.matches(key) {
+            Some(Command::ShowHelp)
         } else {
             None
         }
@@ -450,6 +457,7 @@ mod tests {
         assert_eq!(c.keys.next_window, KeySpec::Char('n'));
         assert_eq!(c.keys.prev_window, KeySpec::Char('p'));
         assert_eq!(c.keys.detach, KeySpec::Char('d'));
+        assert_eq!(c.keys.help, KeySpec::Char('?'));
     }
 
     #[test]
@@ -538,6 +546,7 @@ mod tests {
         );
         assert_eq!(c.resolve(&Key::Char(b'x')), Some(Command::ClosePane));
         assert_eq!(c.resolve(&Key::Char(b'c')), Some(Command::NewWindow));
+        assert_eq!(c.resolve(&Key::Char(b'?')), Some(Command::ShowHelp));
         assert_eq!(c.resolve(&Key::Char(b'z')), None);
     }
 
@@ -686,5 +695,18 @@ flavor = "one-dark"
         std::env::set_var("HOME", "/tmp/fake-home");
         let cfg = Config::from_toml_str("[sound]\nblocked = \"~/x.aiff\"\n");
         assert_eq!(cfg.sound.blocked.as_deref(), Some("/tmp/fake-home/x.aiff"));
+    }
+
+    #[test]
+    fn toml_overrides_help_key() {
+        let c = Config::from_toml_str("[keys]\nhelp = \"h\"\n");
+        assert_eq!(c.keys.help, KeySpec::Char('h'));
+        assert_eq!(c.resolve(&Key::Char(b'h')), Some(Command::ShowHelp));
+    }
+
+    #[test]
+    fn malformed_help_key_falls_back_to_question_mark() {
+        let c = Config::from_toml_str("[keys]\nhelp = \"Nonsense\"\n");
+        assert_eq!(c.keys.help, KeySpec::Char('?'));
     }
 }

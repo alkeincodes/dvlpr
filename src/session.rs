@@ -585,6 +585,9 @@ impl Session {
                 eff.detach = true;
                 self.menu = None;
             }
+            Command::ShowHelp => {
+                // Wired in Task 7 (needs the `help` field added in Task 6).
+            }
         }
         self.reconcile_menu();
         eff
