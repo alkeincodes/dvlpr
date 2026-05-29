@@ -114,6 +114,31 @@ pub const COMMAND_ROWS: &[(&str, &str)] = &[
     ("dvlpr server [name]", "Internal daemon entrypoint (spawned for you)"),
 ];
 
+/// The `-h` / `--help` line, appended after `COMMAND_ROWS` in the CLI help.
+/// Kept here (not in `COMMAND_ROWS`) so it shows in the terminal `--help` output
+/// without leaking into the in-app Commands tab, which lists session subcommands.
+const HELP_FLAG_ROW: (&str, &str) = ("dvlpr -h, --help", "Show this help and exit");
+
+/// Render the full `dvlpr --help` text printed to stdout. Reuses `COMMAND_ROWS`
+/// (the same table the in-app Commands tab uses) so the CLI and overlay never
+/// drift, then appends the `-h/--help` line. Columns are aligned to the widest
+/// command. Pure: returns the string, performs no I/O.
+pub fn cli_help() -> String {
+    let rows: Vec<(&str, &str)> = COMMAND_ROWS
+        .iter()
+        .copied()
+        .chain(std::iter::once(HELP_FLAG_ROW))
+        .collect();
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    out.push_str("dvlpr — a lightweight agent-aware terminal multiplexer\n\n");
+    out.push_str("commands:\n");
+    for (cmd, desc) in rows {
+        out.push_str(&format!("  {cmd:<width$}  {desc}\n"));
+    }
+    out
+}
+
 /// Build a render-ready view from the open state plus the live prefix + keymap.
 /// Keybinding chords are rendered from `prefix`/`keys` so a user's rebinds show.
 pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView {
@@ -325,6 +350,18 @@ mod tests {
                 "no command row mentions {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_help_lists_every_command_and_the_help_flag() {
+        let text = cli_help();
+        // Every subcommand from the shared table appears...
+        for (cmd, desc) in COMMAND_ROWS {
+            assert!(text.contains(cmd), "cli help missing command {cmd:?}");
+            assert!(text.contains(desc), "cli help missing description {desc:?}");
+        }
+        // ...plus the help flag itself.
+        assert!(text.contains("-h, --help"), "cli help missing the help flag row");
     }
 
     #[test]

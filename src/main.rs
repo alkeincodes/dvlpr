@@ -29,6 +29,10 @@ async fn main() {
             destination,
             session,
         } => run_ssh(&destination, session.as_deref()),
+        Cmd::Help => {
+            print!("{}", dvlpr::help::cli_help());
+            std::process::exit(0);
+        }
         Cmd::Usage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
@@ -59,6 +63,8 @@ enum Cmd {
         destination: String,
         session: Option<String>,
     },
+    /// `dvlpr -h` / `dvlpr --help` / `dvlpr help` — print command list (exit 0)
+    Help,
     /// A usage error to print on stderr (exit 2)
     Usage(String),
 }
@@ -78,6 +84,13 @@ fn parse_args(args: &[String]) -> Cmd {
     // subcommand here, update that table (and its coverage test) to match.
     const USAGE: &str =
         "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name>";
+    // `-h`/`--help` anywhere, or a bare `help` subcommand, prints the command
+    // list. Checked before routing so `dvlpr ls --help` shows help, not an error.
+    if args.iter().any(|a| a == "-h" || a == "--help")
+        || args.first().map(String::as_str) == Some("help")
+    {
+        return Cmd::Help;
+    }
     match args.first().map(String::as_str) {
         None => Cmd::Run {
             session: "default".into(),
@@ -383,6 +396,16 @@ mod tests {
                 session: "work".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_help_flags_and_subcommand() {
+        assert_eq!(parse_args(&v(&["-h"])), Cmd::Help);
+        assert_eq!(parse_args(&v(&["--help"])), Cmd::Help);
+        assert_eq!(parse_args(&v(&["help"])), Cmd::Help);
+        // A help flag anywhere wins over routing, so it never errors out.
+        assert_eq!(parse_args(&v(&["ls", "--help"])), Cmd::Help);
+        assert_eq!(parse_args(&v(&["attach", "-h"])), Cmd::Help);
     }
 
     #[test]
