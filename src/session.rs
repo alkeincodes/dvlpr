@@ -109,6 +109,12 @@ pub struct Session {
     /// in all layout calculations so the value propagates from config to
     /// every relayout call.
     sidebar_width: u16,
+    /// Live prefix + keymap, captured at construction so the help overlay can
+    /// render real chords without threading `Config` through `compose`.
+    prefix: crate::config::KeySpec,
+    keys: crate::config::KeyMap,
+    /// The open help overlay, if any. Shared across all attached clients.
+    help: Option<crate::help::HelpState>,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -156,6 +162,8 @@ impl Session {
         cols: u16,
         rows: u16,
         theme: crate::theme::Theme,
+        prefix: crate::config::KeySpec,
+        keys: crate::config::KeyMap,
         sidebar_width: u16,
     ) -> io::Result<(Self, PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         // Clamp to at least 1x1 (matches GhosttyScreen/PaneRuntime resize behavior).
@@ -176,6 +184,9 @@ impl Session {
             sidebar_visible: false,
             menu: None,
             sidebar_width,
+            prefix,
+            keys,
+            help: None,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -399,6 +410,16 @@ impl Session {
         self.menu = menu;
     }
 
+    /// Build a render-ready help view from the open state + live prefix/keys.
+    fn build_help_view(&self, state: &crate::help::HelpState) -> crate::help::HelpView {
+        crate::help::build_view(state, self.prefix, &self.keys)
+    }
+
+    #[cfg(test)]
+    pub fn set_help_for_test(&mut self, help: Option<crate::help::HelpState>) {
+        self.help = help;
+    }
+
     /// Resize every pane's PTY + screen to the rect the current geometry assigns
     /// it (across all windows), draining size-report replies. Called after any
     /// structural change and on viewport resize.
@@ -452,6 +473,7 @@ impl Session {
             .collect();
         let win = &self.windows[self.active_window];
         let agent_entries = self.agent_entries();
+        let help_view = self.help.as_ref().map(|h| self.build_help_view(h));
         self.compositor.compose(
             viewport,
             &win.root,
@@ -466,7 +488,7 @@ impl Session {
             self.sidebar_width,
             &agent_entries,
             self.menu.as_ref(),
-            None, // help view — wired in Task 6
+            help_view.as_ref(),
         )
     }
 
@@ -1347,6 +1369,8 @@ mod tests {
             80,
             10,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("Session::new");
@@ -1454,6 +1478,8 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1491,6 +1517,8 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1520,6 +1548,8 @@ mod tests {
             40,
             10,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1556,6 +1586,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1584,6 +1616,8 @@ mod tests {
             40,
             3,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1607,6 +1641,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1631,6 +1667,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1656,6 +1694,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1676,6 +1716,8 @@ mod tests {
             40,
             24,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1710,6 +1752,8 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1749,6 +1793,8 @@ mod tests {
             41,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -1811,6 +1857,8 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1830,6 +1878,8 @@ mod tests {
             30,
             8,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1850,6 +1900,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1885,6 +1937,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1904,6 +1958,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1926,6 +1982,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1950,6 +2008,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1971,6 +2031,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -1991,6 +2053,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .unwrap();
@@ -2028,6 +2092,8 @@ mod tests {
             40,
             12,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
         )
         .expect("session");
@@ -2795,6 +2861,8 @@ mod tests {
             80,
             10,
             crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
             30, // sidebar_width
         )
         .expect("Session::new");
@@ -2959,5 +3027,28 @@ mod tests {
         let out = session.handle_hit(crate::layout::Hit::NewWindowButton);
         assert!(out.is_none());
         assert_eq!(session.window_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn compose_includes_help_overlay_when_open() {
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(crate::help::HelpState::default()));
+        let frame = session.render();
+        // The Keybindings tab label is painted into the frame bytes.
+        let needle = "Keybindings".as_bytes();
+        assert!(
+            frame.windows(needle.len()).any(|w| w == needle),
+            "open help overlay must render the Keybindings tab"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_help_keybindings_reflect_prefix() {
+        // Session built via build_session_with_one_pane uses the default C-b prefix.
+        let (mut session, _pid, _rx) = build_session_with_one_pane().await;
+        session.set_help_for_test(Some(crate::help::HelpState::default()));
+        let frame = session.render();
+        let needle = "C-b".as_bytes();
+        assert!(frame.windows(needle.len()).any(|w| w == needle), "help keybindings must render the C-b prefix");
     }
 }
