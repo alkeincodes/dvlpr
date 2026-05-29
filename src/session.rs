@@ -460,6 +460,13 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub fn tab_status_row_1based_for_test(&self) -> u16 {
+        let regions =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width);
+        regions.tab_status_row + 1
+    }
+
+    #[cfg(test)]
     pub fn dialog_buffer_for_test(&self) -> String {
         self.dialog.as_ref().map(|d| d.buffer.clone()).unwrap_or_default()
     }
@@ -1099,11 +1106,11 @@ impl Session {
             MouseKind::Press => {
                 let hit = self.hit(ev.col, ev.row);
                 if let layout::Hit::NewWindowButton = hit {
-                    // Clear any stale divider-drag before creating the window,
-                    // so a malformed/reordered mouse stream can't leave a drag
-                    // dangling across the new-window switch.
+                    // Clear any stale divider-drag, then open the New Window
+                    // dialog (Enter on empty creates the default window).
                     *drag = None;
-                    return self.apply_command(Command::NewWindow);
+                    self.open_new_window_dialog();
+                    return CommandEffect::default();
                 }
                 let new_drag = self.handle_hit(hit);
                 *drag = new_drag.map(|path| (self.active_window, path));
@@ -3881,6 +3888,28 @@ mod tests {
         // The new window is auto: a refresh CAN rename it.
         s.refresh_window_names(|_| Some("zsh".to_string()));
         assert_eq!(*s.window_names_for_test().last().unwrap(), "zsh");
+    }
+
+    #[tokio::test]
+    async fn plus_button_click_opens_dialog_not_immediate_window() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut s = test_session();
+        let before = s.window_count_for_test();
+        // Compute the [+] button column from the same layout the daemon uses.
+        let bar = s.tab_bar_for_test();
+        let pb = bar.plus.expect("plus button present at test width");
+        let mut drag = None;
+        let _eff = s.handle_mouse(
+            MouseEvent {
+                button: 0,
+                col: pb.x_start + 2,
+                row: s.tab_status_row_1based_for_test(),
+                kind: MouseKind::Press,
+            },
+            &mut drag,
+        );
+        assert!(s.dialog_is_open_for_test(), "[+] opens the New Window dialog");
+        assert_eq!(s.window_count_for_test(), before, "no window created yet");
     }
 
     #[tokio::test]
