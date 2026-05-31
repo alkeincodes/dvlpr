@@ -139,6 +139,26 @@ pub const COMMAND_ROWS: &[(&str, &str)] = &[
 /// without leaking into the in-app Commands tab, which lists session subcommands.
 const HELP_FLAG_ROW: (&str, &str) = ("dvlpr -h, --help", "Show this help and exit");
 
+/// Control commands that drive a running session's daemon over its socket.
+/// Listed separately from `COMMAND_ROWS` so the in-app Commands tab can render
+/// them in their own group; `cli_help()` emits them under a "control commands:"
+/// header. Update this table whenever `src/main.rs` gains a new control verb.
+pub const CONTROL_ROWS: &[(&str, &str)] = &[
+    ("dvlpr window new [--name NAME]", "Create a new window tab"),
+    ("dvlpr window rename <NAME>", "Rename the active window"),
+    ("dvlpr window close", "Close the active window"),
+    ("dvlpr window next", "Switch to the next window"),
+    ("dvlpr window prev", "Switch to the previous window"),
+    ("dvlpr window select <N>", "Jump to window N (1-based)"),
+    (
+        "dvlpr pane split right|down",
+        "Split the focused pane right or down",
+    ),
+    ("dvlpr pane close", "Close the focused pane"),
+    ("dvlpr pane zoom", "Toggle zoom on the focused pane"),
+    ("dvlpr sidebar toggle", "Show/hide the agent sidebar"),
+];
+
 /// Render the full `dvlpr --help` text printed to stdout. Reuses `COMMAND_ROWS`
 /// (the same table the in-app Commands tab uses) so the CLI and overlay never
 /// drift, then appends the `-h/--help` line. Columns are aligned to the widest
@@ -149,13 +169,40 @@ pub fn cli_help() -> String {
         .copied()
         .chain(std::iter::once(HELP_FLAG_ROW))
         .collect();
-    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let width = rows
+        .iter()
+        .map(|(k, _)| k.len())
+        .chain(CONTROL_ROWS.iter().map(|(k, _)| k.len()))
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     out.push_str("dvlpr — a lightweight agent-aware terminal multiplexer\n\n");
     out.push_str("commands:\n");
-    for (cmd, desc) in rows {
+    for (cmd, desc) in &rows {
         out.push_str(&format!("  {cmd:<width$}  {desc}\n"));
     }
+    out.push('\n');
+    out.push_str("control commands (drive a running session's daemon over its socket):\n");
+    for (cmd, desc) in CONTROL_ROWS {
+        out.push_str(&format!("  {cmd:<width$}  {desc}\n"));
+    }
+    let indent = format!("  {:<width$}  ", "", width = width);
+    out.push('\n');
+    out.push_str(&format!(
+        "  Session targeting: @<name> or --session <name> selects the target;\n\
+         {indent}otherwise $DVLPR (the session you're inside) is used,\n\
+         {indent}falling back to 'default'.\n\
+         {indent}Precedence: @name/--session > $DVLPR > default.\n\
+         \n\
+         {indent}Exit codes: 0 = applied; 1 = runtime failure (no running session\n\
+         {indent}or command failed, e.g. window select out of range); 2 = usage error.\n\
+         \n\
+         {indent}Note: 'window', 'pane', and 'sidebar' are reserved first words and\n\
+         {indent}cannot be used as bare session names. Use dvlpr @window or --session.\n\
+         \n\
+         {indent}v1 limitation: --session <NAME> is consumed anywhere in the arg tail,\n\
+         {indent}so a window cannot be literally named '--session'.\n"
+    ));
     out
 }
 
@@ -191,6 +238,7 @@ pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView
     ];
     let commands = COMMAND_ROWS
         .iter()
+        .chain(CONTROL_ROWS.iter())
         .map(|(k, d)| HelpRow {
             keys: (*k).to_string(),
             desc: (*d).to_string(),
@@ -417,7 +465,10 @@ mod tests {
             &cfg.keys,
         );
         assert_eq!(kb.active_rows().len(), 8 + 3); // 8 KeyMap bindings + 3 implicit (0/s/1-9)
-        assert_eq!(cmds.active_rows().len(), COMMAND_ROWS.len());
+        assert_eq!(
+            cmds.active_rows().len(),
+            COMMAND_ROWS.len() + CONTROL_ROWS.len()
+        );
     }
 
     fn area(x: u16, y: u16, w: u16, h: u16) -> Rect {

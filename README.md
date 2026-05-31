@@ -145,6 +145,47 @@ aren't officially tested.
 | `dvlpr --version` / `-V` | Print the version and build target triple |
 | `dvlpr -h` / `--help` / `dvlpr help` | Print the command list |
 
+### Control CLI
+
+The control CLI drives a running session's daemon over its socket — scriptably,
+from inside a pane, a plain shell (even while detached), or any process that can
+run `dvlpr`, as long as the target session's daemon is alive.
+
+| Command | What it does |
+|---------|--------------|
+| `dvlpr window new [--name NAME]` | Create a new window tab |
+| `dvlpr window rename <NAME>` | Rename the active window |
+| `dvlpr window close` | Close the active window |
+| `dvlpr window next` | Switch to the next window |
+| `dvlpr window prev` | Switch to the previous window |
+| `dvlpr window select <N>` | Jump to window N (1-based) |
+| `dvlpr pane split right\|down` | Split the focused pane right or down |
+| `dvlpr pane close` | Close the focused pane |
+| `dvlpr pane zoom` | Toggle zoom on the focused pane |
+| `dvlpr sidebar toggle` | Show/hide the agent sidebar |
+
+**Session targeting** — a leading `@name` or a trailing `--session NAME` selects
+the target session. Without either, dvlpr uses `$DVLPR` (the session you're
+currently inside), falling back to `default`.
+
+Precedence: `@name` / `--session` &gt; `$DVLPR` &gt; `default`
+
+**Exit codes**
+
+| Exit | Meaning |
+|------|---------|
+| `0` | Command applied successfully |
+| `1` | Runtime failure — no running session for the target, or the command failed (e.g. `window select` out of range) |
+| `2` | Usage error — unrecognised command or bad arguments |
+
+**Reserved words** — `window`, `pane`, and `sidebar` are reserved first words.
+`dvlpr window` is now a control command, not a request to create/attach to a
+session named `window`. To target a session that happens to share one of those
+names, use `dvlpr @window` or `dvlpr --session window`.
+
+**v1 limitation** — `--session NAME` is consumed anywhere in the arg tail, so
+you cannot name a window literally `--session`.
+
 ### `dvlpr ssh`
 
 ```sh
