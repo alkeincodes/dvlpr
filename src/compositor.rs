@@ -2044,9 +2044,10 @@ mod tests {
         let rect = layout::Rect { x: 4, y: 0, w: 16, h: rows };
         let theme = crate::theme::Theme::default();
         draw_sidebar(&mut buf, cols, rect, &theme, &[], "");
-        let sep_row0 = buf[(0 * cols as usize) + rect.x as usize].ch;
-        let junction = buf[(1 * cols as usize) + rect.x as usize].ch;
-        let after_junction = buf[(1 * cols as usize) + (rect.x as usize) + 1].ch;
+        let idx = |y: usize, x: usize| y * (cols as usize) + x;
+        let sep_row0 = buf[idx(0, rect.x as usize)].ch;
+        let junction = buf[idx(1, rect.x as usize)].ch;
+        let after_junction = buf[idx(1, rect.x as usize + 1)].ch;
         assert_eq!(sep_row0, '│', "vertical bar above the divider");
         assert_eq!(junction, '├', "tee where the divider meets the bar");
         assert_eq!(after_junction, '─', "divider continues to the right");
