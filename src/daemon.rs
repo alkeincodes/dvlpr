@@ -40,8 +40,16 @@ pub fn spawn_detached_server(name: &str, restore: bool) -> io::Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         cmd.env("DVLPR_SESSION_CWD", cwd);
     }
+    // Make the restore handoff explicit and non-inheritable: only ever set
+    // DVLPR_RESTORE when we are deliberately restoring, and otherwise strip it
+    // from the child's inherited environment. Without the env_remove, a user
+    // whose own environment already had DVLPR_RESTORE=1 would cause a normal
+    // (restore=false) launch to wrongly restore, since Command inherits the
+    // parent env by default.
     if restore {
         cmd.env("DVLPR_RESTORE", "1");
+    } else {
+        cmd.env_remove("DVLPR_RESTORE");
     }
     unsafe {
         cmd.pre_exec(|| {
@@ -54,4 +62,20 @@ pub fn spawn_detached_server(name: &str, restore: bool) -> io::Result<()> {
     }
     cmd.spawn()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Source-guard: the non-restore branch of `spawn_detached_server` must
+    /// strip DVLPR_RESTORE from the child's inherited environment, so an
+    /// inherited DVLPR_RESTORE=1 in the user's own environment can never cause
+    /// a normal launch to restore.
+    #[test]
+    fn daemon_clears_restore_flag_when_not_restoring() {
+        let src = include_str!("daemon.rs");
+        assert!(
+            src.contains("env_remove(\"DVLPR_RESTORE\")"),
+            "spawn_detached_server must env_remove(\"DVLPR_RESTORE\") on the non-restore path"
+        );
+    }
 }

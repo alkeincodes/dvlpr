@@ -410,6 +410,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 if session.take_snapshot_dirty() || volatile_changed {
                     if let Err(e) = crate::persist::write_atomic(&snapshot_file, &session.snapshot()) {
                         tracing::warn!("snapshot write failed: {e}");
+                        session.request_snapshot(); // retry on the next tick
                     }
                 }
             }

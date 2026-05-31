@@ -511,6 +511,14 @@ impl Session {
         std::mem::replace(&mut self.snapshot_dirty, false)
     }
 
+    /// Re-request a snapshot so the next snapshot tick writes again. Used by the
+    /// server to retry after a transient `write_atomic` failure (the dirty bit
+    /// was already consumed by `take_snapshot_dirty`, so without this the write
+    /// would not be retried until the next structural/volatile change).
+    pub fn request_snapshot(&mut self) {
+        self.snapshot_dirty = true;
+    }
+
     fn mark_snapshot_dirty(&mut self) {
         self.snapshot_dirty = true;
     }
