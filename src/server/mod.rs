@@ -30,6 +30,15 @@ use crate::session::Session;
 pub struct FrameSnapshot {
     pub grid: Grid,
     pub menu_open: bool,
+    /// The client that owns copy mode (gets mouse capture), if any. None when
+    /// copy mode is inactive. Computed in the central loop each frame.
+    pub copy_mode_client: Option<ClientId>,
+}
+
+/// Per-client desired mouse-capture state: capture when a menu is open (global)
+/// OR this client is the foreground copy-mode client.
+fn desired_mouse_capture(menu_open: bool, is_copy_fg: bool) -> bool {
+    menu_open || is_copy_fg
 }
 
 /// Compute the `?1003h` / `?1003l` prefix bytes for a single per-writer
@@ -109,9 +118,6 @@ type ClientId = u64;
 /// whenever the client's terminal size changes (so the writer re-fits its view and
 /// repaints); `Detach`/`Closed` are terminal (the writer exits after writing them).
 /// The unbounded channel keeps `send` synchronous for the sync resize/teardown paths.
-// `Emit` is sent in Tasks 11/12 (copy-mode OSC 52 + mouse-capture); the variant
-// lives here ahead of those tasks so the writer arm is already in place.
-#[allow(dead_code)]
 enum Control {
     Detach,
     Closed(String),
@@ -284,7 +290,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         session.resize(cols, rows);
                         // Make the very first frame show real process names.
                         session.refresh_window_names(crate::procinfo::process_name);
-                        let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
+                        let snapshot = Arc::new(FrameSnapshot {
+                            grid: session.compose(),
+                            menu_open: session.menu_open(),
+                            copy_mode_client: session.copy_mode_active().then_some(foreground).flatten(),
+                        });
                         for st in clients.values() {
                             let _ = st.grid_tx.send(snapshot.clone());
                         }
@@ -313,12 +323,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             Some(st) => {
                                 let now = Instant::now();
                                 let mut evs = Vec::new();
+                                let copy_mode = session.copy_mode_active();
                                 // Commit a standalone Escape whose deadline already
                                 // passed BEFORE interpreting the new bytes.
                                 if matches!(st.escape_deadline, Some(dl) if dl <= now) {
-                                    evs.extend(st.parser.flush_escape_timeout(false));
+                                    evs.extend(st.parser.flush_escape_timeout(copy_mode));
                                 }
-                                evs.extend(st.parser.feed(&keymap, &bytes, false));
+                                evs.extend(st.parser.feed(&keymap, &bytes, copy_mode));
                                 st.escape_deadline = st
                                     .parser
                                     .pending_escape()
@@ -393,7 +404,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     let events = match clients.get_mut(&id) {
                         Some(st) => {
                             st.escape_deadline = None;
-                            st.parser.flush_escape_timeout(false)
+                            st.parser.flush_escape_timeout(session.copy_mode_active())
                         }
                         None => Vec::new(),
                     };
@@ -410,7 +421,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 // rendering zero windows is pointless and a panic risk (compose indexes
                 // self.windows[self.active_window] unconditionally).
                 if dirty && !clients.is_empty() && !session.is_empty() {
-                    let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
+                    let snapshot = Arc::new(FrameSnapshot {
+                        grid: session.compose(),
+                        menu_open: session.menu_open(),
+                        copy_mode_client: session.copy_mode_active().then_some(foreground).flatten(),
+                    });
                     for st in clients.values() {
                         let _ = st.grid_tx.send(snapshot.clone());
                     }
@@ -815,9 +830,16 @@ fn apply_events(
                 // — that would write focus bytes into the pane PTY, the exact
                 // leak the parser intercept is fixing.
             }
-            InputEvent::CopyKey(_) => {
-                // Real copy-mode routing lands in Task 11. For now this arm
-                // exists only to keep the exhaustive match compiling.
+            InputEvent::CopyKey(k) => {
+                let eff = session.handle_copy_mode_key(k);
+                if let Some(bytes) = eff.emit {
+                    // Foreground-only OSC 52: target the issuing client (== foreground
+                    // because non-empty events already promoted it in commit_input).
+                    if let Some(st) = clients.get(&id) {
+                        let _ = st.control.send(Control::Emit(bytes));
+                    }
+                }
+                *dirty = true; // recompose so the highlight/status updates or clears
             }
         }
         *dirty = true;
@@ -854,7 +876,9 @@ fn spawn_writer(
         let first: Arc<FrameSnapshot> = grid_rx.borrow_and_update().clone();
         let mut last_src: Arc<Grid> = Arc::new(first.grid.clone());
         let mut last_fitted = fit(last_src.as_ref(), view.0, view.1);
-        let first_prefix: &[u8] = if first.menu_open { b"\x1b[?1003h" } else { b"" };
+        let first_is_copy_fg = first.copy_mode_client == Some(id);
+        let first_want = desired_mouse_capture(first.menu_open, first_is_copy_fg);
+        let first_prefix: &[u8] = if first_want { b"\x1b[?1003h" } else { b"" };
         let first_body = serialize_full(&last_fitted);
         let mut first_data = Vec::with_capacity(first_prefix.len() + first_body.len());
         first_data.extend_from_slice(first_prefix);
@@ -872,7 +896,7 @@ fn spawn_writer(
             let _ = ev_tx.send(Event::ClientGone(id));
             return;
         }
-        let mut last_menu_open: bool = first.menu_open;
+        let mut last_want: bool = first_want;
         loop {
             tokio::select! {
                 biased;
@@ -929,8 +953,10 @@ fn spawn_writer(
                     let next_src = Arc::new(next.grid.clone());
                     let resized = next_src.dims() != last_src.dims();
                     let fitted = fit(next_src.as_ref(), view.0, view.1);
-                    let prefix: &[u8] = one_oh_three_edge_prefix(last_menu_open, next.menu_open);
-                    last_menu_open = next.menu_open;
+                    let is_copy_fg = next.copy_mode_client == Some(id);
+                    let want = desired_mouse_capture(next.menu_open, is_copy_fg);
+                    let prefix: &[u8] = one_oh_three_edge_prefix(last_want, want);
+                    last_want = want;
                     let body = if resized {
                         serialize_full(&fitted)
                     } else {
@@ -1158,13 +1184,24 @@ mod tests {
         let s = FrameSnapshot {
             grid: g.clone(),
             menu_open: false,
+            copy_mode_client: None,
         };
         assert!(!s.menu_open);
         let s2 = FrameSnapshot {
             grid: g,
             menu_open: true,
+            copy_mode_client: None,
         };
         assert!(s2.menu_open);
+    }
+
+    #[test]
+    fn desired_capture_is_menu_or_foreground_copy_client() {
+        // menu open → all clients capture; copy mode → only the foreground copy client.
+        assert!(desired_mouse_capture(/*menu*/ true,  /*is_copy_fg*/ false));
+        assert!(desired_mouse_capture(false, true));
+        assert!(!desired_mouse_capture(false, false));
+        assert!(desired_mouse_capture(true, true));
     }
 
     #[test]
