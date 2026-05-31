@@ -351,6 +351,138 @@ fn codex_head_cwd_id(path: &std::path::Path) -> Option<(String, String)> {
     crate::persist::is_canonical_uuid(&id).then_some((cwd, id))
 }
 
+/// File creation time, falling back to mtime where the FS/kernel doesn't record a
+/// birth time (e.g. some Linux filesystems). Used to pair concurrent same-cwd
+/// agents to distinct transcripts by recency-of-creation.
+fn entry_birth(md: &std::fs::Metadata) -> Option<std::time::SystemTime> {
+    md.created().or_else(|_| md.modified()).ok()
+}
+
+/// EVERY candidate transcript for an agent of `kind` running in `cwd`, as
+/// `(path, session uuid, birth time)`. Unlike `agent_transcript` (newest only),
+/// this returns all matches so the caller can disambiguate two agents sharing a
+/// cwd — pairing each pane to its OWN session by birth-time ↔ process-start-time.
+pub fn agent_transcripts(
+    cwd: &str,
+    kind: crate::detect::Agent,
+) -> Vec<(PathBuf, String, std::time::SystemTime)> {
+    home_dir()
+        .map(|h| agent_transcripts_in(&h, cwd, kind))
+        .unwrap_or_default()
+}
+
+/// Home-injected core of `agent_transcripts` (testable without mutating `$HOME`).
+fn agent_transcripts_in(
+    home: &std::path::Path,
+    cwd: &str,
+    kind: crate::detect::Agent,
+) -> Vec<(PathBuf, String, std::time::SystemTime)> {
+    match kind {
+        // Claude: every `<uuid>.jsonl` directly under `~/.claude/projects/<munged-cwd>/`.
+        crate::detect::Agent::Claude => {
+            let dir = home
+                .join(".claude/projects")
+                .join(claude_project_dirname(cwd));
+            let mut out = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let Some(id) =
+                        transcript_id_for(&p.to_string_lossy(), crate::detect::Agent::Claude)
+                    else {
+                        continue;
+                    };
+                    let Some(birth) = e.metadata().ok().as_ref().and_then(entry_birth) else {
+                        continue;
+                    };
+                    out.push((p, id, birth));
+                }
+            }
+            out
+        }
+        // Codex: every date-foldered rollout whose first-line `payload.cwd` matches.
+        crate::detect::Agent::Codex => {
+            let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+            collect_rollouts(&home.join(".codex/sessions"), 0, &mut files);
+            let mut out = Vec::new();
+            for (_, path) in files {
+                if let Some((c, id)) = codex_head_cwd_id(&path) {
+                    if c == cwd {
+                        let birth = std::fs::metadata(&path)
+                            .ok()
+                            .as_ref()
+                            .and_then(entry_birth)
+                            .unwrap_or(std::time::UNIX_EPOCH);
+                        out.push((path, id, birth));
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Wall-clock start time of process `pid`, or `None` on any failure. Used to
+/// order concurrent same-cwd agents so each pairs to the transcript created
+/// during its own lifetime.
+#[cfg(target_os = "macos")]
+pub fn proc_start_time(pid: i32) -> Option<std::time::SystemTime> {
+    use std::mem;
+    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::new(info.pbi_start_tvsec, (info.pbi_start_tvusec as u32) * 1000),
+    )
+}
+
+/// Linux: derive wall-clock start from `/proc/<pid>/stat` field 22 (starttime, in
+/// clock ticks since boot) + boot time from `/proc/stat`'s `btime`.
+#[cfg(target_os = "linux")]
+pub fn proc_start_time(pid: i32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may itself contain spaces/parens; the
+    // fields we want all follow the LAST ')'. After it, field 3 (state) is first,
+    // so starttime (field 22) sits at index 22 - 3 = 19.
+    let after = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let ticks: u64 = fields.get(19)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let hz = hz as u64;
+    let btime = boot_time_secs()?;
+    let secs = btime + ticks / hz;
+    let nanos = ((ticks % hz) * 1_000_000_000 / hz) as u32;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+}
+
+/// Linux boot time (seconds since epoch) from `/proc/stat`'s `btime` line.
+#[cfg(target_os = "linux")]
+fn boot_time_secs() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn proc_start_time(_pid: i32) -> Option<std::time::SystemTime> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +705,59 @@ mod tests {
         let _ = child.wait();
 
         assert_eq!(got, Some(want));
+    }
+
+    #[test]
+    fn agent_transcripts_returns_all_claude_jsonl_for_cwd_with_births() {
+        // Two concurrent sessions in one cwd → BOTH transcripts must surface (the
+        // singular `agent_transcript` only returns one, which collapsed two panes
+        // onto the same id in production).
+        let home = tempfile::tempdir().unwrap();
+        let cwd = "/work/proj";
+        let dir = home.path().join(".claude/projects/-work-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("11111111-1111-1111-1111-111111111111.jsonl");
+        let b = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
+        std::fs::write(&a, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&b, b"x").unwrap();
+        let mut got = agent_transcripts_in(home.path(), cwd, crate::detect::Agent::Claude);
+        got.sort_by(|x, y| x.1.cmp(&y.1));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].1, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(got[1].1, "22222222-2222-2222-2222-222222222222");
+        // birth(b) must be later than birth(a) — the ordering the pairing relies on.
+        let birth = |id: &str| got.iter().find(|t| t.1 == id).unwrap().2;
+        assert!(
+            birth("22222222-2222-2222-2222-222222222222")
+                > birth("11111111-1111-1111-1111-111111111111")
+        );
+        // Unknown cwd → no project dir → empty.
+        assert!(agent_transcripts_in(home.path(), "/nope", crate::detect::Agent::Claude).is_empty());
+    }
+
+    #[test]
+    fn proc_start_time_is_recent_for_a_freshly_spawned_child() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let got = super::proc_start_time(pid);
+        // Clean up BEFORE asserting so a failure doesn't leak the child.
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let _ = child.wait();
+        let started = got.expect("must resolve a start time for a live child");
+        let age = std::time::SystemTime::now()
+            .duration_since(started)
+            .expect("start time must precede now");
+        assert!(
+            age < std::time::Duration::from_secs(120),
+            "a just-spawned child's start time should be recent, got age {age:?}"
+        );
     }
 }

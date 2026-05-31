@@ -188,6 +188,43 @@ fn restore_command(agent: &crate::persist::AgentResume, shell: &str) -> Vec<Stri
     ]
 }
 
+/// Pair agent panes (each with its process start time) to candidate transcripts
+/// (each with a birth time) so that two agents sharing one cwd map to DISTINCT
+/// sessions. Walk panes youngest-start-first; give each the newest still-unclaimed
+/// transcript whose birth precedes the next-younger pane's start. The youngest
+/// pane is unbounded, so a single agent that `/clear`ed still gets its newest
+/// transcript. Transcripts born before the oldest pane started (stale prior runs)
+/// stay unclaimed. Returns `(pane, path, session uuid)` only for matched panes.
+fn assign_transcripts(
+    mut panes: Vec<(PaneId, std::time::SystemTime)>,
+    candidates: Vec<(std::path::PathBuf, String, std::time::SystemTime)>,
+) -> Vec<(PaneId, std::path::PathBuf, String)> {
+    panes.sort_by_key(|(_, t)| *t); // oldest start first
+    // Index candidates newest-birth first so the first eligible match is the newest.
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|&a, &b| candidates[b].2.cmp(&candidates[a].2));
+    let mut claimed = vec![false; candidates.len()];
+    let mut out = Vec::new();
+    for i in (0..panes.len()).rev() {
+        let (id, _start) = panes[i];
+        // Exclusive upper bound = the next-younger pane's start (none for youngest).
+        let upper = panes.get(i + 1).map(|(_, t)| *t);
+        for &ci in &order {
+            if claimed[ci] {
+                continue;
+            }
+            let birth = candidates[ci].2;
+            if upper.map(|u| birth < u).unwrap_or(true) {
+                claimed[ci] = true;
+                let (path, sid, _) = candidates[ci].clone();
+                out.push((id, path, sid));
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Outcome of `Session::refresh_agent_states`. Tracks whether anything
 /// changed (gates redraws) and which pane(s) just transitioned into
 /// `Blocked` (drives the sound trigger in `server::run`).
@@ -1840,16 +1877,23 @@ impl Session {
         changed
     }
 
-    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus the agent's
+    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus each agent's
     /// transcript identity discovered BY CWD (agents open-append-close their
-    /// transcripts, so there is no fd to enumerate — see `procinfo::agent_transcript`).
+    /// transcripts, so there is no fd to enumerate — see `procinfo::agent_transcripts`).
+    /// Two agents in the SAME cwd are disambiguated by pairing each pane to the
+    /// transcript created during its own process's lifetime (`assign_transcripts`),
+    /// so they never collapse onto a single session id.
     /// Returns true if any pane's cwd or agent_resume changed (→ caller marks the
     /// snapshot dirty). Resolvers are injected for testability (prod:
-    /// `procinfo::pid_cwd` and `procinfo::agent_transcript`).
+    /// `procinfo::pid_cwd`, `procinfo::agent_transcripts`, `procinfo::proc_start_time`).
     pub fn refresh_restore_meta(
         &mut self,
         resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
-        resolve_transcript: impl Fn(&str, detect::Agent) -> Option<(std::path::PathBuf, String)>,
+        resolve_transcripts: impl Fn(
+            &str,
+            detect::Agent,
+        ) -> Vec<(std::path::PathBuf, String, std::time::SystemTime)>,
+        resolve_start: impl Fn(i32) -> Option<std::time::SystemTime>,
     ) -> bool {
         let mut changed = false;
         // Collect (id, fg_pid, agent_kind) first to avoid borrow conflicts.
@@ -1858,13 +1902,15 @@ impl Session {
             .iter()
             .map(|(id, p)| (*id, p.runtime.foreground_pid(), p.agent))
             .collect();
-        for (id, fg_pid, kind) in work {
-            let Some(pane) = self.panes.get_mut(&id) else {
+
+        // Pass 1 — cwd for every pane; clear a CONFIRMED-but-now-gone agent's
+        // resume for panes that are no longer agents.
+        for (id, fg_pid, kind) in &work {
+            let Some(pane) = self.panes.get_mut(id) else {
                 continue;
             };
-            // cwd: every pane, but only when a foreground pid exists to resolve.
             if let Some(pid) = fg_pid {
-                if let Some(dir) = resolve_cwd(pid) {
+                if let Some(dir) = resolve_cwd(*pid) {
                     let s = dir.to_string_lossy().to_string();
                     if pane.cwd.as_deref() != Some(s.as_str()) {
                         pane.cwd = Some(s);
@@ -1872,53 +1918,72 @@ impl Session {
                     }
                 }
             }
-            // agent transcript: discovered by the pane's cwd, re-run each tick so we
-            // converge on the LIVE session id right after launch (and after a /clear
-            // spawns a new transcript). A directory read is cheap.
-            match kind {
-                Some(k) => {
-                    // Discover only when we know the pane's cwd. A `None` result means
-                    // the transcript isn't on disk yet (still booting) or this is a
-                    // restored pane in its transient shell phase — keep the seeded /
-                    // previously-captured resume and retry next tick; never wipe it here.
-                    if let Some(cwd) = pane.cwd.clone() {
-                        if let Some((path, sid)) = resolve_transcript(&cwd, k) {
-                            let resume = match k {
-                                detect::Agent::Claude => crate::persist::AgentResume::Claude {
-                                    session_id: sid,
-                                    transcript: path.to_string_lossy().to_string(),
-                                },
-                                detect::Agent::Codex => crate::persist::AgentResume::Codex {
-                                    session_id: sid,
-                                    transcript: path.to_string_lossy().to_string(),
-                                },
-                            };
-                            if pane.agent_resume != resume {
-                                pane.agent_resume = resume;
-                                changed = true;
-                            }
-                            // Mark CONFIRMED so the clear branch below knows a real
-                            // agent was live here (used when it later exits to a shell).
-                            if let Some(pid) = fg_pid {
-                                pane.captured_for_pid = Some(pid);
-                            }
-                        }
+            if kind.is_none() {
+                // No agent classification right now. Only clear when we had a
+                // CONFIRMED live agent (real pid) that is now gone — i.e. the pane
+                // became a plain shell. A restored/seeded pane briefly runs the shell
+                // before `claude`/`codex` paints, so its `kind` is transiently `None`;
+                // that seeded-but-unconfirmed state (captured_for_pid still None) must
+                // keep its resume id.
+                if pane.captured_for_pid.is_some() {
+                    if pane.agent_resume != crate::persist::AgentResume::None {
+                        pane.agent_resume = crate::persist::AgentResume::None;
+                        changed = true;
                     }
+                    pane.captured_for_pid = None;
                 }
-                None => {
-                    // No agent classification right now. Only clear when we had a
-                    // CONFIRMED live agent (real pid) that is now gone — i.e. the
-                    // pane became a plain shell. A restored/seeded pane briefly
-                    // runs the shell before `claude`/`codex` paints, so its `kind`
-                    // is transiently `None`; that seeded-but-unconfirmed state must
-                    // keep its resume id (captured_for_pid is still None).
-                    if pane.captured_for_pid.is_some() {
-                        if pane.agent_resume != crate::persist::AgentResume::None {
-                            pane.agent_resume = crate::persist::AgentResume::None;
-                            changed = true;
-                        }
-                        pane.captured_for_pid = None;
-                    }
+            }
+        }
+
+        // Pass 2 — group agent panes by (cwd, kind) and assign each its OWN
+        // transcript. Re-run each tick (cheap dir read); the pairing is deterministic
+        // so it converges on the live id after launch and stays stable thereafter.
+        let mut groups: std::collections::HashMap<(String, detect::Agent), Vec<(PaneId, i32)>> =
+            std::collections::HashMap::new();
+        for (id, fg_pid, kind) in &work {
+            let (Some(k), Some(pid)) = (*kind, *fg_pid) else {
+                continue;
+            };
+            if let Some(cwd) = self.panes.get(id).and_then(|p| p.cwd.clone()) {
+                groups.entry((cwd, k)).or_default().push((*id, pid));
+            }
+        }
+        for ((cwd, kind), members) in groups {
+            // Each member's process start time; drop members whose start can't be
+            // resolved (keep their seed/previous capture, retry next tick).
+            let panes_t: Vec<(PaneId, std::time::SystemTime)> = members
+                .iter()
+                .filter_map(|(id, pid)| resolve_start(*pid).map(|t| (*id, t)))
+                .collect();
+            if panes_t.is_empty() {
+                continue;
+            }
+            let candidates = resolve_transcripts(&cwd, kind);
+            if candidates.is_empty() {
+                continue; // not on disk yet — keep seeds, retry next tick.
+            }
+            for (id, path, sid) in assign_transcripts(panes_t, candidates) {
+                let Some(pane) = self.panes.get_mut(&id) else {
+                    continue;
+                };
+                let resume = match kind {
+                    detect::Agent::Claude => crate::persist::AgentResume::Claude {
+                        session_id: sid,
+                        transcript: path.to_string_lossy().to_string(),
+                    },
+                    detect::Agent::Codex => crate::persist::AgentResume::Codex {
+                        session_id: sid,
+                        transcript: path.to_string_lossy().to_string(),
+                    },
+                };
+                if pane.agent_resume != resume {
+                    pane.agent_resume = resume;
+                    changed = true;
+                }
+                // Mark CONFIRMED so the clear branch knows a real agent was matched
+                // here (used when it later exits to a shell).
+                if let Some((_, pid)) = members.iter().find(|(mid, _)| *mid == id) {
+                    pane.captured_for_pid = Some(*pid);
                 }
             }
         }
@@ -2206,6 +2271,11 @@ impl Session {
     #[cfg(test)]
     pub fn pane_cwd_for_test(&self, id: PaneId) -> Option<String> {
         self.panes.get(&id).and_then(|p| p.cwd.clone())
+    }
+
+    #[cfg(test)]
+    pub fn pane_ids_for_test(&self) -> Vec<PaneId> {
+        self.panes.keys().copied().collect()
     }
 
     #[cfg(test)]
@@ -5009,7 +5079,8 @@ mod tests {
         // Resolver stubs: cwd resolves to /work for any pid; no agent transcript.
         let changed = s.refresh_restore_meta(
             |_pid| Some(std::path::PathBuf::from("/work")),
-            |_pid, _kind| None,
+            |_cwd, _kind| Vec::new(),
+            |_pid| None,
         );
         assert!(changed);
         assert_eq!(s.pane_cwd_for_test(id).as_deref(), Some("/work"));
@@ -5030,11 +5101,13 @@ mod tests {
                 // The resolver is now driven by CWD (not pid).
                 assert_eq!(cwd, "/work/proj");
                 assert_eq!(kind, detect::Agent::Claude);
-                Some((
+                vec![(
                     std::path::PathBuf::from(tpath),
                     "11111111-2222-3333-4444-555555555555".to_string(),
-                ))
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(100),
+                )]
             },
+            |_pid| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(50)),
         );
         assert!(changed);
         assert_eq!(
@@ -5044,6 +5117,137 @@ mod tests {
                 transcript: tpath.into(),
             }
         );
+    }
+
+    // Production bug: two Claude panes in the SAME cwd both captured the newest
+    // transcript → both restored the same conversation. `assign_transcripts` pairs
+    // each pane to the transcript created during its OWN process's lifetime, so the
+    // older-started pane gets the older-born transcript and they stay distinct.
+    #[test]
+    fn assign_transcripts_gives_concurrent_same_cwd_panes_distinct_sessions() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let (p1, p2): (PaneId, PaneId) = (1, 2);
+        let out = assign_transcripts(
+            // Deliberately unsorted: p2 started AFTER p1.
+            vec![
+                (p2, UNIX_EPOCH + Duration::from_secs(200)),
+                (p1, UNIX_EPOCH + Duration::from_secs(100)),
+            ],
+            vec![
+                (
+                    std::path::PathBuf::from("/a.jsonl"),
+                    "aaa".into(),
+                    UNIX_EPOCH + Duration::from_secs(101), // born just after p1 started
+                ),
+                (
+                    std::path::PathBuf::from("/b.jsonl"),
+                    "bbb".into(),
+                    UNIX_EPOCH + Duration::from_secs(201), // born just after p2 started
+                ),
+            ],
+        );
+        let m: std::collections::HashMap<PaneId, String> =
+            out.into_iter().map(|(id, _, sid)| (id, sid)).collect();
+        assert_eq!(m.get(&p1).map(String::as_str), Some("aaa"));
+        assert_eq!(m.get(&p2).map(String::as_str), Some("bbb"));
+    }
+
+    // A single agent that `/clear`ed mid-session spawns a second transcript; it must
+    // resume the NEWEST one (its lifetime interval is open-ended).
+    #[test]
+    fn assign_transcripts_single_pane_gets_newest_after_clear() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let out = assign_transcripts(
+            vec![(7u64, UNIX_EPOCH + Duration::from_secs(100))],
+            vec![
+                (
+                    std::path::PathBuf::from("/old.jsonl"),
+                    "old".into(),
+                    UNIX_EPOCH + Duration::from_secs(101),
+                ),
+                (
+                    std::path::PathBuf::from("/new.jsonl"),
+                    "new".into(),
+                    UNIX_EPOCH + Duration::from_secs(150), // post-/clear
+                ),
+            ],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2, "new");
+    }
+
+    // Transcripts born before any current agent started (a previous day's run in
+    // the same project) must stay unclaimed — never resumed by a fresh pane.
+    #[test]
+    fn assign_transcripts_ignores_transcripts_older_than_every_pane() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let out = assign_transcripts(
+            vec![(1u64, UNIX_EPOCH + Duration::from_secs(1000))],
+            vec![
+                (
+                    std::path::PathBuf::from("/stale.jsonl"),
+                    "stale".into(),
+                    UNIX_EPOCH + Duration::from_secs(10), // long before the pane started
+                ),
+                (
+                    std::path::PathBuf::from("/live.jsonl"),
+                    "live".into(),
+                    UNIX_EPOCH + Duration::from_secs(1001),
+                ),
+            ],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].2, "live");
+    }
+
+    // End-to-end through `refresh_restore_meta`: two agent panes grouped by the
+    // same cwd must come out of a refresh holding DISTINCT session ids.
+    #[tokio::test]
+    async fn refresh_restore_meta_disambiguates_two_same_cwd_agents() {
+        let (mut s, _id, _rx) = snapshot_test_session();
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff); // two panes now
+        let ids = s.pane_ids_for_test();
+        assert_eq!(ids.len(), 2, "test needs exactly two panes");
+        for id in &ids {
+            s.set_pane_agent_kind_for_test(*id, Some(detect::Agent::Claude));
+        }
+        let changed = s.refresh_restore_meta(
+            // Both panes share one cwd → same project dir → must be disambiguated.
+            |_pid| Some(std::path::PathBuf::from("/shared")),
+            |_cwd, _kind| {
+                vec![
+                    (
+                        std::path::PathBuf::from("/a.jsonl"),
+                        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(101),
+                    ),
+                    (
+                        std::path::PathBuf::from("/b.jsonl"),
+                        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(202),
+                    ),
+                ]
+            },
+            // Distinct process start times keyed off the (distinct) real pids.
+            |pid| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(pid as u64)),
+        );
+        assert!(changed);
+        let sid = |id: PaneId| match s.pane_agent_resume_for_test(id) {
+            crate::persist::AgentResume::Claude { session_id, .. } => session_id,
+            other => panic!("expected a Claude resume, got {other:?}"),
+        };
+        let s0 = sid(ids[0]);
+        let s1 = sid(ids[1]);
+        assert_ne!(s0, s1, "two same-cwd agents must capture DISTINCT session ids");
+        let got: std::collections::HashSet<String> = [s0, s1].into_iter().collect();
+        let want: std::collections::HashSet<String> = [
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, want, "each pane must hold one of the two real sessions");
     }
 
     // Fix 1: unzoom_active must persist the unzoom itself (mark snapshot dirty)
@@ -5098,7 +5302,8 @@ mod tests {
 
         let changed = s.refresh_restore_meta(
             |_pid| Some(std::path::PathBuf::from("/work")),
-            |_pid, _kind| None,
+            |_cwd, _kind| Vec::new(),
+            |_pid| None,
         );
 
         assert!(changed, "clearing a stale agent_resume counts as a change");
@@ -5207,7 +5412,8 @@ mod tests {
         // Resolver finds no transcript yet.
         let _ = s.refresh_restore_meta(
             |_pid| Some(std::path::PathBuf::from("/work")),
-            |_pid, _kind| None,
+            |_cwd, _kind| Vec::new(),
+            |_pid| None,
         );
 
         assert_eq!(
@@ -5236,7 +5442,8 @@ mod tests {
 
         let changed = s.refresh_restore_meta(
             |_pid| Some(std::path::PathBuf::from("/work")),
-            |_pid, _kind| None,
+            |_cwd, _kind| Vec::new(),
+            |_pid| None,
         );
 
         assert!(

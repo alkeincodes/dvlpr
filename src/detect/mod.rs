@@ -8,7 +8,7 @@ mod spinner_verbs;
 use spinner_verbs::SPINNER_VERBS;
 
 /// An agent dvlpr can classify the state of.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Agent {
     Claude,
     Codex,

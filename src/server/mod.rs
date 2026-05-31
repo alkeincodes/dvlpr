@@ -417,7 +417,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             _ = snapshot_tick.tick() => {
                 let volatile_changed = session.refresh_restore_meta(
                     crate::procinfo::pid_cwd,
-                    crate::procinfo::agent_transcript,
+                    crate::procinfo::agent_transcripts,
+                    crate::procinfo::proc_start_time,
                 );
                 if session.take_snapshot_dirty() || volatile_changed {
                     if let Err(e) = crate::persist::write_atomic(&snapshot_file, &session.snapshot()) {
