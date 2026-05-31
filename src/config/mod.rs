@@ -27,7 +27,7 @@ pub enum Command {
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
     ToggleZoom,          // C-b 0: fullscreen the focused pane (toggle)
-    ToggleSidebar,       // C-b s: show/hide agent-awareness sidebar
+    ToggleSidebar,       // default C-b s: show/hide agent-awareness sidebar
     Detach,
     ShowHelp, // C-b ?: open/close the help overlay (toggle)
 }
@@ -470,6 +470,7 @@ mod tests {
         assert_eq!(c.keys.prev_window, KeySpec::Char('p'));
         assert_eq!(c.keys.detach, KeySpec::Char('d'));
         assert_eq!(c.keys.help, KeySpec::Char('?'));
+        assert_eq!(c.keys.toggle_sidebar, KeySpec::Char('s'));
     }
 
     #[test]
@@ -732,12 +733,6 @@ flavor = "one-dark"
     }
 
     #[test]
-    fn config_default_toggle_sidebar_is_s() {
-        let cfg = Config::default();
-        assert_eq!(cfg.keys.toggle_sidebar, KeySpec::Char('s'));
-    }
-
-    #[test]
     fn config_parses_explicit_toggle_sidebar() {
         let cfg = Config::from_toml_str("[keys]\ntoggle-sidebar = \"v\"\n");
         assert_eq!(cfg.keys.toggle_sidebar, KeySpec::Char('v'));
@@ -753,5 +748,6 @@ flavor = "one-dark"
     fn resolve_maps_custom_key_to_toggle_sidebar() {
         let cfg = Config::from_toml_str("[keys]\ntoggle-sidebar = \"v\"\n");
         assert_eq!(cfg.resolve(&Key::Char(b'v')), Some(Command::ToggleSidebar));
+        assert_eq!(cfg.resolve(&Key::Char(b's')), None);
     }
 }
