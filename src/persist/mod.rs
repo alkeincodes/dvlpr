@@ -80,8 +80,17 @@ pub fn snapshot_path(session: &str) -> PathBuf {
 }
 
 /// Atomic write: ensure dir (0700), write a sibling temp file created 0600, fsync the
-/// file, rename, then fsync the parent directory so the rename is durable. A power cut
-/// mid-write leaves at most the temp file, never a torn target.
+/// file, then rename it onto the target. The rename is atomic, so a reader (and a
+/// power cut) never observes a torn or half-written target — only the old file or the
+/// fully-written new one. Any failure during the temp write or the rename removes the
+/// temp file before returning, so no stray `.tmp.<pid>` is left behind.
+///
+/// The follow-up parent-directory fsync is BEST-EFFORT: we do not fail the write if the
+/// directory can't be opened/synced (failing here would be strictly worse — the data is
+/// already renamed into place). The cost is that a power loss in the small window after
+/// the rename but before the dir entry reaches stable storage may lose only the most
+/// recent snapshot. That is acceptable: snapshots are rewritten ~once per second, so at
+/// most ~1s of state is at risk, and the target is never left torn.
 pub fn write_atomic(path: &Path, snap: &SessionSnapshot) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -90,8 +99,9 @@ pub fn write_atomic(path: &Path, snap: &SessionSnapshot) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(snap)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    {
-        // Create with 0600 from the start (no chmod-after race window).
+    // Create (0600 from the start, no chmod-after race window), write, fsync. Capture
+    // any error so we can remove the temp file before returning — a `?` here would leak it.
+    let write = (|| -> io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -102,12 +112,17 @@ pub fn write_atomic(path: &Path, snap: &SessionSnapshot) -> io::Result<()> {
         let mut f = opts.open(&tmp)?;
         f.write_all(&json)?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    // fsync the parent directory so the rename survives a power loss.
+    // Best-effort parent-directory fsync (see doc comment): never fail the write on it.
     if let Some(dir) = path.parent() {
         if let Ok(d) = std::fs::File::open(dir) {
             let _ = d.sync_all();
@@ -186,7 +201,7 @@ impl RestorePlan {
         if downgrades == 0 {
             base
         } else {
-            format!("{base} ({downgrades} → shell)")
+            format!("{base} ({downgrades} downgraded)")
         }
     }
 }
@@ -216,7 +231,11 @@ fn resolve_pane(p: &PaneSnapshot) -> PaneRestore {
     let cwd_exists = Path::new(&p.cwd).is_dir();
     // Reason strings are checked in priority order; cwd loss downgrades any pane.
     let (agent, downgraded) = match &p.agent {
-        AgentResume::None => (AgentResume::None, None),
+        AgentResume::None => {
+            // A shell pane whose cwd vanished will silently relocate to $HOME on
+            // restore; flag it so the summary counts it as a downgrade.
+            (AgentResume::None, (!cwd_exists).then_some("cwd missing"))
+        }
         ag @ (AgentResume::Claude { session_id, transcript }
         | AgentResume::Codex { session_id, transcript }) => {
             if !is_canonical_uuid(session_id) {
@@ -389,7 +408,27 @@ mod tests {
         assert_eq!(plan.panes[1].downgraded, Some("transcript missing"));
         assert!(plan.summary().contains("1 window"));
         assert!(plan.summary().contains("2 panes"));
-        assert!(plan.summary().contains("1 → shell"));
+        assert!(plan.summary().contains("downgraded"));
+    }
+
+    #[test]
+    fn write_atomic_cleans_temp_and_preserves_target_on_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // Make the target path a NON-EMPTY directory so rename(file -> dir) fails.
+        let target = dir.path().join("work.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inner"), b"keep").unwrap();
+        let err = write_atomic(&target, &sample());
+        assert!(err.is_err(), "rename onto a non-empty dir must fail");
+        // Target dir still intact.
+        assert!(target.is_dir());
+        assert!(target.join("inner").exists());
+        // No leftover temp files.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp must be cleaned up on rename failure: {leftovers:?}");
     }
 
     #[test]
