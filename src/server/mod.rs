@@ -139,6 +139,11 @@ enum Event {
     },
     /// A management client asked for session status (answered without attaching).
     StatusRequest(oneshot::Sender<StatusInfo>),
+    /// A control client asked to apply a `ControlCommand` (answered without attaching).
+    ControlCommand {
+        cmd: crate::protocol::ControlCommand,
+        reply: oneshot::Sender<crate::protocol::CommandReply>,
+    },
     /// A management client (or `kill`) asked the daemon to shut down.
     Shutdown,
 }
@@ -334,6 +339,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             clients: clients.len() as u32,
                         });
                     }
+                    Event::ControlCommand { cmd, reply } => {
+                        let result = apply_control_command(&mut session, cmd, &ev_tx, &mut dirty);
+                        let _ = reply.send(result);
+                        if session.is_empty() {
+                            break "pane process exited".to_string();
+                        }
+                    }
                     Event::Shutdown => break "killed".to_string(),
                 }
             }
@@ -508,6 +520,92 @@ fn apply_command_effect(
     }
     *dirty = true;
     eff.detach
+}
+
+/// Map a `ControlCommand` onto a session mutation, apply its effect through the
+/// shared helper, and compute the reply. Runs in the main loop with the live
+/// `session`, so it can range-check against current window state.
+fn apply_control_command(
+    session: &mut Session,
+    cmd: crate::protocol::ControlCommand,
+    ev_tx: &mpsc::UnboundedSender<Event>,
+    dirty: &mut bool,
+) -> crate::protocol::CommandReply {
+    use crate::config::Command;
+    use crate::protocol::{CommandReply, ControlCommand as C, SplitDir};
+
+    let ok = || CommandReply {
+        ok: true,
+        message: None,
+    };
+    let err = |m: String| CommandReply {
+        ok: false,
+        message: Some(m),
+    };
+    let mut eff = crate::session::CommandEffect::default();
+
+    let reply = match cmd {
+        C::PaneSplit(SplitDir::Right) => {
+            eff = session.apply_command(Command::SplitVertical);
+            ok()
+        }
+        C::PaneSplit(SplitDir::Down) => {
+            eff = session.apply_command(Command::SplitHorizontal);
+            ok()
+        }
+        C::PaneClose => {
+            eff = session.apply_command(Command::ClosePane);
+            ok()
+        }
+        C::PaneZoom => {
+            eff = session.apply_command(Command::ToggleZoom);
+            ok()
+        }
+        C::SidebarToggle => {
+            eff = session.apply_command(Command::ToggleSidebar);
+            ok()
+        }
+        C::WindowNext => {
+            eff = session.apply_command(Command::NextWindow);
+            ok()
+        }
+        C::WindowPrev => {
+            eff = session.apply_command(Command::PrevWindow);
+            ok()
+        }
+        C::WindowSelect(n) => {
+            let count = session.window_count();
+            if n >= 1 && (n as usize) <= count {
+                eff = session.apply_command(Command::SelectWindow(n as usize));
+                ok()
+            } else {
+                err(format!("window {n} out of range (1..={count})"))
+            }
+        }
+        C::WindowNew { name } => {
+            eff = session.new_named_window(name);
+            ok()
+        }
+        C::WindowRename(name) => {
+            if session.window_count() == 0 {
+                err("no active window to rename".into())
+            } else {
+                session.rename_active_window(name);
+                ok()
+            }
+        }
+        C::WindowClose => {
+            if session.window_count() == 0 {
+                err("no active window to close".into())
+            } else {
+                eff.closed = session.close_active_window();
+                ok()
+            }
+        }
+    };
+
+    apply_command_effect(eff, ev_tx, dirty);
+    reply
 }
 
 /// Route decoded input events for client `id` into the session, performing command
@@ -857,8 +955,21 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                 let _ = ev_tx.send(Event::Shutdown);
             }
             Intent::Command => {
-                // TODO(Task 3): receive ControlCommand, apply, reply CommandReply.
-                // Placeholder: close the connection immediately.
+                if let Ok(Some(ClientMsg::Command(cmd))) =
+                    read_msg::<_, ClientMsg>(&mut read_half).await
+                {
+                    let (tx, rx) = oneshot::channel();
+                    if ev_tx
+                        .send(Event::ControlCommand { cmd, reply: tx })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Ok(result) = rx.await {
+                        let _ = write_msg(&mut write_half, &result).await;
+                    }
+                }
+                // empty/garbage/non-command frame: close without replying
             }
             Intent::Attach { cols, rows } => {
                 if write_msg(
