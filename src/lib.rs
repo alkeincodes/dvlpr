@@ -3,6 +3,7 @@ pub mod client;
 pub mod compositor;
 pub mod config;
 pub mod control;
+pub mod copymode;
 pub mod daemon;
 pub mod detect;
 pub mod dialog;
