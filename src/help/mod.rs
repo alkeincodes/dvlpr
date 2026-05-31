@@ -183,10 +183,10 @@ pub fn build_view(state: &HelpState, prefix: KeySpec, keys: &KeyMap) -> HelpView
         row(&keys.prev_window, "Switch to the previous window"),
         row(&keys.detach, "Detach from the session (leave it running)"),
         row(&keys.help, "Show / hide this help"),
+        row(&keys.toggle_sidebar, "Toggle the agent-awareness sidebar"),
         // Implicit parser-level bindings (src/input/mod.rs::resolve_key). These
         // literals MUST stay in sync with that function.
         lit("0", "Toggle zoom (fullscreen the focused pane)"),
-        lit("s", "Toggle the agent-awareness sidebar"),
         lit("1-9", "Jump to window by number"),
     ];
     let commands = COMMAND_ROWS
@@ -416,7 +416,7 @@ mod tests {
             cfg.prefix,
             &cfg.keys,
         );
-        assert_eq!(kb.active_rows().len(), 8 + 3); // 8 KeyMap bindings + 3 implicit (0/s/1-9)
+        assert_eq!(kb.active_rows().len(), 9 + 2); // 9 KeyMap bindings + 2 implicit (0/1-9)
         assert_eq!(cmds.active_rows().len(), COMMAND_ROWS.len());
     }
 
@@ -542,6 +542,21 @@ mod tests {
         let v = view_with(HelpTab::Keybindings);
         let content = area(0, 0, 10, 3); // too small to render
         assert_eq!(help_hit(&v, content, 1, 1), HelpHit::Body);
+    }
+
+    #[test]
+    fn build_view_renders_custom_toggle_sidebar_chord() {
+        let keys = KeyMap {
+            toggle_sidebar: KeySpec::Char('v'),
+            ..KeyMap::default()
+        };
+        let v = build_view(&HelpState::default(), KeySpec::Ctrl('b'), &keys);
+        let toggle = v
+            .keybindings
+            .iter()
+            .find(|r| r.desc.contains("agent-awareness sidebar"))
+            .expect("toggle-sidebar row present");
+        assert_eq!(toggle.keys, "C-b v");
     }
 
     #[test]
