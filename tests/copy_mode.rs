@@ -304,7 +304,23 @@ async fn mouse_drag_highlights_selection() {
         "copy mode must be entered"
     );
 
-    // Drain frames that accumulated while waiting for [copy].
+    // Drain ALL frames that arrive after copy-mode entry (including the initial
+    // full frame which contains the status-bar inverse row at the pane's bottom).
+    // After this drain, the client has received and consumed the status-bar
+    // inverse.  Any `;7m` appearing in frames produced by the subsequent mouse
+    // drag must come from a SELECTION HIGHLIGHT, not the status bar, because:
+    //
+    //   1. The status bar row is always inverse in copy mode.  Since it does not
+    //      change during a horizontal drag on a content row (scroll_offset stays
+    //      the same, status text stays the same), the diff renderer emits that
+    //      row only in the initial compose — it will NOT appear again in any
+    //      drag-triggered diff frame.
+    //   2. The selection on a content row (row 2 in 1-based wire coords = row 1
+    //      in 0-based pane coords, well above the bottom status row) IS new after
+    //      the drag, so its row appears in the diff with an inverse SGR run.
+    //
+    // This is why the post-drain `;7m` check genuinely proves the selection
+    // highlight was drawn, not merely that a copy-mode frame was produced.
     let _ = collect_bytes(&mut r, 1).await;
 
     // SGR mouse PRESS at (col 3, row 2): ESC [ < 0 ; 3 ; 2 M
@@ -318,19 +334,19 @@ async fn mouse_drag_highlights_selection() {
     )
     .await;
 
-    // The compositor always emits `ESC[0;...m` (reset-first), so an inverse
-    // cell emits `ESC[0;7m`.  We search for the subsequence `;7m` (bytes
-    // 0x3b 0x37 0x6d) which is present in any `ESC[0;7m` or `ESC[...;7m`.
+    // Collect frames produced by the drag.  Any `;7m` here is a SELECTION
+    // inverse on a content row — it CANNOT be the status bar because:
+    //   - the status bar row was already consumed in the drain above, and
+    //   - the drag does not change the status text (scroll_offset is unchanged),
+    //     so diff_rows will not re-emit that row.
     let inverse_marker: &[u8] = b";7m";
     let (found, accumulated) = collect_bytes_until(&mut r, 5, inverse_marker).await;
 
-    // Additional sanity: copy mode should still be active.
-    let _copy_present = String::from_utf8_lossy(&accumulated).contains("[copy]");
-
     assert!(
         found,
-        "expected SGR inverse marker (;7m inside ESC[0;7m) in frames after mouse drag, \
-         indicating a selection highlight was drawn; \
+        "expected SGR inverse marker (;7m) in diff frames produced by the mouse drag, \
+         proving a selection highlight was drawn on a CONTENT ROW (not just the \
+         always-on status-bar inverse, which was already drained before the drag); \
          accumulated {} bytes (first 400): {:?}",
         accumulated.len(),
         &accumulated[..accumulated.len().min(400)]
