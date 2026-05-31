@@ -410,6 +410,8 @@ mod tests {
         assert_eq!(out, vec![InputEvent::Command(Command::ToggleZoom)]);
     }
 
+    // Pins the end-to-end default path: the default keymap binds toggle_sidebar to
+    // 's', so prefix + 's' routes through config.resolve (not a hardwired branch).
     #[test]
     fn prefix_then_s_toggles_sidebar() {
         assert_eq!(
