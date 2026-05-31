@@ -491,6 +491,25 @@ fn commit_input(
     apply_events(session, clients, foreground, ev_tx, id, events, dirty);
 }
 
+/// Apply the parts of a `CommandEffect` that are identical for every caller:
+/// spawn output forwarders for new panes, tear down closed panes, and mark the
+/// session dirty so the next tick recomposes + broadcasts. Returns whether a
+/// detach was requested; the caller handles detach (it is client-specific).
+fn apply_command_effect(
+    eff: crate::session::CommandEffect,
+    ev_tx: &mpsc::UnboundedSender<Event>,
+    dirty: &mut bool,
+) -> bool {
+    for (pane_id, rx) in eff.spawned {
+        spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+    }
+    for runtime in eff.closed {
+        runtime.close();
+    }
+    *dirty = true;
+    eff.detach
+}
+
 /// Route decoded input events for client `id` into the session, performing command
 /// side effects (attach forwarders for new panes, async-close removed runtimes,
 /// detach the issuing client).
@@ -610,13 +629,8 @@ fn apply_events(
             }
             InputEvent::Command(cmd) => {
                 let eff = session.apply_command(cmd);
-                for (pane_id, rx) in eff.spawned {
-                    spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
-                }
-                for runtime in eff.closed {
-                    runtime.close();
-                }
-                if eff.detach {
+                let detach = apply_command_effect(eff, ev_tx, dirty);
+                if detach {
                     // NB: if this detaches the issuing client, later events in this same
                     // vector that look up the client (e.g. Mouse) become no-ops — acceptable.
                     // Funnel through remove_client so the foreground is re-promoted if
