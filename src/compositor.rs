@@ -2194,9 +2194,7 @@ mod tests {
         let entries: Vec<crate::session::AgentEntry> = vec![];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
         let last = rows - 1;
-        let footer: String = (0..cols)
-            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
-            .collect();
+        let footer = row_text(&buf, cols as usize, last as usize);
         assert!(footer.contains("C-b s: hide"), "footer row: {footer:?}");
         let idx = (last as usize) * (cols as usize) + 1; // first hint col (rect.x + 1)
         assert!(buf[idx].style.faint, "footer must be faint");
@@ -2212,9 +2210,7 @@ mod tests {
         let entries: Vec<crate::session::AgentEntry> = vec![];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
         let last = rows - 1;
-        let footer: String = (0..cols)
-            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
-            .collect();
+        let footer = row_text(&buf, cols as usize, last as usize);
         assert!(!footer.contains("hide"), "no footer when too short: {footer:?}");
     }
 
@@ -2228,9 +2224,7 @@ mod tests {
         let entries: Vec<crate::session::AgentEntry> = vec![];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries, "");
         let last = rows - 1;
-        let footer: String = (0..cols)
-            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
-            .collect();
+        let footer = row_text(&buf, cols as usize, last as usize);
         // The vertical separator '│' on rect.x is always present; only the hint
         // text must be absent on an empty hint.
         assert_eq!(
@@ -2260,13 +2254,10 @@ mod tests {
         };
         let entries = vec![mk("one", "b1"), mk("two", "b2"), mk("three", "b3")];
         draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
-        let row_text = |y: u16| -> String {
-            (0..cols)
-                .map(|x| buf[(y as usize) * (cols as usize) + x as usize].ch)
-                .collect()
-        };
-        assert!(row_text(9).contains("three"), "row9: {:?}", row_text(9));
-        assert!(row_text(11).contains("C-b s: hide"), "row11: {:?}", row_text(11));
+        let row9 = row_text(&buf, cols as usize, 9);
+        let row11 = row_text(&buf, cols as usize, 11);
+        assert!(row9.contains("three"), "row9: {row9:?}");
+        assert!(row11.contains("C-b s: hide"), "row11: {row11:?}");
     }
 
     #[test]
@@ -2280,13 +2271,9 @@ mod tests {
         let long = "C-b s: hide ".repeat(8); // far wider than 20 cols
         draw_sidebar(&mut buf, cols, rect, &theme, &entries, &long);
         let last = (rows - 1) as usize;
-        let footer: String = (0..cols)
-            .map(|x| buf[last * (cols as usize) + x as usize].ch)
-            .collect();
+        let footer = row_text(&buf, cols as usize, last);
         assert!(footer.contains("C-b s"), "clipped footer still starts the hint");
-        let above: String = (0..cols)
-            .map(|x| buf[(last - 1) * (cols as usize) + x as usize].ch)
-            .collect();
+        let above = row_text(&buf, cols as usize, last - 1);
         assert!(!above.contains("hide"), "hint did not bleed onto the row above");
     }
 
