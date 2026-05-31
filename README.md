@@ -476,6 +476,19 @@ clipboard depends on your host terminal's settings:
 - **tmux / dvlpr nesting** — the outer multiplexer must pass through OSC 52;
   dvlpr does not add a local-clipboard fallback in v1.
 
+### Multi-client and known limitations
+
+- **Ownership** — copy mode is owned by the client that entered it. If several
+  clients are attached to the same session, another client typing while you are
+  in copy mode does not drive or hijack your session, and only you receive the
+  yanked clipboard text.
+- **Scrollback eviction during copy mode (v1)** — copy mode freezes the *view*,
+  but the pane keeps producing output. If that output overflows the scrollback
+  limit while you hold a selection, the oldest rows are evicted and a selection
+  anchored in the evicted region is clamped (best-effort) rather than tracked
+  exactly — a yank in that rare case may capture slightly shifted text. Increase
+  `scrollback` or yank before heavy output to avoid it.
+
 ---
 
 ## Architecture
