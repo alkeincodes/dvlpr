@@ -205,12 +205,133 @@ pub fn pid_cwd(_pid: i32) -> Option<std::path::PathBuf> {
     None
 }
 
+use std::path::PathBuf;
+
+/// If `path` is an agent transcript of `kind`, return its session uuid.
+/// Claude: `**/.claude/projects/**/<uuid>.jsonl` (filename stem is the uuid).
+/// Codex:  `**/.codex/sessions/**/rollout-*-<uuid>.jsonl` (trailing uuid).
+pub fn transcript_id_for(path: &str, kind: crate::detect::Agent) -> Option<String> {
+    if !path.ends_with(".jsonl") {
+        return None;
+    }
+    let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+    match kind {
+        crate::detect::Agent::Claude => {
+            if !path.contains("/.claude/projects/") {
+                return None;
+            }
+            crate::persist::is_canonical_uuid(stem).then(|| stem.to_string())
+        }
+        crate::detect::Agent::Codex => {
+            if !path.contains("/.codex/sessions/") || !stem.starts_with("rollout-") {
+                return None;
+            }
+            // The uuid is the trailing 5 hyphen-groups of the stem.
+            let tail: Vec<&str> = stem.rsplit('-').take(5).collect();
+            if tail.len() < 5 {
+                return None;
+            }
+            let uuid: String = tail.into_iter().rev().collect::<Vec<_>>().join("-");
+            crate::persist::is_canonical_uuid(&uuid).then_some(uuid)
+        }
+    }
+}
+
+/// Read a `/proc/<pid>/fd`-style directory, returning resolved symlink targets.
+#[cfg(any(target_os = "linux", test))]
+pub fn scan_fd_dir(fd_dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fd_dir) {
+        for e in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(e.path()) {
+                out.push(target.to_string_lossy().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Discover the agent's open transcript: returns (full path, uuid). `None` if the
+/// process holds no matching transcript or discovery is unavailable.
+pub fn agent_transcript(pid: i32, kind: crate::detect::Agent) -> Option<(PathBuf, String)> {
+    let paths = open_files(pid);
+    paths.into_iter().find_map(|p| {
+        transcript_id_for(&p, kind).map(|id| (PathBuf::from(p), id))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_files(pid: i32) -> Vec<String> {
+    scan_fd_dir(std::path::Path::new(&format!("/proc/{pid}/fd")))
+}
+
+// NOTE: the macOS libproc `open_files` and the non-unix fallback are added in
+// Task 2.2. Until then a temporary stub keeps non-Linux hosts compiling.
+#[cfg(not(target_os = "linux"))]
+fn open_files(_pid: i32) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{friendly_name, parse_procargs2};
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn transcript_id_extracts_claude_uuid_from_path() {
+        let p = "/home/u/.claude/projects/-home-u-proj/abcdef01-2345-6789-abcd-ef0123456789.jsonl";
+        assert_eq!(
+            transcript_id_for(p, crate::detect::Agent::Claude),
+            Some("abcdef01-2345-6789-abcd-ef0123456789".to_string())
+        );
+        // Wrong agent shape → None.
+        assert_eq!(transcript_id_for(p, crate::detect::Agent::Codex), None);
+    }
+
+    #[test]
+    fn transcript_id_extracts_codex_uuid_from_rollout_path() {
+        let p = "/home/u/.codex/sessions/2026/03/28/rollout-2026-03-28T03-24-32-019d30c1-5e55-74f1-84bc-e8a8c3b3024c.jsonl";
+        assert_eq!(
+            transcript_id_for(p, crate::detect::Agent::Codex),
+            Some("019d30c1-5e55-74f1-84bc-e8a8c3b3024c".to_string())
+        );
+        assert_eq!(transcript_id_for(p, crate::detect::Agent::Claude), None);
+    }
+
+    #[test]
+    fn transcript_id_rejects_non_transcript_paths() {
+        assert_eq!(transcript_id_for("/dev/null", crate::detect::Agent::Claude), None);
+        assert_eq!(transcript_id_for("/home/u/.claude/projects/x/notes.txt", crate::detect::Agent::Claude), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_transcript_finds_open_jsonl_via_synthetic_fd_dir() {
+        // We can't easily fake /proc, so exercise the fd-scan helper directly with a
+        // directory of symlinks pointing at staged transcript files.
+        let dir = tempfile::tempdir().unwrap();
+        let fddir = dir.path().join("fd");
+        std::fs::create_dir_all(&fddir).unwrap();
+        let target = dir.path().join("abcdef01-2345-6789-abcd-ef0123456789.jsonl");
+        std::fs::write(&target, b"x").unwrap();
+        // Place it under a claude-shaped path via a parent symlink chain is overkill;
+        // instead point the matcher at the resolved target path string directly.
+        std::os::unix::fs::symlink(&target, fddir.join("7")).unwrap();
+        let claude_path = format!(
+            "/x/.claude/projects/p/abcdef01-2345-6789-abcd-ef0123456789.jsonl"
+        );
+        // scan_fd_dir returns resolved link targets; assert it reads the symlink.
+        let links = scan_fd_dir(&fddir);
+        assert!(links.iter().any(|l| l.ends_with("abcdef01-2345-6789-abcd-ef0123456789.jsonl")));
+        // And the matcher turns a claude-shaped path into the uuid.
+        assert_eq!(
+            transcript_id_for(&claude_path, crate::detect::Agent::Claude),
+            Some("abcdef01-2345-6789-abcd-ef0123456789".to_string())
+        );
     }
 
     #[test]
