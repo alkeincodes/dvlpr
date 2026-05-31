@@ -149,7 +149,31 @@ async fn pane_split_then_close_is_accepted() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: Sending a command to a socket with no daemon bound returns a clean error.
+// Test 3: Closing the last pane still delivers an ok reply (Critical regression).
+// A daemon starts with exactly one pane; PaneClose closes it, making the session
+// empty. The reply must arrive BEFORE the daemon shuts down (deferred shutdown).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn closing_last_pane_still_returns_ok_reply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let path = spawn_session(dir, "solo");
+    wait_for_socket(&path).await;
+
+    // The daemon starts with exactly 1 pane (sleep 30). Closing it empties the
+    // session and should trigger shutdown — but only AFTER the reply is flushed.
+    let reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose)
+        .await
+        .expect("reply must arrive before the daemon exits");
+    assert!(
+        reply.ok,
+        "closing the last pane should ack ok=true, got {reply:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: Sending a command to a socket with no daemon bound returns a clean error.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

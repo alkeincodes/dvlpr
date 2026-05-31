@@ -20,14 +20,14 @@ control commands:
 target a session with a leading @name or a trailing --session NAME";
 
 /// Resolve the target session and return `(name, remaining_args)` with the
-/// selector removed. Precedence: leading `@name` > `--session NAME` > `$DVLPR`
-/// > `"default"`.
+/// selector removed. Precedence: leading `@name` wins over `--session NAME`,
+/// which wins over `$DVLPR`, which wins over `"default"`. Both selectors are
+/// stripped from the args passed to `parse_command`, so
+/// `@work pane zoom --session other` correctly targets `work` and leaves only
+/// `["pane", "zoom"]`.
 fn strip_session(args: &[String], dvlpr_env: Option<&str>) -> (String, Vec<String>) {
-    if let Some(first) = args.first() {
-        if let Some(name) = first.strip_prefix('@') {
-            return (name.to_string(), args[1..].to_vec());
-        }
-    }
+    // Strip any `--session NAME` pair from the tail (records it as the explicit
+    // selector); everything else accumulates into `rest`.
     let mut rest = Vec::new();
     let mut explicit: Option<String> = None;
     let mut i = 0;
@@ -39,6 +39,15 @@ fn strip_session(args: &[String], dvlpr_env: Option<&str>) -> (String, Vec<Strin
         }
         rest.push(args[i].clone());
         i += 1;
+    }
+    // A leading `@name` (now possibly the first element of `rest`) wins over the
+    // explicit `--session`, which wins over `$DVLPR`, which wins over "default".
+    if let Some(first) = rest.first() {
+        if let Some(name) = first.strip_prefix('@') {
+            let name = name.to_string();
+            let tail = rest[1..].to_vec();
+            return (name, tail);
+        }
     }
     let name = explicit
         .or_else(|| dvlpr_env.map(|s| s.to_string()))
@@ -231,5 +240,15 @@ mod tests {
 
         let (name, _rest) = strip_session(&v(&["pane", "split", "right"]), None);
         assert_eq!(name, "default");
+    }
+
+    #[test]
+    fn at_name_wins_over_trailing_session_and_both_are_stripped() {
+        let (name, rest) = strip_session(
+            &v(&["@work", "pane", "zoom", "--session", "other"]),
+            Some("envsess"),
+        );
+        assert_eq!(name, "work");
+        assert_eq!(rest, v(&["pane", "zoom"]));
     }
 }

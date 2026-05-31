@@ -140,9 +140,12 @@ enum Event {
     /// A management client asked for session status (answered without attaching).
     StatusRequest(oneshot::Sender<StatusInfo>),
     /// A control client asked to apply a `ControlCommand` (answered without attaching).
+    /// The bool in the reply tuple means "shut the daemon down after this reply is
+    /// flushed" — the client task sends `Event::Shutdown` once the write completes,
+    /// guaranteeing the reply reaches the socket before the loop exits.
     ControlCommand {
         cmd: crate::protocol::ControlCommand,
-        reply: oneshot::Sender<crate::protocol::CommandReply>,
+        reply: oneshot::Sender<(crate::protocol::CommandReply, bool)>,
     },
     /// A management client (or `kill`) asked the daemon to shut down.
     Shutdown,
@@ -234,6 +237,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut foreground: Option<ClientId> = None;
+    // Set to true when a control command empties the session; prevents the tick arm
+    // from calling session.compose() on an empty session (which would panic on the
+    // windows index) while waiting for the client task to send Event::Shutdown.
+    let mut shutting_down = false;
     let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
@@ -341,10 +348,14 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     }
                     Event::ControlCommand { cmd, reply } => {
                         let result = apply_control_command(&mut session, cmd, &ev_tx, &mut dirty);
-                        let _ = reply.send(result);
-                        if session.is_empty() {
-                            break "pane process exited".to_string();
+                        // Defer shutdown to AFTER the client task flushes the reply (it sends
+                        // Event::Shutdown once the write completes), so a command that closes
+                        // the last pane still delivers its `ok` reply instead of racing exit.
+                        let shutdown_after = session.is_empty();
+                        if shutdown_after {
+                            shutting_down = true;
                         }
+                        let _ = reply.send((result, shutdown_after));
                     }
                     Event::Shutdown => break "killed".to_string(),
                 }
@@ -374,7 +385,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         &ev_tx, &mut dirty, id, events,
                     );
                 }
-                if dirty && !clients.is_empty() {
+                if dirty && !clients.is_empty() && !shutting_down {
                     let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
                     for st in clients.values() {
                         let _ = st.grid_tx.send(snapshot.clone());
@@ -965,8 +976,13 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     {
                         return;
                     }
-                    if let Ok(result) = rx.await {
+                    if let Ok((result, shutdown_after)) = rx.await {
+                        // Write the reply BEFORE signalling shutdown, so the last-pane
+                        // close case always delivers its `ok` to the caller.
                         let _ = write_msg(&mut write_half, &result).await;
+                        if shutdown_after {
+                            let _ = ev_tx.send(Event::Shutdown);
+                        }
                     }
                 }
                 // empty/garbage/non-command frame: close without replying
@@ -1005,7 +1021,9 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                             let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
                         }
                         Ok(Some(ClientMsg::Command(_))) => {
-                            // TODO(Task 3): forward as Event::ControlCommand.
+                            // A control command on an attach stream is unexpected — the
+                            // control CLI uses a dedicated `Intent::Command` connection.
+                            // Ignore it.
                         }
                         Ok(None) | Err(_) => break,
                     }
