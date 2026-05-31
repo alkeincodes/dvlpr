@@ -332,15 +332,24 @@ impl Session {
     /// Build a `Session` from a snapshot, spawning each pane with its restore command.
     /// Returns the session and the per-pane output receivers (caller wires forwarders).
     #[allow(clippy::too_many_arguments)]
+    /// Rebuild a live session from a persisted snapshot. The restore plan is
+    /// computed HERE from `snap` (not passed in) so the per-leaf resume commands
+    /// are structurally locked to the snapshot's DFS leaf order: both
+    /// `plan_restore`/`collect_panes` and the `build_node` walk recurse
+    /// first-then-second over the SAME `snap`, so plan pane `k` always maps to
+    /// snapshot leaf `k`. A foreign/stale plan can no longer be substituted.
+    /// Phase 5's server caller therefore invokes
+    /// `Session::restore(snap, 80, 24, theme, prefix, keys)` with no plan arg.
     pub fn restore(
         snap: crate::persist::SessionSnapshot,
-        plan: &crate::persist::RestorePlan,
         cols: u16,
         rows: u16,
         theme: crate::theme::Theme,
         prefix: crate::config::KeySpec,
         keys: crate::config::KeyMap,
     ) -> io::Result<(Self, Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>)> {
+        // Re-walk the snapshot to derive the plan locally; see doc comment above.
+        let plan = crate::persist::plan_restore(&snap);
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut session = Session {
@@ -4841,11 +4850,9 @@ mod tests {
         for w in &mut snap.windows {
             set_all_cwd(&mut w.layout, ".");
         }
-        let plan = crate::persist::plan_restore(&snap);
 
         let (r, rxs) = Session::restore(
             snap.clone(),
-            &plan,
             80,
             24,
             crate::theme::Theme::default(),
@@ -4865,6 +4872,81 @@ mod tests {
             assert_eq!(a.zoomed, b.zoomed);
         }
         assert_eq!(rxs.len(), 3); // 2 panes in window 0 + 1 in window 1
+    }
+
+    /// Regression for the plan/snapshot coupling: each restored leaf must inherit
+    /// ITS OWN snapshot leaf's cwd, never a swapped sibling's. We build a split
+    /// with two leaves carrying DISTINCT existing cwds, restore, then walk the
+    /// restored root's leaves in tree order and check pane k == snapshot leaf k.
+    ///
+    /// Lockstep-test variant: workspace-subdir. The sandbox only permits PTY
+    /// spawns inside the workspace tree, so the two distinct cwds are created
+    /// UNDER the workspace (`./.tmp_restore_a`, `./.tmp_restore_b`) and cleaned
+    /// up at test end, rather than via `tempfile::tempdir()` (which lands in
+    /// /tmp and would block the spawn).
+    #[tokio::test]
+    async fn restore_maps_each_leaf_to_its_own_snapshot_cwd() {
+        use crate::persist::{
+            AgentResume, NodeSnapshot, PaneSnapshot, SessionSnapshot, SplitDirSnap, WindowSnapshot,
+            SCHEMA_VERSION,
+        };
+
+        // Two distinct, existing cwds under the workspace so plan_restore keeps
+        // them (cwd_exists == true) instead of downgrading to $HOME.
+        std::fs::create_dir_all("./.tmp_restore_a").unwrap();
+        std::fs::create_dir_all("./.tmp_restore_b").unwrap();
+        let cwd_a = std::fs::canonicalize("./.tmp_restore_a")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cwd_b = std::fs::canonicalize("./.tmp_restore_b")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(cwd_a, cwd_b);
+
+        let leaf = |cwd: &str| {
+            NodeSnapshot::Leaf(PaneSnapshot { cwd: cwd.into(), agent: AgentResume::None })
+        };
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "lockstep".into(),
+            sidebar_visible: false,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Split {
+                    dir: SplitDirSnap::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(leaf(&cwd_a)),
+                    second: Box::new(leaf(&cwd_b)),
+                },
+            }],
+        };
+
+        let (r, _rxs) = Session::restore(
+            snap,
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        // Walk the restored window's leaves in tree order; leaf 0 must carry
+        // cwd_a, leaf 1 cwd_b — proving no cross-leaf swap.
+        let leaves = layout::all_panes(&r.windows[0].root);
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(r.pane_cwd_for_test(leaves[0]).as_deref(), Some(cwd_a.as_str()));
+        assert_eq!(r.pane_cwd_for_test(leaves[1]).as_deref(), Some(cwd_b.as_str()));
+
+        let _ = std::fs::remove_dir_all("./.tmp_restore_a");
+        let _ = std::fs::remove_dir_all("./.tmp_restore_b");
     }
 
     // Test helpers.
