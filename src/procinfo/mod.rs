@@ -265,9 +265,79 @@ fn open_files(pid: i32) -> Vec<String> {
     scan_fd_dir(std::path::Path::new(&format!("/proc/{pid}/fd")))
 }
 
-// NOTE: the macOS libproc `open_files` and the non-unix fallback are added in
-// Task 2.2. Until then a temporary stub keeps non-Linux hosts compiling.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn open_files(pid: i32) -> Vec<String> {
+    // Net-new libproc FFI: PROC_PIDLISTFDS to enumerate fds, then
+    // proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO) per vnode fd to resolve its path.
+    use std::os::raw::c_void;
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    const PROX_FDTYPE_VNODE: u32 = 1;
+    // proc_fdinfo: { proc_fd: i32, proc_fdtype: u32 }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+    // vnode_fdinfowithpath = { proc_fileinfo pfi; vnode_info_path pvip; } where
+    // vnode_info_path = { vnode_info vip_vi; char vip_path[MAXPATHLEN]; }. The path
+    // is the TRAILING char[MAXPATHLEN] field. Sizes verified against
+    // <sys/proc_info.h> on this macOS (aarch64) host:
+    //   sizeof(proc_fileinfo)=24, sizeof(vnode_info)=152, MAXPATHLEN=1024
+    //   => sizeof(vnode_fdinfowithpath) = 24 + 152 + 1024 = 1200
+    //   => vip_path offset = 24 + 152 = 176 = 1200 - 1024
+    const VNODE_INFO_SIZE: usize = 1200; // sizeof(vnode_fdinfowithpath) on macOS
+    const PATH_OFFSET: usize = VNODE_INFO_SIZE - libc::PATH_MAX as usize; // trailing char[MAXPATHLEN]
+
+    let mut out = Vec::new();
+    unsafe {
+        let needed = libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return out;
+        }
+        let count = needed as usize / std::mem::size_of::<ProcFdInfo>();
+        let mut fds = vec![ProcFdInfo { proc_fd: 0, proc_fdtype: 0 }; count];
+        let got = libc::proc_pidinfo(
+            pid,
+            PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr() as *mut c_void,
+            needed,
+        );
+        if got <= 0 {
+            return out;
+        }
+        let n = got as usize / std::mem::size_of::<ProcFdInfo>();
+        for fd in fds.iter().take(n) {
+            if fd.proc_fdtype != PROX_FDTYPE_VNODE {
+                continue;
+            }
+            let mut buf = vec![0u8; VNODE_INFO_SIZE];
+            let r = libc::proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                buf.as_mut_ptr() as *mut c_void,
+                VNODE_INFO_SIZE as libc::c_int,
+            );
+            if r <= 0 {
+                continue;
+            }
+            // Path is a NUL-terminated C string in the trailing field.
+            let path_bytes = &buf[PATH_OFFSET..];
+            let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(0);
+            if end > 0 {
+                if let Ok(s) = std::str::from_utf8(&path_bytes[..end]) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_files(_pid: i32) -> Vec<String> {
     Vec::new()
 }
@@ -414,6 +484,38 @@ mod tests {
         buf.extend_from_slice(b"app.js\0");
         let argv = parse_procargs2(&buf).unwrap();
         assert_eq!(argv, vec!["node".to_string(), "app.js".to_string()]);
+    }
+
+    #[test]
+    fn agent_transcript_finds_a_file_this_process_holds_open() {
+        // Stage a claude-shaped transcript path and keep it open in THIS process, then
+        // ask agent_transcript to find it among our own open fds. This validates the
+        // real per-platform open-fd enumeration (Linux /proc, macOS libproc offsets).
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
+        let file = proj.join(format!("{uuid}.jsonl"));
+        // Hold the file open for the duration of the call.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&file)
+            .unwrap();
+        let me = std::process::id() as i32;
+        let found = agent_transcript(me, crate::detect::Agent::Claude)
+            .expect("agent_transcript must discover the .jsonl this process holds open");
+        // Compare canonicalized paths — macOS libproc may report /private/var while
+        // tempfile gives /var (both resolve to the same file). UUID is checked exactly.
+        assert_eq!(found.1, uuid, "extracted uuid must match exactly");
+        assert_eq!(
+            std::fs::canonicalize(&found.0).unwrap(),
+            std::fs::canonicalize(&file).unwrap(),
+            "discovered path must resolve to the held-open file"
+        );
+        // A non-matching kind finds nothing.
+        assert_eq!(agent_transcript(me, crate::detect::Agent::Codex), None);
     }
 
     #[test]
