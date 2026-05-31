@@ -486,6 +486,7 @@ mod tests {
         assert_eq!(argv, vec!["node".to_string(), "app.js".to_string()]);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn agent_transcript_finds_a_file_this_process_holds_open() {
         // Stage a claude-shaped transcript path and keep it open in THIS process, then
