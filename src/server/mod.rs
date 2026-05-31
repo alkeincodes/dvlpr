@@ -140,12 +140,9 @@ enum Event {
     /// A management client asked for session status (answered without attaching).
     StatusRequest(oneshot::Sender<StatusInfo>),
     /// A control client asked to apply a `ControlCommand` (answered without attaching).
-    /// The bool in the reply tuple means "shut the daemon down after this reply is
-    /// flushed" — the client task sends `Event::Shutdown` once the write completes,
-    /// guaranteeing the reply reaches the socket before the loop exits.
     ControlCommand {
         cmd: crate::protocol::ControlCommand,
-        reply: oneshot::Sender<(crate::protocol::CommandReply, bool)>,
+        reply: oneshot::Sender<crate::protocol::CommandReply>,
     },
     /// A management client (or `kill`) asked the daemon to shut down.
     Shutdown,
@@ -344,11 +341,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     }
                     Event::ControlCommand { cmd, reply } => {
                         let result = apply_control_command(&mut session, cmd, &ev_tx, &mut dirty);
-                        // Defer shutdown to AFTER the client task flushes the reply (it sends
-                        // Event::Shutdown once the write completes), so a command that closes
-                        // the last pane still delivers its `ok` reply instead of racing exit.
-                        let shutdown_after = session.is_empty();
-                        let _ = reply.send((result, shutdown_after));
+                        let _ = reply.send(result);
                     }
                     Event::Shutdown => break "killed".to_string(),
                 }
@@ -562,6 +555,12 @@ fn apply_control_command(
             ok()
         }
         C::PaneClose => {
+            if session.window_count() == 1 && session.active_pane_count() == 1 {
+                return err(
+                    "cannot close the last pane via control; use 'dvlpr kill' to stop the session"
+                        .into(),
+                );
+            }
             eff = session.apply_command(Command::ClosePane);
             ok()
         }
@@ -605,6 +604,8 @@ fn apply_control_command(
         C::WindowClose => {
             if session.window_count() == 0 {
                 err("no active window to close".into())
+            } else if session.window_count() == 1 {
+                err("cannot close the last window via control; use 'dvlpr kill' to stop the session".into())
             } else {
                 eff.closed = session.close_active_window();
                 ok()
@@ -973,13 +974,8 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     {
                         return;
                     }
-                    if let Ok((result, shutdown_after)) = rx.await {
-                        // Write the reply BEFORE signalling shutdown, so the last-pane
-                        // close case always delivers its `ok` to the caller.
+                    if let Ok(result) = rx.await {
                         let _ = write_msg(&mut write_half, &result).await;
-                        if shutdown_after {
-                            let _ = ev_tx.send(Event::Shutdown);
-                        }
                     }
                 }
                 // empty/garbage/non-command frame: close without replying

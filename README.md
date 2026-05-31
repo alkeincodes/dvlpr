@@ -164,6 +164,8 @@ run `dvlpr`, as long as the target session's daemon is alive.
 | `dvlpr pane zoom` | Toggle zoom on the focused pane |
 | `dvlpr sidebar toggle` | Show/hide the agent sidebar |
 
+> **Note:** Closing the last pane or the last window is refused (it would end the session) — use `dvlpr kill -t <name>` to stop a session.
+
 **Session targeting** — a leading `@name` or a trailing `--session NAME` selects
 the target session. Without either, dvlpr uses `$DVLPR` (the session you're
 currently inside), falling back to `default`.
