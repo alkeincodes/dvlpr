@@ -270,6 +270,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut foreground: Option<ClientId> = None;
+    // The client that entered copy mode and exclusively owns it. Only this
+    // client's input is parsed as copy keys, routes to copy-mode handlers, and
+    // receives the OSC 52 yank and `?1003h` mouse capture. `None` when copy
+    // mode is inactive. Set on the first ClientInput (or tick flush) that causes
+    // copy mode to become active; cleared unconditionally when copy mode becomes
+    // inactive (covers yank/q/ESC exit AND auto-exit via pane-exit/window-switch
+    // triggered by any path). The clear happens at every point that might
+    // deactivate copy mode, before building the next FrameSnapshot.
+    let mut copy_mode_owner: Option<ClientId> = None;
     let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
@@ -290,10 +299,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         session.resize(cols, rows);
                         // Make the very first frame show real process names.
                         session.refresh_window_names(crate::procinfo::process_name);
+                        // A new client connecting cannot change copy-mode state, but
+                        // defensively clear the owner if copy mode is no longer active.
+                        if !session.copy_mode_active() {
+                            copy_mode_owner = None;
+                        }
                         let snapshot = Arc::new(FrameSnapshot {
                             grid: session.compose(),
                             menu_open: session.menu_open(),
-                            copy_mode_client: session.copy_mode_active().then_some(foreground).flatten(),
+                            copy_mode_client: copy_mode_owner,
                         });
                         for st in clients.values() {
                             let _ = st.grid_tx.send(snapshot.clone());
@@ -323,7 +337,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             Some(st) => {
                                 let now = Instant::now();
                                 let mut evs = Vec::new();
-                                let copy_mode = session.copy_mode_active();
+                                // A non-owner client's input is NEVER parsed as copy keys,
+                                // even if copy mode is globally active for another client.
+                                let copy_mode = session.copy_mode_active()
+                                    && copy_mode_owner == Some(id);
                                 // Commit a standalone Escape whose deadline already
                                 // passed BEFORE interpreting the new bytes.
                                 if matches!(st.escape_deadline, Some(dl) if dl <= now) {
@@ -338,10 +355,25 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             }
                             None => Vec::new(),
                         };
+                        // Pass the PRE-reconcile owner: during event application the owner
+                        // is still whoever entered copy mode. After commit_input returns we
+                        // reconcile (set/clear) based on the new session state.
                         commit_input(
                             &mut session, &mut clients, &mut foreground, &mut activity_seq,
-                            &ev_tx, &mut dirty, id, events,
+                            &ev_tx, &mut dirty, id, events, copy_mode_owner,
                         );
+                        // Reconcile copy_mode_owner after applying events:
+                        // - If copy mode is now active and no owner is set, the client
+                        //   whose input just triggered EnterCopyMode becomes the owner.
+                        // - If copy mode is no longer active, unconditionally clear the
+                        //   owner (covers exit via q/ESC/yank AND any auto-exit path).
+                        if session.copy_mode_active() {
+                            if copy_mode_owner.is_none() {
+                                copy_mode_owner = Some(id);
+                            }
+                        } else {
+                            copy_mode_owner = None;
+                        }
                         if session.is_empty() {
                             break "pane process exited".to_string();
                         }
@@ -404,7 +436,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     let events = match clients.get_mut(&id) {
                         Some(st) => {
                             st.escape_deadline = None;
-                            st.parser.flush_escape_timeout(session.copy_mode_active())
+                            // Use owner-gated bit: only the owner's ESC is a copy-key exit;
+                            // a non-owner's lone ESC is plain pane input.
+                            let copy_mode = session.copy_mode_active()
+                                && copy_mode_owner == Some(id);
+                            st.parser.flush_escape_timeout(copy_mode)
                         }
                         None => Vec::new(),
                     };
@@ -412,8 +448,19 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     // on timeout promotes the sender to foreground before reaching the pane.
                     commit_input(
                         &mut session, &mut clients, &mut foreground, &mut activity_seq,
-                        &ev_tx, &mut dirty, id, events,
+                        &ev_tx, &mut dirty, id, events, copy_mode_owner,
                     );
+                    // Reconcile owner: the tick ESC flush may cause the owner to exit
+                    // copy mode (ESC = exit key in copy mode). Clear unconditionally if
+                    // copy mode is no longer active; set owner if it just became active
+                    // (unlikely here, but symmetric with the ClientInput path).
+                    if session.copy_mode_active() {
+                        if copy_mode_owner.is_none() {
+                            copy_mode_owner = Some(id);
+                        }
+                    } else {
+                        copy_mode_owner = None;
+                    }
                 }
                 // Defensive: never compose a window-less session. Control commands
                 // refuse to close the last pane/window, so they can't empty it; this
@@ -421,10 +468,16 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 // rendering zero windows is pointless and a panic risk (compose indexes
                 // self.windows[self.active_window] unconditionally).
                 if dirty && !clients.is_empty() && !session.is_empty() {
+                    // Defensively clear owner if copy mode is no longer active
+                    // (e.g. auto-exit via pane-exit or window-switch in a PaneOutput
+                    // event processed in the same loop iteration before this tick fired).
+                    if !session.copy_mode_active() {
+                        copy_mode_owner = None;
+                    }
                     let snapshot = Arc::new(FrameSnapshot {
                         grid: session.compose(),
                         menu_open: session.menu_open(),
-                        copy_mode_client: session.copy_mode_active().then_some(foreground).flatten(),
+                        copy_mode_client: copy_mode_owner,
                     });
                     for st in clients.values() {
                         let _ = st.grid_tx.send(snapshot.clone());
@@ -547,6 +600,8 @@ fn remove_client(
 /// Commit decoded input events for client `id`: promote the sender if the parse yielded
 /// any events (interaction), resizing the session when the foreground changes, then route
 /// the events into the session. Used by BOTH `ClientInput` and the tick-time ESC flush.
+///
+/// `copy_mode_owner`: passed through to `apply_events` to gate mouse and CopyKey routing.
 #[allow(clippy::too_many_arguments)]
 fn commit_input(
     session: &mut Session,
@@ -557,6 +612,7 @@ fn commit_input(
     dirty: &mut bool,
     id: ClientId,
     events: Vec<InputEvent>,
+    copy_mode_owner: Option<ClientId>,
 ) {
     if !events.is_empty() && promote(clients, foreground, activity_seq, id) {
         if let Some(st) = clients.get(&id) {
@@ -564,7 +620,7 @@ fn commit_input(
         }
         *dirty = true;
     }
-    apply_events(session, clients, foreground, ev_tx, id, events, dirty);
+    apply_events(session, clients, foreground, ev_tx, id, events, dirty, copy_mode_owner);
 }
 
 /// Apply the parts of a `CommandEffect` that are identical for every caller:
@@ -683,6 +739,12 @@ fn apply_control_command(
 /// Route decoded input events for client `id` into the session, performing command
 /// side effects (attach forwarders for new panes, async-close removed runtimes,
 /// detach the issuing client).
+///
+/// `copy_mode_owner`: the current copy-mode owner (from the central loop state).
+/// Used to gate mouse routing: only the owner's mouse events go to
+/// `handle_copy_mode_mouse`; a non-owner's mouse falls through to normal
+/// `handle_mouse` regardless of global `session.copy_mode_active()`.
+#[allow(clippy::too_many_arguments)]
 fn apply_events(
     session: &mut Session,
     clients: &mut HashMap<ClientId, ClientState>,
@@ -691,6 +753,7 @@ fn apply_events(
     id: ClientId,
     events: Vec<InputEvent>,
     dirty: &mut bool,
+    copy_mode_owner: Option<ClientId>,
 ) {
     for ev in events {
         if let Some(eff) = session.try_consume_help_event(&ev) {
@@ -771,13 +834,14 @@ fn apply_events(
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
-                if session.copy_mode_active() {
-                    // Copy mode owns the mouse. Route directly to handle_copy_mode_mouse
-                    // so the server can capture any CopyEffect.emit (OSC 52) from future
-                    // yank-on-release. In v1 mouse never yanks, so emit is always None,
-                    // but the routing is wired correctly for future use.
+                if session.copy_mode_active() && copy_mode_owner == Some(id) {
+                    // Only the copy-mode owner's mouse events drive copy mode. A
+                    // non-owner's mouse reports fall through to normal handle_mouse below
+                    // so they don't hijack the owner's selection.
                     let eff = session.handle_copy_mode_mouse(m);
                     if let Some(bytes) = eff.emit {
+                        // debug_assert: OSC 52 must only reach the owner.
+                        debug_assert_eq!(copy_mode_owner, Some(id), "OSC 52 must go to copy-mode owner only");
                         if let Some(st) = clients.get(&id) {
                             let _ = st.control.send(Control::Emit(bytes));
                         }
@@ -845,10 +909,13 @@ fn apply_events(
                 // leak the parser intercept is fixing.
             }
             InputEvent::CopyKey(k) => {
+                // CopyKey events are only produced for the owner (the parser copy-bit
+                // is gated on `copy_mode_owner == Some(id)` in ClientInput and the
+                // tick ESC flush). So `id` here is always the owner.
+                debug_assert_eq!(copy_mode_owner, Some(id), "CopyKey routed to non-owner");
                 let eff = session.handle_copy_mode_key(k);
                 if let Some(bytes) = eff.emit {
-                    // Foreground-only OSC 52: target the issuing client (== foreground
-                    // because non-empty events already promoted it in commit_input).
+                    // OSC 52 goes only to the issuing client, which is the owner.
                     if let Some(st) = clients.get(&id) {
                         let _ = st.control.send(Control::Emit(bytes));
                     }

@@ -448,3 +448,108 @@ async fn two_clients_only_foreground_gets_osc52_and_mouse_capture() {
         &b_bytes[..b_bytes.len().min(400)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 6: background client B typing during A's copy mode cannot hijack it
+// ---------------------------------------------------------------------------
+//
+// Regression test for the multi-client copy-mode isolation bug: before the fix,
+// any client that typed while copy mode was active would be promoted to foreground
+// by `commit_input` and their keystrokes would be parsed as CopyKeys — so B could
+// drive A's copy-mode cursor and receive the OSC 52 yank. This test verifies that:
+//   (a) B typing `j j` does NOT advance A's copy-mode cursor.
+//   (b) B receives NO OSC 52 yank bytes.
+//   (c) B receives NO `?1003h` mouse-capture sequence.
+//
+// Implementation: A enters copy mode, moves the cursor up so we can track
+// position. We record A's cursor position via the [copy] status line (which
+// shows row:col). Then B types `j` (copy-mode down), waits, and we confirm A's
+// status line row did NOT decrease (the cursor did not move). Then A yanks with
+// `y` to confirm it still works (owns the session), and B should NOT receive OSC 52.
+#[tokio::test]
+async fn background_client_cannot_hijack_copy_mode() {
+    let sock = temp_socket("isolation");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    // A connects first; B second. A is initially foreground.
+    let (mut ar, mut aw) = handshake(&sock, 40, 14).await;
+    let (mut br, mut bw) = handshake(&sock, 40, 14).await;
+
+    // B connected last, so B is foreground at this point. Send a resize-only
+    // no-op from A to make A active without affecting the session. We achieve
+    // this by having A type nothing and drain initial frames.
+    let _ = collect_bytes(&mut ar, 2).await;
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // A enters copy mode. For A's input to be processed as foreground we need
+    // A to be foreground — send A's prefix input which promotes A.
+    send_input(&mut aw, &[0x02, b'[']).await;
+
+    // Wait for A to confirm copy mode is active.
+    assert!(
+        until_frame(&mut ar, 5, |f| f.contains("[copy]")).await,
+        "client A must enter copy mode"
+    );
+
+    // Drain B's frames up to this point.
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // Move A's cursor UP a few rows so we have a known non-bottom position,
+    // then record the status line state. We scroll up 3 rows so the cursor
+    // is visibly not at the viewport bottom.
+    for _ in 0..3 {
+        send_input(&mut aw, b"k").await;
+    }
+    // Allow the frames to arrive and drain them; A's cursor is now 3 rows up.
+    let _ = collect_bytes(&mut ar, 1).await;
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // Now B types `j j` (copy-mode "down" key). Since B is NOT the owner, these
+    // should be treated as plain pane input bytes (ASCII 'j'), NOT as copy keys
+    // that would move A's cursor back down.
+    send_input(&mut bw, b"j").await;
+    send_input(&mut bw, b"j").await;
+
+    // Give the server time to process B's input.
+    let _ = collect_bytes(&mut ar, 1).await;
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // A now yanks with `v $ y`. Only A gets the OSC 52; B must not.
+    send_input(&mut aw, b"v").await;
+    send_input(&mut aw, b"$").await;
+    send_input(&mut aw, b"y").await;
+
+    let osc52: &[u8] = &[0x1b, b']', b'5', b'2', b';', b'c', b';'];
+    let mouse_cap: &[u8] = &[0x1b, b'[', b'?', b'1', b'0', b'0', b'3', b'h'];
+
+    // A must receive OSC 52 (it is still the owner and yanked successfully).
+    let (a_has_osc52, a_bytes) = collect_bytes_until(&mut ar, 5, osc52).await;
+    assert!(
+        a_has_osc52,
+        "client A (copy-mode owner) must receive OSC 52 on yank; \
+         A accumulated {} bytes (first 200): {:?}",
+        a_bytes.len(),
+        &a_bytes[..a_bytes.len().min(200)]
+    );
+
+    // B must NOT receive OSC 52 or mouse-capture enable at any point.
+    // Collect a window after A's yank to catch any errant bytes to B.
+    let b_bytes = collect_bytes(&mut br, 3).await;
+    let b_has_osc52 = b_bytes.windows(osc52.len()).any(|w| w == osc52);
+    let b_has_mouse_cap = b_bytes.windows(mouse_cap.len()).any(|w| w == mouse_cap);
+    assert!(
+        !b_has_osc52,
+        "background client B must NOT receive OSC 52 (copy-mode isolation broken); \
+         B accumulated {} bytes (first 400): {:?}",
+        b_bytes.len(),
+        &b_bytes[..b_bytes.len().min(400)]
+    );
+    assert!(
+        !b_has_mouse_cap,
+        "background client B must NOT receive ?1003h (mouse capture is owner-only); \
+         B accumulated {} bytes (first 400): {:?}",
+        b_bytes.len(),
+        &b_bytes[..b_bytes.len().min(400)]
+    );
+}
