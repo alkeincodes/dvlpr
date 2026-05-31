@@ -51,6 +51,15 @@ struct Pane {
     /// we don't spam the log on every tick for a persistent failure.
     #[allow(dead_code)]
     meta_err_seen: std::collections::HashSet<std::io::ErrorKind>,
+    /// Pane's last-known cwd, captured for every pane (agent or not) on the
+    /// snapshot cadence. None until first resolve.
+    cwd: Option<String>,
+    /// Agent-resume identity captured lazily from the foreground process's open
+    /// transcript. None until captured (or non-agent).
+    agent_resume: crate::persist::AgentResume,
+    /// Foreground pid the `agent_resume` capture is keyed to; recapture when the
+    /// foreground pid changes.
+    captured_for_pid: Option<i32>,
 }
 
 struct Window {
@@ -122,6 +131,8 @@ pub struct Session {
     /// mutually exclusive with `menu`. See
     /// `docs/superpowers/specs/2026-05-29-window-tab-rename-design.md`.
     dialog: Option<crate::dialog::WindowNameDialog>,
+    /// Set by structural mutators; the daemon's snapshot cadence consumes it.
+    snapshot_dirty: bool,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -200,6 +211,7 @@ impl Session {
             keys,
             help: None,
             dialog: None,
+            snapshot_dirty: true,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -250,6 +262,9 @@ impl Session {
                 branch: None,
                 meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
                 meta_err_seen: std::collections::HashSet::new(),
+                cwd: None,
+                agent_resume: crate::persist::AgentResume::None,
+                captured_for_pid: None,
             },
         );
         Ok((id, rx))
@@ -277,6 +292,7 @@ impl Session {
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.relayout_all();
+        self.mark_snapshot_dirty();
     }
 
     /// True if the context menu is currently open. Exposed for
@@ -285,6 +301,16 @@ impl Session {
     pub fn menu_open(&self) -> bool {
         self.menu.is_some()
     }
+
+    /// True if a structural change occurred since the last `take_snapshot_dirty`.
+    pub fn take_snapshot_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.snapshot_dirty, false)
+    }
+
+    fn mark_snapshot_dirty(&mut self) {
+        self.snapshot_dirty = true;
+    }
+
 
     /// Post-parser keyboard intercept. Returns `true` if the event was
     /// consumed (caller skips its normal dispatch). Returns `None` when the
@@ -577,6 +603,7 @@ impl Session {
                         w.name = value;
                         w.name_pinned = true;
                     }
+                    self.mark_snapshot_dirty();
                 }
             }
         }
@@ -888,6 +915,7 @@ impl Session {
                 if !self.windows.is_empty() {
                     self.unzoom_active();
                     self.active_window = (self.active_window + 1) % self.windows.len();
+                    self.mark_snapshot_dirty();
                 }
                 self.menu = None;
             }
@@ -896,6 +924,7 @@ impl Session {
                     self.unzoom_active();
                     let n = self.windows.len();
                     self.active_window = (self.active_window + n - 1) % n;
+                    self.mark_snapshot_dirty();
                 }
                 self.menu = None;
             }
@@ -905,6 +934,7 @@ impl Session {
                     if idx < self.windows.len() {
                         self.unzoom_active();
                         self.active_window = idx;
+                        self.mark_snapshot_dirty();
                     }
                 }
                 self.menu = None;
@@ -914,6 +944,7 @@ impl Session {
                     win.zoomed = !win.zoomed;
                 }
                 self.relayout_all();
+                self.mark_snapshot_dirty();
             }
             Command::ToggleSidebar => {
                 self.toggle_sidebar();
@@ -982,6 +1013,7 @@ impl Session {
         );
         self.windows[wi].focused = new_id;
         self.relayout_all();
+        self.mark_snapshot_dirty();
         eff.spawned.push((new_id, rx));
     }
 
@@ -1014,6 +1046,7 @@ impl Session {
         });
         self.active_window = self.windows.len() - 1;
         self.relayout_all();
+        self.mark_snapshot_dirty();
         eff.spawned.push((id, rx));
     }
 
@@ -1079,6 +1112,7 @@ impl Session {
         }
         self.relayout_all();
         self.reconcile_menu();
+        self.mark_snapshot_dirty();
         removed
     }
 
@@ -1116,10 +1150,15 @@ impl Session {
 
     /// Focus a pane by id if it belongs to the active window.
     fn focus(&mut self, pane_id: PaneId) {
+        let mut changed = false;
         if let Some(win) = self.windows.get_mut(self.active_window) {
-            if layout::all_panes(&win.root).contains(&pane_id) {
+            if layout::all_panes(&win.root).contains(&pane_id) && win.focused != pane_id {
                 win.focused = pane_id;
+                changed = true;
             }
+        }
+        if changed {
+            self.mark_snapshot_dirty();
         }
     }
 
@@ -1285,6 +1324,7 @@ impl Session {
                 if idx < self.windows.len() {
                     self.unzoom_active();
                     self.active_window = idx;
+                    self.mark_snapshot_dirty();
                 }
                 None
             }
@@ -1310,6 +1350,7 @@ impl Session {
                 }
                 // 6. Cascade layout (zoom may have changed).
                 self.relayout_all();
+                self.mark_snapshot_dirty();
                 None
             }
             // Dispatched in handle_mouse (needs a CommandEffect); never
@@ -1384,6 +1425,9 @@ impl Session {
                     changed = true;
                 }
             }
+        }
+        if changed {
+            self.mark_snapshot_dirty();
         }
         changed
     }
@@ -1658,12 +1702,14 @@ impl Session {
         };
         layout::set_ratio(&mut win.root, path, ratio); // clamps to [0.05, 0.95]
         self.relayout_all();
+        self.mark_snapshot_dirty();
     }
 
     #[cfg(test)]
     pub fn window_pane_ids(&self, idx: usize) -> Vec<PaneId> {
         layout::all_panes(&self.windows[idx].root)
     }
+
 
     #[cfg(test)]
     pub fn focus_for_test(&mut self, id: PaneId) {
@@ -4251,5 +4297,41 @@ mod tests {
         let before = s.window_count_for_test();
         let _eff = s.apply_command(Command::NewWindow);
         assert_eq!(s.window_count_for_test(), before + 1, "NewWindow stays a direct create");
+    }
+
+    /// Session + first pane for the snapshot/restore-meta tests. Uses a long-lived
+    /// `sleep` in the workspace dir so the spawn is allowed by the test sandbox
+    /// (cwd values used in assertions come from injected resolvers, not the spawn).
+    fn snapshot_test_session() -> (
+        Session,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::pane::PaneOutput>,
+    ) {
+        Session::new(
+            "work".into(),
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ".".into(),
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            26,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pane_output_does_not_mark_snapshot_dirty_but_split_does() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Consume the initial (construction) dirty flag.
+        assert!(s.take_snapshot_dirty());
+        // Ordinary terminal output is applied via feed() — must NOT mark dirty.
+        s.feed(id, b"hello world\x1b[2J some redraw traffic");
+        assert!(!s.take_snapshot_dirty(), "pane output must not trigger a snapshot write");
+        // A structural change DOES mark dirty.
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+        assert!(s.take_snapshot_dirty(), "a split must trigger a snapshot write");
     }
 }
