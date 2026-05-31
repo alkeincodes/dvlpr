@@ -178,6 +178,11 @@ mod tests {
     }
 
     #[test]
+    fn protocol_version_unchanged_by_copy_mode() {
+        assert_eq!(PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
     fn client_hello_round_trips_through_bincode() {
         let msg = ClientHello {
             protocol_version: PROTOCOL_VERSION,

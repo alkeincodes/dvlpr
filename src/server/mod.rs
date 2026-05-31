@@ -109,10 +109,16 @@ type ClientId = u64;
 /// whenever the client's terminal size changes (so the writer re-fits its view and
 /// repaints); `Detach`/`Closed` are terminal (the writer exits after writing them).
 /// The unbounded channel keeps `send` synchronous for the sync resize/teardown paths.
+// `Emit` is sent in Tasks 11/12 (copy-mode OSC 52 + mouse-capture); the variant
+// lives here ahead of those tasks so the writer arm is already in place.
+#[allow(dead_code)]
 enum Control {
     Detach,
     Closed(String),
     Resize(u16, u16),
+    /// Raw bytes to forward to THIS client only, as a diff frame (`full: false`).
+    /// Used for foreground-only OSC 52 yank and per-client mouse-capture toggles.
+    Emit(Vec<u8>),
 }
 
 /// Events funneled into the single central loop.
@@ -901,6 +907,18 @@ fn spawn_writer(
                             return;
                         }
                     }
+                    Some(Control::Emit(bytes)) => {
+                        if write_msg(
+                            &mut write_half,
+                            &ServerMsg::Frame { data: bytes, full: false },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            let _ = ev_tx.send(Event::ClientGone(id));
+                            return;
+                        }
+                    }
                     None => return,
                 },
                 changed = grid_rx.changed() => {
@@ -1069,6 +1087,20 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
             }
         }
     });
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn emit_variant_carries_raw_bytes() {
+        let c = Control::Emit(vec![0x1b, b']', b'5', b'2']);
+        match c {
+            Control::Emit(b) => assert_eq!(b, vec![0x1b, b']', b'5', b'2']),
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]
