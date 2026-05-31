@@ -103,6 +103,21 @@ impl Grid {
     }
 }
 
+/// A render-facing projection of the copy-mode selection + cursor for the compositor.
+/// Built by `Session` from `CopyModeState` each frame (pure, no FFI here).
+pub struct CopyModeOverlay<'a> {
+    /// Focused pane content rect (viewport-absolute).
+    pub pane_rect: crate::layout::Rect,
+    /// The copy-mode cursor, viewport-relative within `pane_rect`.
+    pub cursor: (u16, u16),
+    /// The normalized selection endpoints (viewport-relative), if any.
+    /// Both points are guaranteed to be within the visible viewport (the
+    /// `Session` clips fully-offscreen selections to `None`).
+    pub selection: Option<(/*start*/ (u16, u16), /*end*/ (u16, u16))>,
+    /// Status text, e.g. `"[copy] 142/2000"`.
+    pub status: &'a str,
+}
+
 /// Composites frames. Stateless — kept as a struct so `Session` can own one.
 #[derive(Default)]
 pub struct Compositor;
@@ -134,6 +149,7 @@ impl Compositor {
         help: Option<&crate::help::HelpView>,
         dialog: Option<&crate::dialog::WindowNameDialog>,
         toggle_hint: &str,
+        copy_mode: Option<&CopyModeOverlay<'_>>,
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -207,20 +223,34 @@ impl Compositor {
         let dialog_caret =
             dialog.and_then(|d| draw_dialog(&mut buf, cols, rows, d, theme, content));
 
-        // Cursor: the dialog's input caret when a dialog is open, else the
-        // focused pane's cursor mapped to global coordinates.
-        let cursor = match dialog_caret {
-            Some(c) => c,
-            None => match focused_rect {
-                Some(fr) => {
-                    let (cx, cy) = lookup(panes, focused).map_or((0, 0), |p| p.cursor());
-                    (
-                        fr.x + cx.min(fr.w.saturating_sub(1)),
-                        fr.y + cy.min(fr.h.saturating_sub(1)),
-                    )
-                }
-                None => (0, 0),
-            },
+        // Copy-mode overlay: selection highlight, copy cursor, and status line.
+        // Painted after dialog (but copy mode and dialog are mutually exclusive).
+        if let Some(cm) = copy_mode {
+            draw_copy_mode(&mut buf, cols, cm);
+        }
+
+        // Cursor: copy-mode cursor when active, else the dialog's input caret
+        // when a dialog is open, else the focused pane's cursor mapped to global
+        // coordinates.
+        let cursor = if let Some(cm) = copy_mode {
+            (
+                cm.pane_rect.x + cm.cursor.0.min(cm.pane_rect.w.saturating_sub(1)),
+                cm.pane_rect.y + cm.cursor.1.min(cm.pane_rect.h.saturating_sub(1)),
+            )
+        } else {
+            match dialog_caret {
+                Some(c) => c,
+                None => match focused_rect {
+                    Some(fr) => {
+                        let (cx, cy) = lookup(panes, focused).map_or((0, 0), |p| p.cursor());
+                        (
+                            fr.x + cx.min(fr.w.saturating_sub(1)),
+                            fr.y + cy.min(fr.h.saturating_sub(1)),
+                        )
+                    }
+                    None => (0, 0),
+                },
+            }
         };
 
         Grid {
@@ -263,6 +293,7 @@ impl Compositor {
             None,
             None,
             "",
+            None,
         ))
     }
 }
@@ -1344,6 +1375,77 @@ pub fn draw_help(
         }
         put(buf, fx, footer_y, ch, label);
         fx += 1;
+    }
+}
+
+/// Paint the copy-mode overlay: selection highlight, copy cursor, and a status
+/// line on the pane's last row. Pure function — no I/O.
+///
+/// Selection is painted as linear (character-wise) `inverse` on all cells from
+/// the start endpoint to the end endpoint, inclusive.  Full intermediate rows
+/// between a multi-row selection are fully inverted.  The status string is left-
+/// aligned on the pane's bottom row (inside `pane_rect`), clipped to the pane
+/// width so a narrow pane never panics.
+fn draw_copy_mode(buf: &mut [StyledCell], cols: u16, cm: &CopyModeOverlay<'_>) {
+    let pr = cm.pane_rect;
+
+    // --- Selection highlight ---
+    if let Some((start, end)) = cm.selection {
+        // start/end are viewport-relative (col, row) within pane_rect and are
+        // already normalized (start <= end row-then-col) by Session.
+        let (sc, sr) = start; // (col, row) — r is viewport row within pane
+        let (ec, er) = end;
+        let pr_cols = pr.w;
+        let pr_rows = pr.h;
+        // Clamp endpoints to pane_rect dimensions.
+        let sr = sr.min(pr_rows.saturating_sub(1));
+        let er = er.min(pr_rows.saturating_sub(1));
+        let sc = sc.min(pr_cols.saturating_sub(1));
+        let ec = ec.min(pr_cols.saturating_sub(1));
+        for row in sr..=er {
+            let x_start = if row == sr { sc } else { 0 };
+            let x_end = if row == er { ec } else { pr_cols.saturating_sub(1) };
+            for col in x_start..=x_end {
+                let gx = pr.x + col;
+                let gy = pr.y + row;
+                let idx = gy as usize * cols as usize + gx as usize;
+                if idx < buf.len() {
+                    buf[idx].style.inverse = true;
+                }
+            }
+        }
+    }
+
+    // --- Status line: left-aligned on the pane's bottom row ---
+    if pr.h == 0 || pr.w == 0 {
+        return;
+    }
+    let status_style = CellStyle {
+        inverse: true,
+        faint: false,
+        ..CellStyle::default()
+    };
+    let status_y = pr.y + pr.h - 1;
+    let max_chars = pr.w as usize;
+    let mut col = pr.x;
+    for ch in cm.status.chars().take(max_chars) {
+        let idx = status_y as usize * cols as usize + col as usize;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch, style: status_style };
+        }
+        col += 1;
+        if col >= pr.x + pr.w {
+            break;
+        }
+    }
+    // Pad the rest of the status row to the pane width with spaces (so the
+    // highlight bar extends the full width).
+    while col < pr.x + pr.w {
+        let idx = status_y as usize * cols as usize + col as usize;
+        if idx < buf.len() {
+            buf[idx] = StyledCell { ch: ' ', style: status_style };
+        }
+        col += 1;
     }
 }
 
@@ -3213,5 +3315,150 @@ mod tests {
         // The top-left corner is now the box glyph, not the sentinel (z-order).
         let corner = buf[rect.y as usize * cols as usize + rect.x as usize];
         assert_eq!(corner.ch, '┌');
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 10: copy-mode overlay tests
+    // -------------------------------------------------------------------------
+
+    /// Build a `StubScreen` for copy-mode compositor tests. The screen returns
+    /// a single row of characters from `content`; out-of-range cells return ' '.
+    fn stub(content: &str) -> StubScreen {
+        let cols = content.len().max(1) as u16;
+        StubScreen::new(cols, 2, &[content, ""], (0, 0))
+    }
+
+    /// Call `Compositor::compose` with a copy-mode overlay and return the Grid.
+    /// Uses the minimal valid args for everything else (single pane, 1 window).
+    fn compose_with_copy(
+        panes_arg: &[(u64, &dyn PaneCells)],
+        overlay: &CopyModeOverlay<'_>,
+    ) -> Grid {
+        let cols = overlay.pane_rect.x + overlay.pane_rect.w;
+        let rows = overlay.pane_rect.y + overlay.pane_rect.h + 1; // +1 for tab bar
+        let vp = Rect { x: 0, y: 0, w: cols.max(5), h: rows.max(3) };
+        let root = crate::layout::Node::Leaf(panes_arg.first().map(|(id, _)| *id).unwrap_or(1));
+        Compositor::new().compose(
+            vp,
+            &root,
+            "s",
+            &["w".to_string()],
+            0,
+            panes_arg.first().map(|(id, _)| *id).unwrap_or(1),
+            false,
+            &crate::theme::Theme::default(),
+            panes_arg,
+            false,
+            0,
+            &[],
+            None,
+            None,
+            None,
+            "",
+            Some(overlay),
+        )
+    }
+
+    #[test]
+    fn compose_copy_mode_inverts_selected_cells() {
+        // A 5-wide, 2-high pane with content "abcde". Selection covers cols 0..=2
+        // on row 0. Cells 0,1,2 must be inverse; cell 3 must not.
+        let pane = stub("abcde");
+        let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
+        let overlay = CopyModeOverlay {
+            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            cursor: (0, 0),
+            selection: Some(((0, 0), (2, 0))),
+            status: "[copy] 0/100",
+        };
+        let grid = compose_with_copy(&panes, &overlay);
+        // cells are indexed row-major: cell(col, row) = cells[row * cols + col]
+        let cell = |col: usize, row: usize| grid.cells[row * grid.cols as usize + col];
+        assert!(cell(0, 0).style.inverse, "col 0 should be inverse");
+        assert!(cell(1, 0).style.inverse, "col 1 should be inverse");
+        assert!(cell(2, 0).style.inverse, "col 2 should be inverse");
+        assert!(!cell(3, 0).style.inverse, "col 3 should NOT be inverse");
+        assert!(!cell(4, 0).style.inverse, "col 4 should NOT be inverse");
+    }
+
+    #[test]
+    fn compose_copy_mode_paints_status_line_text() {
+        // Build a grid with the overlay, serialize_full, assert it contains "[copy]".
+        // Use a pane wide enough to fit the full status string "[copy] 5/2000" (13 chars).
+        let pane = StubScreen::new(20, 2, &["abcdefghijklmnopqrst", ""], (0, 0));
+        let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane as &dyn PaneCells)];
+        let overlay = CopyModeOverlay {
+            pane_rect: Rect { x: 0, y: 0, w: 20, h: 2 },
+            cursor: (0, 0),
+            selection: None,
+            status: "[copy] 5/2000",
+        };
+        let grid = compose_with_copy(&panes, &overlay);
+        // Status line sits on the bottom row of pane_rect (row 1 in pane_rect).
+        // pane_rect.y = 0, so global row 1.
+        let status_row: String = (0..grid.cols)
+            .map(|x| grid.cells[grid.cols as usize + x as usize].ch)
+            .collect();
+        assert!(
+            status_row.contains("[copy]"),
+            "status row must contain [copy], got: {status_row:?}"
+        );
+        // The serialized frame must also contain the status text.
+        let frame_bytes = serialize_full(&grid);
+        let frame = String::from_utf8_lossy(&frame_bytes);
+        assert!(
+            frame.contains("[copy]"),
+            "serialized frame must contain [copy]"
+        );
+    }
+
+    #[test]
+    fn compose_copy_mode_no_selection_leaves_cells_non_inverse() {
+        // With selection=None, no pane cells should be made inverse.
+        let pane = stub("abcde");
+        let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
+        let overlay = CopyModeOverlay {
+            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            cursor: (2, 0),
+            selection: None,
+            status: "[copy] 0/0",
+        };
+        let grid = compose_with_copy(&panes, &overlay);
+        // Only check the pane rows (row 0 and 1 = pane_rect); row 2+ is tab bar.
+        for col in 0..5usize {
+            assert!(
+                !grid.cells[col].style.inverse,
+                "col {col} row 0 must not be inverse when no selection"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_copy_mode_cursor_parks_at_copy_position() {
+        // The grid's cursor field must be pane_rect.x + cursor.0, pane_rect.y + cursor.1.
+        let pane = stub("abcde");
+        let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
+        let overlay = CopyModeOverlay {
+            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            cursor: (3, 1),
+            selection: None,
+            status: "[copy] 0/0",
+        };
+        let grid = compose_with_copy(&panes, &overlay);
+        assert_eq!(grid.cursor.0, 3, "cursor col mismatch");
+        assert_eq!(grid.cursor.1, 1, "cursor row mismatch");
+    }
+
+    #[test]
+    fn draw_copy_mode_status_does_not_panic_on_narrow_pane() {
+        // A 1-col pane should not panic even with a long status string.
+        let mut buf = vec![StyledCell::default(); 3];
+        let overlay = CopyModeOverlay {
+            pane_rect: Rect { x: 0, y: 0, w: 1, h: 3 },
+            cursor: (0, 0),
+            selection: None,
+            status: "[copy] 1234567890/9999999",
+        };
+        draw_copy_mode(&mut buf, 1, &overlay); // must not panic
     }
 }

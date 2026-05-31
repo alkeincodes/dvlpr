@@ -1203,6 +1203,66 @@ impl Session {
             crate::help::render_keyspec(&self.prefix),
             crate::help::render_keyspec(&self.keys.toggle_sidebar),
         );
+
+        // Build the copy-mode overlay if copy mode is active. The status String
+        // must be computed before constructing the borrowing CopyModeOverlay.
+        let copy_status: Option<String> = self.copy_mode.as_ref().and_then(|cm| {
+            let pane = self.panes.get(&cm.pane)?;
+            Some(format!(
+                "[copy] {}/{}",
+                cm.scroll_offset,
+                pane.screen.scrollback_rows()
+            ))
+        });
+        let copy_overlay: Option<crate::compositor::CopyModeOverlay<'_>> =
+            self.copy_mode.as_ref().and_then(|cm| {
+                let pane = self.panes.get(&cm.pane)?;
+                let rows = pane.screen.rows();
+                let total = pane.screen.total_rows();
+                let content = layout::compute_regions(
+                    self.viewport(),
+                    self.sidebar_visible,
+                    self.sidebar_width,
+                )
+                .content_area;
+                let pane_rect = if win.zoomed && win.focused == cm.pane {
+                    content
+                } else {
+                    layout::pane_rects(&win.root, content)
+                        .into_iter()
+                        .find(|(id, _)| *id == cm.pane)
+                        .map(|(_, r)| r)?
+                };
+                // Clip the selection to the visible viewport. Compute the
+                // visible SCREEN-row span; drop the highlight if the selection
+                // lies entirely above or below it.
+                let selection = cm.selection.and_then(|sel| {
+                    let (a, b) = sel.normalized();
+                    let top = total
+                        .saturating_sub(rows as usize)
+                        .saturating_sub(cm.scroll_offset);
+                    let bottom = top + (rows as usize).saturating_sub(1);
+                    if b.y < top || a.y > bottom {
+                        return None; // entirely off-screen
+                    }
+                    let pa = crate::copymode::project(a, cm.scroll_offset, rows, total)
+                        .unwrap_or((0, 0));
+                    let pb =
+                        crate::copymode::project(b, cm.scroll_offset, rows, total).unwrap_or((
+                            pane_rect.w.saturating_sub(1),
+                            rows.saturating_sub(1),
+                        ));
+                    Some((pa, pb))
+                });
+                let status = copy_status.as_deref().unwrap_or("");
+                Some(crate::compositor::CopyModeOverlay {
+                    pane_rect,
+                    cursor: cm.cursor,
+                    selection,
+                    status,
+                })
+            });
+
         self.compositor.compose(
             viewport,
             &win.root,
@@ -1220,6 +1280,7 @@ impl Session {
             help_view.as_ref(),
             self.dialog.as_ref(),
             &toggle_hint,
+            copy_overlay.as_ref(),
         )
     }
 
@@ -6142,6 +6203,184 @@ mod tests {
 
         let _ = std::fs::remove_dir_all("./.tmp_restore_a");
         let _ = std::fs::remove_dir_all("./.tmp_restore_b");
+    }
+
+    // --- Task 10: compositor copy-mode offscreen-clip (session-level) ---
+
+    /// Helper: check if any non-status-line pane cells are inverse.
+    /// The status line is the last row of the pane (draw_copy_mode always paints
+    /// it inverse); we exclude it and check only the content rows above.
+    /// The pane occupies rows 0..(pane_rows-1) of the grid when sidebar is hidden
+    /// and the status/tab bar rows are at the bottom.
+    fn any_inverse_in_pane_content(
+        grid: &crate::compositor::Grid,
+        pane_cols: u16,
+        pane_rows: u16,
+    ) -> bool {
+        // Exclude the last pane row (status line, always inverse in copy mode).
+        let check_rows = pane_rows.saturating_sub(1);
+        for row in 0..check_rows {
+            for col in 0..pane_cols {
+                let idx = row as usize * grid.cols as usize + col as usize;
+                if idx < grid.cells.len() && grid.cells[idx].style.inverse {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn compose_copy_mode_offscreen_selection_produces_no_inverse() {
+        // Build a session with scrollback, feed enough lines to push data into history,
+        // enter copy mode, make a selection, then scroll the viewport so the selection
+        // is entirely above the visible rows. compose() must produce zero selection-
+        // highlight inverse cells in the pane content area (status line excluded).
+        //
+        // Session viewport: cols=20, rows=6. Tab bar takes 1 row → pane has 5 rows.
+        // Feed 20 lines → scrollback = 20 - 5 = 15, total = 20.
+        // Selection: SCREEN rows 18..19 (near live bottom).
+        // Scroll up by 10 → top = 20-5-10 = 5, bottom = 5+4 = 9.
+        // Selection (18,19) > bottom(9) → offscreen → no highlight.
+        let cols = 20u16;
+        let rows = 6u16; // viewport height; pane height = 5
+        let (mut session, pane_id, _rx) = copy_test_session(cols, rows, 200).await;
+
+        // Feed 20 lines to build scrollback.
+        for i in 0..20u8 {
+            session.feed(pane_id, format!("line{i:02}\r\n").as_bytes());
+        }
+
+        // Enter copy mode.
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session.copy_mode_active());
+
+        // Gather actual dimensions from the pane screen.
+        let (total, pane_rows_actual) = {
+            let pane = session.panes.get(&pane_id).unwrap();
+            (pane.screen.total_rows(), pane.screen.rows() as usize)
+        };
+        // We need actual scrollback to exist.
+        assert!(total > pane_rows_actual, "need scrollback for this test");
+
+        // Place the selection on the last 2 SCREEN rows (live bottom).
+        {
+            let anchor = crate::copymode::AbsPoint { x: 0, y: total.saturating_sub(2) };
+            let head   = crate::copymode::AbsPoint { x: cols - 1, y: total.saturating_sub(1) };
+            let cm = session.copy_mode.as_mut().unwrap();
+            cm.selection = Some(crate::copymode::Selection { anchor, head });
+        }
+
+        // Scroll up so the selection is entirely above the viewport.
+        // scroll_offset = 10: top = total - pane_rows - 10.
+        // With total=20, pane_rows=5: top = 5, bottom = 9.
+        // Selection at rows 18,19 → both > bottom=9 → offscreen.
+        let scroll_up = 10usize;
+        {
+            let pane = session.panes.get_mut(&pane_id).unwrap();
+            pane.screen.scroll_viewport_delta(-(scroll_up as isize));
+            session.copy_mode.as_mut().unwrap().scroll_offset = scroll_up;
+        }
+
+        // compose() — no selection-highlight inverse cells in content rows above status.
+        let grid = session.compose();
+        let pane_rows_u16 = pane_rows_actual as u16;
+        assert!(
+            !any_inverse_in_pane_content(&grid, cols, pane_rows_u16),
+            "fully-offscreen selection must produce no selection-highlight inverse cells"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_copy_mode_partially_overlapping_selection_inverts_only_overlapping_rows() {
+        // Same setup, but scroll up by only 1 so only part of the selection overlaps.
+        //
+        // Session viewport: cols=20, rows=6. Tab bar takes 1 row → pane has 5 rows.
+        // Feed 20 lines → scrollback=15, total=20.
+        // Selection: SCREEN rows total-2 (=18) and total-1 (=19).
+        // Scroll up by 0 (live bottom): top = 20-5-0 = 15, bottom = 15+4 = 19.
+        // Both anchor.y=18 and head.y=19 are in [15,19] → selection fully visible.
+        //
+        // Now to get partial overlap: put selection on rows total-6 (=14) and total-5 (=15),
+        // then scroll up by 1: top=14, bottom=18. anchor.y=14 → in viewport (row 0);
+        // head.y=15 → in viewport (row 1). Wait, that's still both visible.
+        //
+        // Better: selection spans rows total-6..total-5 (14..15). Scroll by 2:
+        // top=20-5-2=13, bottom=13+4=17. anchor.y=14 → row 1 (visible).
+        // head.y=15 → row 2 (visible). Both in viewport.
+        //
+        // Clearest partial overlap case: selection spans rows 5..total-1 (covers most
+        // of history). With scroll_offset=5: top=20-5-5=10, bottom=14.
+        // anchor.y=5 < top=10 → clipped to (0,0); head.y=19 → projected to row 9 but
+        // rows=5 → clipped to (cols-1, 4). That gives a full-pane selection.
+        //
+        // For a clean test, use: anchor.y = total-1 (live-bottom SCREEN row),
+        // scroll up by 3: top=12, bottom=16. anchor.y=19 > bottom=16 → None.
+        //
+        // Actually the cleanest demonstration of partial clip: selection
+        // anchor=total-5 (=15), head=total-1 (=19). No scroll (offset=0):
+        // top=15, bottom=19. Both visible → full selection rows 0..4.
+        // Then scroll up by 1: top=14, bottom=18. anchor.y=15 → row 1. head.y=19 > 18 →
+        // clipped to (cols-1, rows-1=4). Status line is on row 4, but highlight also
+        // paints row 4. Rows 1..4 inverse.
+        // Row 0 should NOT be inverse.
+        let cols = 20u16;
+        let rows = 6u16; // viewport; pane = 5 rows
+        let (mut session, pane_id, _rx) = copy_test_session(cols, rows, 200).await;
+
+        for i in 0..20u8 {
+            session.feed(pane_id, format!("line{i:02}\r\n").as_bytes());
+        }
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+
+        let (total, pane_rows_actual) = {
+            let pane = session.panes.get(&pane_id).unwrap();
+            (pane.screen.total_rows(), pane.screen.rows() as usize)
+        };
+        assert!(total > pane_rows_actual + 2, "need enough scrollback");
+
+        // Selection: SCREEN rows (total-5)..(total-1) i.e. bottom 5 rows.
+        let sel_start_y = total.saturating_sub(pane_rows_actual); // = total-5 = 15
+        let sel_end_y   = total.saturating_sub(1); // = 19
+        {
+            let anchor = crate::copymode::AbsPoint { x: 0, y: sel_start_y };
+            let head   = crate::copymode::AbsPoint { x: cols - 1, y: sel_end_y };
+            let cm = session.copy_mode.as_mut().unwrap();
+            cm.selection = Some(crate::copymode::Selection { anchor, head });
+        }
+
+        // Scroll up by 1: top = total - pane_rows - 1 = 14, bottom = 18.
+        // anchor.y=15 → visible at row 1 (15-14=1).
+        // head.y=19 > bottom=18 → clipped to (cols-1, pane_rows-1=4).
+        // So selection in viewport spans rows 1..4 (4 = status line row also).
+        // Row 0 should NOT be inverse.
+        let scroll_up = 1usize;
+        {
+            let pane = session.panes.get_mut(&pane_id).unwrap();
+            pane.screen.scroll_viewport_delta(-(scroll_up as isize));
+            session.copy_mode.as_mut().unwrap().scroll_offset = scroll_up;
+        }
+
+        let grid = session.compose();
+        // Row 0 must NOT be inverse (selection starts at viewport row 1).
+        let row0_has_inverse = (0..cols).any(|col| {
+            let idx = col as usize; // row 0 * cols + col
+            idx < grid.cells.len() && grid.cells[idx].style.inverse
+        });
+        assert!(
+            !row0_has_inverse,
+            "row 0 (above selection start) must NOT be inverse, got inverse cells"
+        );
+
+        // Row 1 MUST be inverse (selection starts here).
+        let row1_has_inverse = (0..cols).any(|col| {
+            let idx = grid.cols as usize + col as usize;
+            idx < grid.cells.len() && grid.cells[idx].style.inverse
+        });
+        assert!(
+            row1_has_inverse,
+            "row 1 (at selection start) must be inverse"
+        );
     }
 
     // Test helpers.
