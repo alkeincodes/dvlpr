@@ -76,6 +76,23 @@ async fn wait_live(path: &std::path::Path) {
     panic!("daemon never became live at {path:?}");
 }
 
+/// Poll until the snapshot at `path` loads AND satisfies `pred` (e.g. window count),
+/// up to ~6s. Returns the loaded snapshot. Panics on timeout.
+async fn wait_snapshot(
+    path: &std::path::Path,
+    pred: impl Fn(&dvlpr::persist::SessionSnapshot) -> bool,
+) -> dvlpr::persist::SessionSnapshot {
+    for _ in 0..300 {
+        if let Some(s) = dvlpr::persist::load(path) {
+            if pred(&s) {
+                return s;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("snapshot at {path:?} never reached expected state");
+}
+
 /// Attach and return the (read, write) halves so the caller can send input.
 async fn attach(
     path: &std::path::Path,
@@ -137,10 +154,9 @@ async fn abrupt_kill_leaves_snapshot_and_restore_rebuilds_layout() {
     write_msg(&mut w, &ClientMsg::Input(b"\x02c\r".to_vec()))
         .await
         .unwrap();
-    // Let the structural change + 1s snapshot cadence persist it.
-    tokio::time::sleep(Duration::from_millis(1400)).await;
-
-    let loaded = dvlpr::persist::load(&snap).expect("snapshot present after tick");
+    // Let the structural change + 1s snapshot cadence persist it; poll until the
+    // snapshot captures both windows instead of racing a fixed sleep under load.
+    let loaded = wait_snapshot(&snap, |s| s.windows.len() == 2).await;
     assert_eq!(loaded.windows.len(), 2, "two windows should be captured");
 
     // 2) SIGKILL — a true abrupt death; no teardown runs.
@@ -191,8 +207,8 @@ async fn graceful_kill_deletes_the_snapshot() {
     );
     wait_live(&sock).await;
     let (_r, _w) = attach(&sock).await;
-    tokio::time::sleep(Duration::from_millis(1400)).await;
-    assert!(snap.exists(), "snapshot should exist after the tick");
+    // Poll until the snapshot exists rather than racing a fixed sleep under load.
+    let _ = wait_snapshot(&snap, |_| true).await;
 
     // Graceful kill via Intent::Kill → teardown deletes the snapshot.
     graceful_kill(&sock).await;
