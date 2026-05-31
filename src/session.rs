@@ -107,8 +107,8 @@ pub struct Session {
     rows: u16,
     command: Vec<String>,
     cwd: String,
-    /// True when the user has toggled the agent-awareness sidebar visible.
-    /// Default: false (hidden). Toggled by Command::ToggleSidebar.
+    /// Whether the agent-awareness sidebar is shown. Default: true (open) — it's
+    /// the product's headline feature. Toggled by Command::ToggleSidebar.
     /// `layout::compute_regions` may still suppress the sidebar's visual
     /// presence if the viewport is too narrow (see SIDEBAR_MIN_CONTENT_COLS).
     sidebar_visible: bool,
@@ -1085,6 +1085,11 @@ impl Session {
         let win = &self.windows[self.active_window];
         let agent_entries = self.agent_entries();
         let help_view = self.help.as_ref().map(|h| self.build_help_view(h));
+        let toggle_hint = format!(
+            "{} {}: hide",
+            crate::help::render_keyspec(&self.prefix),
+            crate::help::render_keyspec(&self.keys.toggle_sidebar),
+        );
         self.compositor.compose(
             viewport,
             &win.root,
@@ -1101,6 +1106,7 @@ impl Session {
             self.menu.as_ref(),
             help_view.as_ref(),
             self.dialog.as_ref(),
+            &toggle_hint,
         )
     }
 
@@ -3073,6 +3079,33 @@ mod tests {
             session.sidebar_width,
         );
         assert!(regions.sidebar.is_some(), "sidebar region present at 80 cols");
+    }
+
+    #[test]
+    fn compose_renders_toggle_hint_footer_in_sidebar() {
+        let (session, _id, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            ".".to_string(),
+            120,
+            30,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        )
+        .expect("session");
+        let grid = session.compose();
+        let cols = 120usize;
+        let regions = crate::layout::compute_regions(
+            crate::layout::Rect { x: 0, y: 0, w: 120, h: 30 },
+            true,
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        );
+        let sb = regions.sidebar.expect("sidebar visible at 120x30");
+        let footer_y = (sb.y + sb.h - 1) as usize;
+        let row: String = (0..cols).map(|x| grid.cells[footer_y * cols + x].ch).collect();
+        assert!(row.contains("C-b s"), "footer chord on sidebar bottom row: {row:?}");
     }
 
     #[tokio::test]

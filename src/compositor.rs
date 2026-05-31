@@ -133,6 +133,7 @@ impl Compositor {
         menu: Option<&crate::menu::MenuState>,
         help: Option<&crate::help::HelpView>,
         dialog: Option<&crate::dialog::WindowNameDialog>,
+        toggle_hint: &str,
     ) -> Grid {
         debug_assert!(
             viewport.x == 0 && viewport.y == 0,
@@ -184,7 +185,7 @@ impl Compositor {
 
         // Sidebar (if visible).
         if let Some(sb) = regions.sidebar {
-            draw_sidebar(&mut buf, cols, sb, theme, agent_entries, "");
+            draw_sidebar(&mut buf, cols, sb, theme, agent_entries, toggle_hint);
         }
 
         // Menu overlay — painted last so it covers panes / dividers / tabs /
@@ -268,6 +269,7 @@ impl Compositor {
             None,
             None,
             None,
+            "",
         ))
     }
 }
