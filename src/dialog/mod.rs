@@ -22,12 +22,18 @@ pub struct WindowNameDialog {
 impl WindowNameDialog {
     /// New Window dialog, empty buffer.
     pub fn new_window() -> Self {
-        Self { mode: DialogMode::NewWindow, buffer: String::new() }
+        Self {
+            mode: DialogMode::NewWindow,
+            buffer: String::new(),
+        }
     }
 
     /// Rename dialog for `window`, pre-filled with the current `name`.
     pub fn rename(window: usize, name: &str) -> Self {
-        Self { mode: DialogMode::RenameWindow { window }, buffer: name.to_string() }
+        Self {
+            mode: DialogMode::RenameWindow { window },
+            buffer: name.to_string(),
+        }
     }
 
     /// Append a printable character. Control characters are ignored by the
@@ -88,7 +94,9 @@ mod tests {
     #[test]
     fn value_trims_surrounding_whitespace() {
         let mut d = WindowNameDialog::new_window();
-        for c in "  hi  ".chars() { d.insert_char(c); }
+        for c in "  hi  ".chars() {
+            d.insert_char(c);
+        }
         assert_eq!(d.value(), "hi");
     }
 }

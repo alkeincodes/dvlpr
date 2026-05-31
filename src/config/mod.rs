@@ -546,7 +546,10 @@ mod tests {
             Some(Command::SplitVertical)
         );
         assert_eq!(c.resolve(&Key::Char(b'x')), Some(Command::ClosePane));
-        assert_eq!(c.resolve(&Key::Char(b'c')), Some(Command::OpenNewWindowDialog));
+        assert_eq!(
+            c.resolve(&Key::Char(b'c')),
+            Some(Command::OpenNewWindowDialog)
+        );
         assert_eq!(c.resolve(&Key::Char(b'?')), Some(Command::ShowHelp));
         assert_eq!(c.resolve(&Key::Char(b'z')), None);
     }

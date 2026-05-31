@@ -68,17 +68,35 @@ impl MenuState {
 /// The v1 pane-menu items. Order is render order; index 0 is the default
 /// initial highlight.
 pub const PANE_MENU_ITEMS: &[MenuItem] = &[
-    MenuItem { label: "Split Vertically", action: MenuAction::Command(Command::SplitVertical) },
-    MenuItem { label: "Split Horizontally", action: MenuAction::Command(Command::SplitHorizontal) },
-    MenuItem { label: "Zoom", action: MenuAction::Command(Command::ToggleZoom) },
-    MenuItem { label: "Exit", action: MenuAction::Command(Command::ClosePane) },
+    MenuItem {
+        label: "Split Vertically",
+        action: MenuAction::Command(Command::SplitVertical),
+    },
+    MenuItem {
+        label: "Split Horizontally",
+        action: MenuAction::Command(Command::SplitHorizontal),
+    },
+    MenuItem {
+        label: "Zoom",
+        action: MenuAction::Command(Command::ToggleZoom),
+    },
+    MenuItem {
+        label: "Exit",
+        action: MenuAction::Command(Command::ClosePane),
+    },
 ];
 
 /// Tab context-menu items. Order is render order; index 0 is the initial
 /// highlight.
 pub const TAB_MENU_ITEMS: &[MenuItem] = &[
-    MenuItem { label: "Rename", action: MenuAction::RenameWindow },
-    MenuItem { label: "Close", action: MenuAction::CloseWindow },
+    MenuItem {
+        label: "Rename",
+        action: MenuAction::RenameWindow,
+    },
+    MenuItem {
+        label: "Close",
+        action: MenuAction::CloseWindow,
+    },
 ];
 
 use crate::layout::Rect;
@@ -221,7 +239,10 @@ mod tests {
         assert_eq!(items[0].label, "Split Vertically");
         assert_eq!(items[0].action, MenuAction::Command(Command::SplitVertical));
         assert_eq!(items[1].label, "Split Horizontally");
-        assert_eq!(items[1].action, MenuAction::Command(Command::SplitHorizontal));
+        assert_eq!(
+            items[1].action,
+            MenuAction::Command(Command::SplitHorizontal)
+        );
         assert_eq!(items[2].label, "Zoom");
         assert_eq!(items[2].action, MenuAction::Command(Command::ToggleZoom));
         assert_eq!(items[3].label, "Exit");
@@ -245,7 +266,11 @@ mod tests {
 
     #[test]
     fn tab_kind_carries_window_index() {
-        let menu = MenuState { kind: MenuKind::Tab { window: 3 }, anchor: (1, 1), highlighted: 0 };
+        let menu = MenuState {
+            kind: MenuKind::Tab { window: 3 },
+            anchor: (1, 1),
+            highlighted: 0,
+        };
         match menu.kind {
             MenuKind::Tab { window } => assert_eq!(window, 3),
             _ => panic!("expected Tab kind"),

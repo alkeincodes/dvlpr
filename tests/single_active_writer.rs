@@ -201,8 +201,8 @@ async fn bigger_observer_receives_letterboxed_fitted_frame() {
     );
     // The pane PTY height is the content area (viewport rows - 1 for the status bar).
     // Foreground B is 60x18, so the pane content is 34x17 (60-26 sidebar, 18-1 status): stty reports "17 34".
-    let seen =
-        String::from_utf8_lossy(&f).contains(&pane_size(60, 18)) || until_text(&mut ra, 5, &pane_size(60, 18)).await;
+    let seen = String::from_utf8_lossy(&f).contains(&pane_size(60, 18))
+        || until_text(&mut ra, 5, &pane_size(60, 18)).await;
     assert!(
         seen,
         "a bigger observer must mirror the foreground's content, not paint blank"
@@ -236,8 +236,8 @@ async fn smaller_observer_receives_clipped_fitted_frame() {
     );
     // The pane PTY height is the content area (viewport rows - 1 for the status bar).
     // Foreground B is 100x30, so the pane content is 74x29 (100-26 sidebar, 30-1 status): stty reports "29 74".
-    let seen =
-        String::from_utf8_lossy(&f).contains(&pane_size(100, 30)) || until_text(&mut ra, 5, &pane_size(100, 30)).await;
+    let seen = String::from_utf8_lossy(&f).contains(&pane_size(100, 30))
+        || until_text(&mut ra, 5, &pane_size(100, 30)).await;
     assert!(
         seen,
         "a clipped observer must mirror the foreground's top-left content, not paint blank"
@@ -295,7 +295,10 @@ async fn smaller_client_connecting_shrinks_geometry() {
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
     // Pane PTY height = viewport rows - 1 (status bar). 100x30 → content is 74x29 (rows-1 status, cols-26 sidebar).
-    assert!(until_text(&mut ra, 5, &pane_size(100, 30)).await, "A drives 100x30");
+    assert!(
+        until_text(&mut ra, 5, &pane_size(100, 30)).await,
+        "A drives 100x30"
+    );
 
     let (_rb, _wb) = handshake(&sock, 60, 18).await;
     // B=60x18 → content is 34x17 (rows-1 status, cols-26 sidebar).
@@ -384,11 +387,17 @@ async fn dropping_a_client_keeps_the_session_responsive() {
     wait_for_socket(&sock).await;
     let (mut ra, _wa) = handshake(&sock, 100, 30).await;
     // Pane PTY height = viewport rows - 1 (status bar). 100x30 → content is 74x29 (rows-1 status, cols-26 sidebar).
-    assert!(until_text(&mut ra, 5, &pane_size(100, 30)).await, "A drives 100x30");
+    assert!(
+        until_text(&mut ra, 5, &pane_size(100, 30)).await,
+        "A drives 100x30"
+    );
 
     let (rb, wb) = handshake(&sock, 60, 18).await;
     // B=60x18 → content is 34x17 (rows-1 status, cols-26 sidebar).
-    assert!(until_text(&mut ra, 5, &pane_size(60, 18)).await, "B is foreground");
+    assert!(
+        until_text(&mut ra, 5, &pane_size(60, 18)).await,
+        "B is foreground"
+    );
     drop(rb);
     drop(wb);
 

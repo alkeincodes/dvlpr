@@ -277,7 +277,9 @@ mod tests {
         // The child must start in the directory we pass. Use `pwd -P` (physical
         // path) and canonicalize the expected dir so the macOS /tmp ->
         // /private/tmp symlink does not cause a spurious mismatch.
-        let want = std::env::temp_dir().canonicalize().expect("canonicalize tmp");
+        let want = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonicalize tmp");
         let (pane, mut rx) = PaneRuntime::spawn(
             &["sh".into(), "-c".into(), "pwd -P".into()],
             want.to_str().unwrap(),

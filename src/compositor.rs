@@ -168,8 +168,7 @@ impl Compositor {
         // Status/tab bar (always present): session prefix at the left, then tabs.
         {
             let ty = regions.tab_status_row;
-            let bar =
-                layout::tab_bar_layout(session_name, tab_names, active_window, zoomed, cols);
+            let bar = layout::tab_bar_layout(session_name, tab_names, active_window, zoomed, cols);
             draw_tabs(
                 &mut buf,
                 cols,
@@ -191,14 +190,7 @@ impl Compositor {
         // sidebar in its footprint. The rect is clipped to content_area
         // inside draw_menu so the bar/sidebar are never overwritten.
         if let Some(m) = menu {
-            draw_menu(
-                &mut buf,
-                cols,
-                m,
-                m.items(),
-                theme,
-                content,
-            );
+            draw_menu(&mut buf, cols, m, m.items(), theme, content);
         }
 
         // Help overlay — painted after the menu (top-most). The caller (Session)
@@ -211,7 +203,8 @@ impl Compositor {
         // Dialog overlay — top-most, painted after menu and help. Caller keeps at
         // most one of menu/help/dialog active. Returns the input caret so the
         // real (blinking) terminal cursor can be parked there.
-        let dialog_caret = dialog.and_then(|d| draw_dialog(&mut buf, cols, rows, d, theme, content));
+        let dialog_caret =
+            dialog.and_then(|d| draw_dialog(&mut buf, cols, rows, d, theme, content));
 
         // Cursor: the dialog's input caret when a dialog is open, else the
         // focused pane's cursor mapped to global coordinates.
@@ -1030,10 +1023,23 @@ pub fn draw_dialog(
     }
     let x0 = content_area.x + (content_area.w.saturating_sub(box_w)) / 2;
     let y0 = content_area.y + (content_area.h.saturating_sub(box_h)) / 2;
-    let rect = Rect { x: x0, y: y0, w: box_w, h: box_h };
+    let rect = Rect {
+        x: x0,
+        y: y0,
+        w: box_w,
+        h: box_h,
+    };
 
-    let border = CellStyle { fg: theme.menu_border_fg, bg: theme.menu_bg, ..Default::default() };
-    let label = CellStyle { fg: theme.menu_label_fg, bg: theme.menu_bg, ..Default::default() };
+    let border = CellStyle {
+        fg: theme.menu_border_fg,
+        bg: theme.menu_bg,
+        ..Default::default()
+    };
+    let label = CellStyle {
+        fg: theme.menu_label_fg,
+        bg: theme.menu_bg,
+        ..Default::default()
+    };
 
     let put = |buf: &mut [StyledCell], x: u16, y: u16, ch: char, style: CellStyle| {
         let idx = y as usize * cols as usize + x as usize;
@@ -1060,15 +1066,33 @@ pub fn draw_dialog(
                 (_, _, true, _) | (_, _, _, true) => '│',
                 _ => ' ',
             };
-            put(buf, x, y, ch, if is_top || is_bottom || is_left || is_right { border } else { label });
+            put(
+                buf,
+                x,
+                y,
+                ch,
+                if is_top || is_bottom || is_left || is_right {
+                    border
+                } else {
+                    label
+                },
+            );
         }
     }
 
     let title_chars: Vec<char> = format!(" {title} ").chars().collect();
-    let tstart = rect.x + 1 + (rect.w.saturating_sub(2).saturating_sub(title_chars.len() as u16)) / 2;
+    let tstart = rect.x
+        + 1
+        + (rect
+            .w
+            .saturating_sub(2)
+            .saturating_sub(title_chars.len() as u16))
+            / 2;
     for (i, &c) in title_chars.iter().enumerate() {
         let x = tstart + i as u16;
-        if x < right { put(buf, x, rect.y, c, border); }
+        if x < right {
+            put(buf, x, rect.y, c, border);
+        }
     }
 
     // Interior rows, breathing room top and bottom. Guarded so a clamped
@@ -1248,7 +1272,11 @@ pub fn draw_help(
     let vis = visible_body_rows(rect);
     let scroll = view.scroll.min(max_scroll(rows.len(), rect));
     let interior_w = rect.w.saturating_sub(2);
-    let key_w_raw = rows.iter().map(|r| r.keys.chars().count()).max().unwrap_or(0) as u16;
+    let key_w_raw = rows
+        .iter()
+        .map(|r| r.keys.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
     // interior_w >= 22 here (help_renderable guarantees w >= HELP_MIN_W = 24),
     // so the desc column always keeps >= 6 cells; the -8 reserves the gap+min desc.
     let key_w = key_w_raw.min(interior_w.saturating_sub(8));
@@ -1554,7 +1582,16 @@ mod tests {
         let names = vec!["zsh".to_string(), "vim".to_string(), "git".to_string()];
         let active_window = 1;
         let regions = layout::tab_layout("work", &names, active_window, false, cols);
-        draw_tabs(&mut buf, cols, 0, "work", &regions, active_window, &theme, None);
+        draw_tabs(
+            &mut buf,
+            cols,
+            0,
+            "work",
+            &regions,
+            active_window,
+            &theme,
+            None,
+        );
 
         // Active region (window 1, "2:vim*") spans the full chip range.
         let r1 = &regions[1];
@@ -1855,8 +1892,16 @@ mod tests {
         let (cx, cy) = draw_dialog(&mut buf, cols, rows, &d, &theme, content)
             .expect("dialog should render at this size");
         let at = |x: u16, y: u16| buf[y as usize * cols as usize + x as usize].ch;
-        assert_eq!(at(cx - 1, cy), 'c', "caret sits just past the last typed char");
-        assert_eq!(at(cx, cy), ' ', "no painted caret glyph — the real cursor goes here");
+        assert_eq!(
+            at(cx - 1, cy),
+            'c',
+            "caret sits just past the last typed char"
+        );
+        assert_eq!(
+            at(cx, cy),
+            ' ',
+            "no painted caret glyph — the real cursor goes here"
+        );
     }
 
     #[test]
@@ -2027,12 +2072,17 @@ mod tests {
         let rows: u16 = 6;
         let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
         // Place the sidebar at a non-zero x so we exercise rect.x, not col 0.
-        let rect = layout::Rect { x: 4, y: 0, w: 16, h: rows };
+        let rect = layout::Rect {
+            x: 4,
+            y: 0,
+            w: 16,
+            h: rows,
+        };
         let theme = crate::theme::Theme::default();
         draw_sidebar(&mut buf, cols, rect, &theme, &[]);
-        let sep_row0 = buf[(0 * cols as usize) + rect.x as usize].ch;
-        let junction = buf[(1 * cols as usize) + rect.x as usize].ch;
-        let after_junction = buf[(1 * cols as usize) + (rect.x as usize) + 1].ch;
+        let sep_row0 = buf[rect.x as usize].ch;
+        let junction = buf[(cols as usize) + rect.x as usize].ch;
+        let after_junction = buf[(cols as usize) + (rect.x as usize) + 1].ch;
         assert_eq!(sep_row0, '│', "vertical bar above the divider");
         assert_eq!(junction, '├', "tee where the divider meets the bar");
         assert_eq!(after_junction, '─', "divider continues to the right");
@@ -2100,7 +2150,12 @@ mod tests {
     fn draw_sidebar_renders_done_with_check_and_done_color() {
         let cols: u16 = 26;
         let rows: u16 = 12;
-        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let rect = layout::Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
         let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
         let theme = crate::theme::Theme::default();
         let entries = vec![crate::session::AgentEntry {
@@ -2730,7 +2785,9 @@ mod tests {
         let pb = bar.plus.expect("button present");
         let theme = crate::theme::Theme::default();
         draw_tabs(&mut buf, cols, 0, "s", &bar.tabs, 0, &theme, Some(&pb));
-        let glyph: String = (pb.x_start..=pb.x_end).map(|x| buf[x as usize].ch).collect();
+        let glyph: String = (pb.x_start..=pb.x_end)
+            .map(|x| buf[x as usize].ch)
+            .collect();
         assert_eq!(glyph, "[+]");
     }
 
@@ -2758,8 +2815,13 @@ mod tests {
         let theme = crate::theme::Theme::default();
         // Pass None — the button cells must remain blank.
         draw_tabs(&mut buf, cols, 0, "s", &bar.tabs, 0, &theme, None);
-        let glyph: String = (pb.x_start..=pb.x_end).map(|x| buf[x as usize].ch).collect();
-        assert!(!glyph.contains('+'), "no glyph should be painted when plus is None");
+        let glyph: String = (pb.x_start..=pb.x_end)
+            .map(|x| buf[x as usize].ch)
+            .collect();
+        assert!(
+            !glyph.contains('+'),
+            "no glyph should be painted when plus is None"
+        );
     }
 
     #[test]
@@ -2769,7 +2831,10 @@ mod tests {
         let theme = crate::theme::Theme::default();
         // Manually construct a button whose x_end runs past the buffer; the
         // paint loop must clip at `cols` and not panic.
-        let pb = layout::PlusButton { x_start: cols - 1, x_end: cols + 2 };
+        let pb = layout::PlusButton {
+            x_start: cols - 1,
+            x_end: cols + 2,
+        };
         draw_tabs(&mut buf, cols, 0, "x", &[], 0, &theme, Some(&pb));
         assert_eq!(buf[(cols - 1) as usize].ch, '[');
     }
@@ -2818,7 +2883,12 @@ mod tests {
     fn draw_help_paints_box_drawing_border_with_title() {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows - 1,
+        };
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let rect = crate::help::help_rect(content, v.active_rows().len());
@@ -2828,9 +2898,7 @@ mod tests {
         assert_eq!(at(rect.x, rect.y + rect.h - 1), '└');
         assert_eq!(at(rect.x + rect.w - 1, rect.y + rect.h - 1), '┘');
         // Title present on the top border.
-        let top: String = (rect.x..rect.x + rect.w)
-            .map(|x| at(x, rect.y))
-            .collect();
+        let top: String = (rect.x..rect.x + rect.w).map(|x| at(x, rect.y)).collect();
         assert!(top.contains("Help"));
     }
 
@@ -2838,7 +2906,12 @@ mod tests {
     fn draw_help_active_tab_chip_uses_highlight_roles() {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows - 1,
+        };
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let rect = crate::help::help_rect(content, v.active_rows().len());
@@ -2856,7 +2929,12 @@ mod tests {
     fn draw_help_body_renders_keys_and_truncated_desc() {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows - 1,
+        };
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let rect = crate::help::help_rect(content, v.active_rows().len());
@@ -2874,7 +2952,12 @@ mod tests {
         let mut buf0 = vec![StyledCell::default(); cols as usize * rows as usize];
         let mut buf1 = vec![StyledCell::default(); cols as usize * rows as usize];
         // Force scrolling: a short content area so not all rows fit.
-        let content = Rect { x: 0, y: 0, w: cols, h: 12 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: 12,
+        };
         let v0 = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         let v1 = help_view_for_test(crate::help::HelpTab::Keybindings, 1);
         draw_help(&mut buf0, cols, &v0, &theme(), content);
@@ -2886,7 +2969,11 @@ mod tests {
                 .map(|x| buf[y as usize * cols as usize + x as usize].ch)
                 .collect()
         };
-        assert_ne!(first_line(&buf0), first_line(&buf1), "scroll must shift rows");
+        assert_ne!(
+            first_line(&buf0),
+            first_line(&buf1),
+            "scroll must shift rows"
+        );
     }
 
     #[test]
@@ -2894,7 +2981,12 @@ mod tests {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
         let snapshot = buf.clone();
-        let content = Rect { x: 0, y: 0, w: 80, h: 0 }; // degenerate
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 0,
+        }; // degenerate
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content); // must not panic
         assert_eq!(buf, snapshot, "no cells should change");
@@ -2904,9 +2996,14 @@ mod tests {
     fn draw_help_clamps_scroll_defensively_when_overflowing() {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: 12 }; // forces overflow
-        // scroll wildly past the end; draw_help must clamp (show the last page),
-        // not panic.
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: 12,
+        }; // forces overflow
+           // scroll wildly past the end; draw_help must clamp (show the last page),
+           // not panic.
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 99);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let text: String = buf.iter().map(|c| c.ch).collect();
@@ -2920,16 +3017,19 @@ mod tests {
     fn draw_help_never_writes_outside_resolved_rect() {
         let (cols, rows) = (80u16, 24u16);
         let mut buf = vec![StyledCell::default(); cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows - 1,
+        };
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let rect = crate::help::help_rect(content, v.active_rows().len());
         for y in 0..rows {
             for x in 0..cols {
-                let inside = x >= rect.x
-                    && x < rect.x + rect.w
-                    && y >= rect.y
-                    && y < rect.y + rect.h;
+                let inside =
+                    x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h;
                 if !inside {
                     assert_eq!(
                         buf[y as usize * cols as usize + x as usize],
@@ -2950,7 +3050,12 @@ mod tests {
             style: CellStyle::default(),
         };
         let mut buf = vec![sentinel; cols as usize * rows as usize];
-        let content = Rect { x: 0, y: 0, w: cols, h: rows - 1 };
+        let content = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows - 1,
+        };
         let v = help_view_for_test(crate::help::HelpTab::Keybindings, 0);
         draw_help(&mut buf, cols, &v, &theme(), content);
         let rect = crate::help::help_rect(content, v.active_rows().len());
@@ -2959,4 +3064,3 @@ mod tests {
         assert_eq!(corner.ch, '┌');
     }
 }
-

@@ -842,6 +842,10 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
             Intent::Kill => {
                 let _ = ev_tx.send(Event::Shutdown);
             }
+            Intent::Command => {
+                // TODO(Task 3): receive ControlCommand, apply, reply CommandReply.
+                // Placeholder: close the connection immediately.
+            }
             Intent::Attach { cols, rows } => {
                 if write_msg(
                     &mut write_half,
@@ -874,6 +878,9 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                         }
                         Ok(Some(ClientMsg::Resize { cols, rows })) => {
                             let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
+                        }
+                        Ok(Some(ClientMsg::Command(_))) => {
+                            // TODO(Task 3): forward as Event::ControlCommand.
                         }
                         Ok(None) | Err(_) => break,
                     }

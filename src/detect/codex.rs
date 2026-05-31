@@ -98,13 +98,19 @@ mod tests {
 
     #[test]
     fn working_on_interrupt_hint() {
-        assert_eq!(classify("Working (3s • esc to interrupt)"), AgentState::Working);
+        assert_eq!(
+            classify("Working (3s • esc to interrupt)"),
+            AgentState::Working
+        );
     }
 
     #[test]
     fn working_survives_key_rebind_via_to_interrupt_suffix() {
         // Interrupt key rebound away from Esc; only `to interrupt)` remains.
-        assert_eq!(classify("Working (12s • ctrl-x to interrupt)"), AgentState::Working);
+        assert_eq!(
+            classify("Working (12s • ctrl-x to interrupt)"),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -164,7 +170,10 @@ mod tests {
 
     #[test]
     fn footer_word_alone_does_not_block() {
-        assert_eq!(classify("press enter to confirm your choice"), AgentState::Idle);
+        assert_eq!(
+            classify("press enter to confirm your choice"),
+            AgentState::Idle
+        );
         assert_eq!(classify("nothing to cancel here"), AgentState::Idle);
     }
 
@@ -199,6 +208,9 @@ mod tests {
     #[test]
     fn working_survives_truncated_status_line() {
         // Narrow terminal clipped the closing paren AND the key was rebound.
-        assert_eq!(classify("Working (12s • ctrl-x to interrupt"), AgentState::Working);
+        assert_eq!(
+            classify("Working (12s • ctrl-x to interrupt"),
+            AgentState::Working
+        );
     }
 }

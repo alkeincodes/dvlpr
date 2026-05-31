@@ -523,6 +523,9 @@ mod tests {
             classify(Agent::Codex, "Would you like to run the following command?"),
             AgentState::Blocked
         );
-        assert_eq!(classify(Agent::Codex, "Ask Codex to do anything"), AgentState::Idle);
+        assert_eq!(
+            classify(Agent::Codex, "Ask Codex to do anything"),
+            AgentState::Idle
+        );
     }
 }

@@ -1680,7 +1680,11 @@ mod tests {
     #[test]
     fn plus_button_space_is_reserved_so_tabs_clip_first() {
         // Width tight enough that tabs would consume the whole row without reservation.
-        let names = vec!["alpha".to_string(), "bravo".to_string(), "charlie".to_string()];
+        let names = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
         let width = 14;
         let bar = tab_bar_layout("s", &names, 0, false, width);
         let last = bar.tabs.last().expect("at least one tab fits");
@@ -1706,12 +1710,18 @@ mod tests {
     fn plus_button_dropped_only_when_bar_too_narrow() {
         let names = vec!["x".to_string()];
         let bar = tab_bar_layout("s", &names, 0, false, 6);
-        assert!(bar.plus.is_none(), "no room for the button after the prefix");
+        assert!(
+            bar.plus.is_none(),
+            "no room for the button after the prefix"
+        );
     }
 
     #[test]
     fn plus_button_hit_true_inside_rect_false_outside() {
-        let pb = PlusButton { x_start: 15, x_end: 17 };
+        let pb = PlusButton {
+            x_start: 15,
+            x_end: 17,
+        };
         assert!(plus_button_hit(Some(&pb), 15));
         assert!(plus_button_hit(Some(&pb), 16));
         assert!(plus_button_hit(Some(&pb), 17));

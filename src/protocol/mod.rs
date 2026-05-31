@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -26,6 +26,9 @@ pub enum Intent {
     Status,
     /// Ask the daemon to shut down. The server tears down and exits.
     Kill,
+    /// One-shot control command: the server applies it, replies `CommandReply`,
+    /// and closes. No attach. (Appended last to keep discriminants stable.)
+    Command,
 }
 
 /// Reply to an `Intent::Status` request.
@@ -44,7 +47,49 @@ pub enum ServerHello {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     Input(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// A one-shot control command (see `Intent::Command`).
+    Command(ControlCommand),
+}
+
+/// Direction for a pane split, mirroring the in-session keybindings:
+/// `Right` = new pane to the right (`C-b →`), `Down` = new pane below (`C-b ↓`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitDir {
+    Right,
+    Down,
+}
+
+/// The scriptable session operations. Each maps onto an operation that already
+/// exists via keybindings/menus today. Kept separate from `config::Command`
+/// (which is `Copy` and parameterless) so string-bearing variants don't force
+/// `config::Command` to grow serde or drop `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControlCommand {
+    WindowNew {
+        name: Option<String>,
+    },
+    WindowRename(String),
+    WindowClose,
+    WindowNext,
+    WindowPrev,
+    /// 1-based, wire-compact. The server range-validates then casts to `usize`
+    /// for `config::Command::SelectWindow(usize)`.
+    WindowSelect(u8),
+    PaneSplit(SplitDir),
+    PaneClose,
+    PaneZoom,
+    SidebarToggle,
+}
+
+/// Reply to an `Intent::Command` request: sent once, then the connection closes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReply {
+    pub ok: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,8 +173,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_four() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+    fn protocol_version_is_five() {
+        assert_eq!(PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -215,5 +260,37 @@ mod tests {
         a.write_all(&len.to_be_bytes()).await.unwrap();
         let err = read_msg::<_, ClientMsg>(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn control_command_roundtrips_through_frame_codec() {
+        let cmds = vec![
+            ClientMsg::Command(ControlCommand::WindowNew {
+                name: Some("api".into()),
+            }),
+            ClientMsg::Command(ControlCommand::WindowRename("db".into())),
+            ClientMsg::Command(ControlCommand::WindowClose),
+            ClientMsg::Command(ControlCommand::WindowNext),
+            ClientMsg::Command(ControlCommand::WindowPrev),
+            ClientMsg::Command(ControlCommand::WindowSelect(3)),
+            ClientMsg::Command(ControlCommand::PaneSplit(SplitDir::Right)),
+            ClientMsg::Command(ControlCommand::PaneSplit(SplitDir::Down)),
+            ClientMsg::Command(ControlCommand::PaneClose),
+            ClientMsg::Command(ControlCommand::PaneZoom),
+            ClientMsg::Command(ControlCommand::SidebarToggle),
+        ];
+        for c in cmds {
+            let bytes = encode(&c).unwrap();
+            let back: ClientMsg = decode(&bytes).unwrap();
+            assert_eq!(c, back);
+        }
+        let reply = CommandReply {
+            ok: false,
+            message: Some("nope".into()),
+        };
+        assert_eq!(
+            reply,
+            decode::<CommandReply>(&encode(&reply).unwrap()).unwrap()
+        );
     }
 }

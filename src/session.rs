@@ -490,7 +490,10 @@ impl Session {
 
     #[cfg(test)]
     pub fn dialog_buffer_for_test(&self) -> String {
-        self.dialog.as_ref().map(|d| d.buffer.clone()).unwrap_or_default()
+        self.dialog
+            .as_ref()
+            .map(|d| d.buffer.clone())
+            .unwrap_or_default()
     }
 
     /// Open the New Window dialog. Closes any open menu (mutual exclusion).
@@ -502,7 +505,9 @@ impl Session {
     /// Open the Rename dialog for `window`, pre-filled with its current name.
     /// No-op if the index is out of range. Closes any open menu.
     pub fn open_rename_dialog(&mut self, window: usize) {
-        let Some(w) = self.windows.get(window) else { return };
+        let Some(w) = self.windows.get(window) else {
+            return;
+        };
         let name = w.name.clone();
         self.menu = None;
         self.dialog = Some(crate::dialog::WindowNameDialog::rename(window, &name));
@@ -514,7 +519,9 @@ impl Session {
     /// Closing the only window empties the session, handled by the existing
     /// empty-session shutdown path.
     pub fn close_window(&mut self, window: usize) -> Vec<PaneRuntime> {
-        let Some(win) = self.windows.get(window) else { return Vec::new() };
+        let Some(win) = self.windows.get(window) else {
+            return Vec::new();
+        };
         let pane_ids = layout::all_panes(&win.root);
         let mut closed = Vec::new();
         for id in pane_ids {
@@ -699,7 +706,10 @@ impl Session {
         } else {
             state.scroll.saturating_add(delta as u16).min(max)
         };
-        self.help = Some(crate::help::HelpState { scroll: new, ..state });
+        self.help = Some(crate::help::HelpState {
+            scroll: new,
+            ..state
+        });
     }
 
     /// Mouse dispatch when the help overlay is open. Press-only; right-button
@@ -1333,20 +1343,35 @@ impl Session {
     #[cfg(test)]
     fn tab_bar_state(&self) -> (Vec<String>, bool) {
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
-        let zoomed = self.windows.get(self.active_window).is_some_and(|w| w.zoomed);
+        let zoomed = self
+            .windows
+            .get(self.active_window)
+            .is_some_and(|w| w.zoomed);
         (names, zoomed)
     }
 
     #[cfg(test)]
     pub fn tab_regions_for_test(&self) -> Vec<layout::TabRegion> {
         let (names, zoomed) = self.tab_bar_state();
-        layout::tab_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
+        layout::tab_layout(
+            &self.session_name,
+            &names,
+            self.active_window,
+            zoomed,
+            self.cols,
+        )
     }
 
     #[cfg(test)]
     pub fn tab_bar_for_test(&self) -> layout::TabBar {
         let (names, zoomed) = self.tab_bar_state();
-        layout::tab_bar_layout(&self.session_name, &names, self.active_window, zoomed, self.cols)
+        layout::tab_bar_layout(
+            &self.session_name,
+            &names,
+            self.active_window,
+            zoomed,
+            self.cols,
+        )
     }
 
     #[cfg(test)]
@@ -2586,7 +2611,10 @@ mod tests {
     async fn new_session_defaults_to_visible_sidebar() {
         // Production default: a freshly constructed session shows the sidebar
         // when the viewport is wide enough to keep usable content width.
-        let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let (session, _pane, _rx) = Session::new(
             "test".to_string(),
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
@@ -2606,7 +2634,10 @@ mod tests {
             session.sidebar_visible,
             session.sidebar_width,
         );
-        assert!(regions.sidebar.is_some(), "sidebar region present at 80 cols");
+        assert!(
+            regions.sidebar.is_some(),
+            "sidebar region present at 80 cols"
+        );
     }
 
     #[tokio::test]
@@ -3391,7 +3422,7 @@ mod tests {
         session.feed(pane_id, b"\x1b[2J\x1b[H");
         session.refresh_agent_states(|_| Some("codex".to_string())); // streak 1
         session.refresh_agent_states(|_| Some("codex".to_string())); // streak 2 → Idle
-        // Single window → pane is focused → confirmed-idle is Idle, not Done.
+                                                                     // Single window → pane is focused → confirmed-idle is Idle, not Done.
         let pane = session.panes.get(&pane_id).expect("pane");
         assert_eq!(pane.agent_state, crate::detect::AgentState::Idle);
     }
@@ -3685,7 +3716,10 @@ mod tests {
         let mut drag = None;
         // [+] now opens the New Window dialog rather than creating immediately.
         let eff = session.handle_mouse(left_press(pb.x_start + 1, 10), &mut drag);
-        assert!(eff.spawned.is_empty(), "[+] opens the dialog, does not spawn yet");
+        assert!(
+            eff.spawned.is_empty(),
+            "[+] opens the dialog, does not spawn yet"
+        );
         assert!(session.dialog_is_open_for_test());
         assert_eq!(session.window_count(), 1);
         // Submitting the (empty) dialog creates the default window and switches.
@@ -3733,7 +3767,10 @@ mod tests {
         session.set_help_for_test(Some(crate::help::HelpState::default()));
         let frame = session.render();
         let needle = "C-b".as_bytes();
-        assert!(frame.windows(needle.len()).any(|w| w == needle), "help keybindings must render the C-b prefix");
+        assert!(
+            frame.windows(needle.len()).any(|w| w == needle),
+            "help keybindings must render the C-b prefix"
+        );
     }
 
     use crate::help::{HelpState, HelpTab};
@@ -3742,7 +3779,9 @@ mod tests {
     async fn try_consume_help_event_returns_none_when_help_closed() {
         let (mut session, _pid, _rx) = build_session_with_one_pane().await;
         assert!(session.try_consume_help_event(&pane_event(b"q")).is_none());
-        assert!(session.try_consume_help_event(&InputEvent::FocusIn).is_none());
+        assert!(session
+            .try_consume_help_event(&InputEvent::FocusIn)
+            .is_none());
     }
 
     #[tokio::test]
@@ -3788,15 +3827,24 @@ mod tests {
             let (mut session, _pid, _rx) = build_session_with_one_pane().await;
             session.set_help_for_test(Some(HelpState::default()));
             assert!(session.try_consume_help_event(&pane_event(key)).is_some());
-            assert!(!session.help_open_for_test(), "key {:?} must close help", key);
+            assert!(
+                !session.help_open_for_test(),
+                "key {:?} must close help",
+                key
+            );
         }
     }
 
     #[tokio::test]
     async fn right_left_tab_switch_active_tab_and_reset_scroll() {
         let (mut session, _pid, _rx) = build_session_with_one_pane().await;
-        session.set_help_for_test(Some(HelpState { tab: HelpTab::Keybindings, scroll: 3 }));
-        assert!(session.try_consume_help_event(&pane_event(b"\x1b[C")).is_some());
+        session.set_help_for_test(Some(HelpState {
+            tab: HelpTab::Keybindings,
+            scroll: 3,
+        }));
+        assert!(session
+            .try_consume_help_event(&pane_event(b"\x1b[C"))
+            .is_some());
         assert_eq!(session.help_tab_for_test(), Some(HelpTab::Commands));
         assert_eq!(session.help_scroll_for_test(), Some(0));
         // Tab key also switches.
@@ -3809,10 +3857,14 @@ mod tests {
         let (mut session, _pid, _rx) = build_session_with_one_pane().await;
         session.resize(80, 24); // 80x24 fits all keybinding rows, so max_scroll == 0 → Down is a no-op.
         session.set_help_for_test(Some(HelpState::default()));
-        assert!(session.try_consume_help_event(&pane_event(b"\x1b[B")).is_some());
+        assert!(session
+            .try_consume_help_event(&pane_event(b"\x1b[B"))
+            .is_some());
         assert_eq!(session.help_scroll_for_test(), Some(0));
         // Up from 0 stays at 0.
-        assert!(session.try_consume_help_event(&pane_event(b"\x1b[A")).is_some());
+        assert!(session
+            .try_consume_help_event(&pane_event(b"\x1b[A"))
+            .is_some());
         assert_eq!(session.help_scroll_for_test(), Some(0));
     }
 
@@ -3838,7 +3890,9 @@ mod tests {
     async fn focus_in_passes_through_while_help_open() {
         let (mut session, _pid, _rx) = build_session_with_one_pane().await;
         session.set_help_for_test(Some(HelpState::default()));
-        assert!(session.try_consume_help_event(&InputEvent::FocusIn).is_none());
+        assert!(session
+            .try_consume_help_event(&InputEvent::FocusIn)
+            .is_none());
     }
 
     #[tokio::test]
@@ -3906,8 +3960,14 @@ mod tests {
         let mut drag = None;
         // Left-click outside the help overlay → help path closes help; menu untouched.
         let _ = session.handle_mouse(left_press(1, 1), &mut drag);
-        assert!(!session.help_open_for_test(), "help gate must run first, closing help");
-        assert!(session.menu_open(), "menu must be untouched by the help gate");
+        assert!(
+            !session.help_open_for_test(),
+            "help gate must run first, closing help"
+        );
+        assert!(
+            session.menu_open(),
+            "menu must be untouched by the help gate"
+        );
     }
 
     #[tokio::test]
@@ -3949,7 +4009,10 @@ mod tests {
         let body_row = (rect.y + 3) + 1;
         let mut drag = None;
         let _ = session.handle_mouse(left_press(body_col, body_row), &mut drag);
-        assert!(session.help_open_for_test(), "body click must not close help");
+        assert!(
+            session.help_open_for_test(),
+            "body click must not close help"
+        );
         assert_eq!(
             session.help_tab_for_test(),
             Some(HelpTab::Keybindings),
@@ -4027,7 +4090,10 @@ mod tests {
             },
             &mut drag,
         );
-        assert!(s.dialog_is_open_for_test(), "[+] opens the New Window dialog");
+        assert!(
+            s.dialog_is_open_for_test(),
+            "[+] opens the New Window dialog"
+        );
         assert_eq!(s.window_count_for_test(), before, "no window created yet");
     }
 
@@ -4104,7 +4170,10 @@ mod tests {
             },
             &mut drag,
         );
-        assert!(matches!(s.menu_kind_for_test(), Some(MenuKind::Pane { .. })));
+        assert!(matches!(
+            s.menu_kind_for_test(),
+            Some(MenuKind::Pane { .. })
+        ));
     }
 
     #[tokio::test]
@@ -4114,8 +4183,14 @@ mod tests {
         let before = s.window_count_for_test();
         let closed = s.close_window(1);
         assert_eq!(s.window_count_for_test(), before - 1);
-        assert!(!closed.is_empty(), "closing a window returns its pane runtime(s)");
-        assert!(s.active_window_in_range_for_test(), "active_window stays valid");
+        assert!(
+            !closed.is_empty(),
+            "closing a window returns its pane runtime(s)"
+        );
+        assert!(
+            s.active_window_in_range_for_test(),
+            "active_window stays valid"
+        );
         // Tear the runtimes down properly — a bare drop runs blocking kill()/wait()
         // (see PaneRuntime::close in src/pane/mod.rs); existing tests do the same.
         for rt in closed {
@@ -4175,14 +4250,22 @@ mod tests {
         s.submit_dialog();
         assert_eq!(s.window_names_for_test()[0], "api");
         s.refresh_window_names(|_| Some("zsh".to_string()));
-        assert_eq!(s.window_names_for_test()[0], "api", "pinned, not overwritten");
+        assert_eq!(
+            s.window_names_for_test()[0],
+            "api",
+            "pinned, not overwritten"
+        );
 
         // Now open rename again, clear to empty, submit → un-pin, re-derive.
         s.open_rename_dialog(0);
         s.dialog_clear_for_test();
         s.submit_dialog();
         s.refresh_window_names(|_| Some("zsh".to_string()));
-        assert_eq!(s.window_names_for_test()[0], "zsh", "un-pinned, now auto again");
+        assert_eq!(
+            s.window_names_for_test()[0],
+            "zsh",
+            "un-pinned, now auto again"
+        );
     }
 
     #[tokio::test]
@@ -4193,7 +4276,10 @@ mod tests {
         s.open_new_window_dialog();
         for b in b"hey" {
             let consumed = s.try_consume_dialog_event(&InputEvent::Pane(vec![*b]));
-            assert!(consumed.is_some(), "dialog must consume key events while open");
+            assert!(
+                consumed.is_some(),
+                "dialog must consume key events while open"
+            );
         }
         assert_eq!(s.dialog_buffer_for_test(), "hey");
         s.try_consume_dialog_event(&InputEvent::Pane(vec![0x7f]));
@@ -4219,7 +4305,9 @@ mod tests {
     async fn dialog_event_ignored_when_closed() {
         use crate::input::InputEvent;
         let mut s = test_session();
-        assert!(s.try_consume_dialog_event(&InputEvent::Pane(vec![b'x'])).is_none());
+        assert!(s
+            .try_consume_dialog_event(&InputEvent::Pane(vec![b'x']))
+            .is_none());
     }
 
     #[tokio::test]
@@ -4232,8 +4320,15 @@ mod tests {
         }
         let consumed = s.try_consume_dialog_event(&InputEvent::Pane(b"\x1b[A".to_vec()));
         assert!(consumed.is_some(), "the dialog still swallows the event");
-        assert_eq!(s.dialog_buffer_for_test(), "ab", "arrow keys do not edit the name");
-        assert!(s.dialog_is_open_for_test(), "an arrow key does not close the dialog");
+        assert_eq!(
+            s.dialog_buffer_for_test(),
+            "ab",
+            "arrow keys do not edit the name"
+        );
+        assert!(
+            s.dialog_is_open_for_test(),
+            "an arrow key does not close the dialog"
+        );
     }
 
     #[tokio::test]
@@ -4242,7 +4337,11 @@ mod tests {
         let before = s.window_count_for_test();
         let _eff = s.apply_command(Command::OpenNewWindowDialog);
         assert!(s.dialog_is_open_for_test());
-        assert_eq!(s.window_count_for_test(), before, "no window yet — dialog only");
+        assert_eq!(
+            s.window_count_for_test(),
+            before,
+            "no window yet — dialog only"
+        );
     }
 
     #[tokio::test]
@@ -4250,6 +4349,10 @@ mod tests {
         let mut s = test_session();
         let before = s.window_count_for_test();
         let _eff = s.apply_command(Command::NewWindow);
-        assert_eq!(s.window_count_for_test(), before + 1, "NewWindow stays a direct create");
+        assert_eq!(
+            s.window_count_for_test(),
+            before + 1,
+            "NewWindow stays a direct create"
+        );
     }
 }
