@@ -283,6 +283,10 @@ daemon.
 # Prefix key. Must be C-<lowercase letter>, e.g. "C-a", "C-b", "C-q".
 prefix = "C-b"
 
+# Scrollback history lines per pane. Default: 2000. Set to 0 to disable
+# copy mode scrolling entirely.
+scrollback = 2000
+
 # Color theme. One of: "one-dark" (default), "macchiato",
 # "frappe", "latte", "mocha".
 [theme]
@@ -309,6 +313,7 @@ next-window = "n"
 prev-window = "p"
 detach = "d"
 toggle-sidebar = "s"
+copy-mode = "["            # prefix + this key enters copy mode
 ```
 
 ### Restoring the pre-v0.2.0 `Ctrl-A` prefix
@@ -399,6 +404,77 @@ the `bindkey` lines above are not strictly needed in a Ghostty session.
   dialog), **Close**.
 - Click the `[+]` button just after the last tab to open the New Window
   dialog (same as `prefix c`).
+
+---
+
+## Copy mode
+
+Copy mode lets you scroll into a pane's scrollback history, select text, and
+yank it to the clipboard.
+
+### Entering and exiting
+
+| Key | Action |
+|-----|--------|
+| `prefix [` | Enter copy mode (freezes the focused pane, cursor at bottom) |
+| `q` or `Esc` | Exit copy mode (returns to the live pane bottom) |
+
+### Navigation
+
+| Key | Action |
+|-----|--------|
+| `h` / `←` | Move cursor left |
+| `l` / `→` | Move cursor right |
+| `k` / `↑` | Move cursor up one row |
+| `j` / `↓` | Move cursor down one row |
+| `0` / `Home` | Move to beginning of line |
+| `$` / `End` | Move to end of line |
+| `w` | Move forward one word |
+| `b` | Move backward one word |
+| `g` | Jump to the top of scrollback |
+| `G` | Jump to the live bottom |
+| `C-u` | Scroll up half a page |
+| `C-d` | Scroll down half a page |
+| `C-b` / `PageUp` | Scroll up one full page |
+| `C-f` / `PageDown` | Scroll down one full page |
+
+### Selecting and yanking
+
+| Key | Action |
+|-----|--------|
+| `v` | Toggle character-wise selection (anchors at the current cursor) |
+| `y` or `Enter` | Yank the selection to the clipboard via OSC 52; exits copy mode |
+| Mouse drag | Draw a selection; release keeps it live (yank with `y`) |
+
+The bottom row of the pane shows `[copy] <offset>/<scrollback>` while copy
+mode is active.
+
+### Configuration
+
+```toml
+# Number of scrollback rows retained per pane. Default: 2000.
+# Set to 0 to disable copy mode scrolling entirely.
+scrollback = 2000
+
+[keys]
+# Key to enter copy mode after the prefix. Default: "[".
+copy-mode = "["
+```
+
+### OSC 52 clipboard support
+
+dvlpr delivers the yanked text to your **host terminal** as an
+[OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands)
+clipboard-write sequence. Whether the paste actually reaches your system
+clipboard depends on your host terminal's settings:
+
+- **iTerm2** — enable *Edit > Preferences > General > Applications in terminal
+  may access clipboard*.
+- **Ghostty** — OSC 52 writes are permitted by default.
+- **Warp** — OSC 52 clipboard writes are not reliably supported in v1; use a
+  different terminal or copy text manually.
+- **tmux / dvlpr nesting** — the outer multiplexer must pass through OSC 52;
+  dvlpr does not add a local-clipboard fallback in v1.
 
 ---
 
