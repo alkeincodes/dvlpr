@@ -237,10 +237,6 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut clients: HashMap<ClientId, ClientState> = HashMap::new();
     let mut dirty = false;
     let mut foreground: Option<ClientId> = None;
-    // Set to true when a control command empties the session; prevents the tick arm
-    // from calling session.compose() on an empty session (which would panic on the
-    // windows index) while waiting for the client task to send Event::Shutdown.
-    let mut shutting_down = false;
     let mut activity_seq: u64 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(16)); // ~60fps cap
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
@@ -352,9 +348,6 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         // Event::Shutdown once the write completes), so a command that closes
                         // the last pane still delivers its `ok` reply instead of racing exit.
                         let shutdown_after = session.is_empty();
-                        if shutdown_after {
-                            shutting_down = true;
-                        }
                         let _ = reply.send((result, shutdown_after));
                     }
                     Event::Shutdown => break "killed".to_string(),
@@ -385,7 +378,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         &ev_tx, &mut dirty, id, events,
                     );
                 }
-                if dirty && !clients.is_empty() && !shutting_down {
+                // Skip compose when the session is empty — a control command may have
+                // closed the last pane and the daemon is mid-shutdown; rendering zero
+                // windows is both pointless and a panic risk (compose indexes
+                // self.windows[self.active_window] unconditionally).
+                if dirty && !clients.is_empty() && !session.is_empty() {
                     let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
                     for st in clients.values() {
                         let _ = st.grid_tx.send(snapshot.clone());

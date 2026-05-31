@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use dvlpr::protocol::{
-    read_msg, write_msg, ClientHello, ControlCommand, Intent, SplitDir, StatusInfo,
-    PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ControlCommand, Intent, ServerHello, ServerMsg, SplitDir,
+    StatusInfo, PROTOCOL_VERSION,
 };
 use dvlpr::server::{run, socket, ServerConfig};
 
@@ -176,6 +176,18 @@ async fn closing_last_pane_still_returns_ok_reply() {
 // Test 4: Sending a command to a socket with no daemon bound returns a clean error.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Test 5: Closing the last pane with an interactive client attached shuts down
+// cleanly — no panic from compose() indexing an empty windows vec.
+//
+// Regression guard: with deferred shutdown, the main loop returns to
+// tokio::select! after the control command. Between the control reply and
+// Event::Shutdown a tick can fire. The tick arm used to call session.compose()
+// unconditionally (guarded only by `dirty && !clients.is_empty()`), which panics
+// via `self.windows[self.active_window]` when windows is empty. The fix guards
+// with `!session.is_empty()` so the tick arm is skipped during mid-shutdown.
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 async fn command_to_missing_session_errors_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -193,5 +205,96 @@ async fn command_to_missing_session_errors_cleanly() {
         ),
         "expected NotFound or ConnectionRefused, got {:?}",
         err.kind()
+    );
+}
+
+#[tokio::test]
+async fn closing_last_pane_with_attached_client_shuts_down_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    let path = spawn_session(dir, "attached-close");
+    wait_for_socket(&path).await;
+
+    // Step 1: Open an interactive attach connection. This puts the daemon into
+    // its "attached client" code path — the tick arm will see !clients.is_empty()
+    // and attempt to compose+broadcast on every dirty tick.
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (mut attach_r, mut attach_w) = stream.into_split();
+    write_msg(
+        &mut attach_w,
+        &ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Attach { cols: 80, rows: 24 },
+        },
+    )
+    .await
+    .unwrap();
+
+    // Handshake: expect ServerHello::Ok.
+    let hello: ServerHello = read_msg(&mut attach_r).await.unwrap().unwrap();
+    assert!(
+        matches!(hello, ServerHello::Ok { .. }),
+        "expected ServerHello::Ok, got {hello:?}"
+    );
+
+    // Step 2: Drain frames from the attach connection in a background task.
+    // We collect the final message (Closed or EOF) to confirm a clean shutdown.
+    // A panic in the daemon's main loop would abort the session thread, causing
+    // the connection to drop abruptly — the reader task would also end, which we
+    // detect via the channel below.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_closed = false;
+        while let Ok(Ok(Some(msg))) =
+            tokio::time::timeout_at(deadline, read_msg::<_, ServerMsg>(&mut attach_r)).await
+        {
+            if matches!(msg, ServerMsg::Closed { .. } | ServerMsg::Detach) {
+                saw_closed = true;
+                break;
+            }
+        }
+        // Either a clean Closed/Detach or connection EOF (both acceptable for
+        // shutdown; panics would also cause EOF but the PaneClose reply below
+        // would not arrive — that's our primary correctness signal).
+        let _ = done_tx.send(saw_closed);
+    });
+
+    // Step 3: Wait until the daemon sees the attached client (Status.clients >= 1).
+    // This ensures the tick arm can actually fire with !clients.is_empty() before
+    // we close the pane.
+    for _ in 0..50 {
+        let s = status(&path).await;
+        if s.clients >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Step 4: Close the last pane via a control command. This empties the session
+    // and triggers deferred shutdown. In the vulnerable window (between this reply
+    // and Event::Shutdown), a tick that fires compose() on an empty session would
+    // panic — the !session.is_empty() guard prevents that.
+    let reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose)
+        .await
+        .expect("reply must arrive before the daemon exits");
+    assert!(
+        reply.ok,
+        "PaneClose should ack ok=true even with an attached client; got {reply:?}"
+    );
+
+    // Step 5: The attached reader task must end cleanly within 5 s. If the daemon
+    // panicked, the JoinHandle would complete but the PaneClose reply above would
+    // not have arrived — so reaching here already proves no pre-reply panic. The
+    // timeout here guards against the daemon hanging instead of shutting down.
+    let saw_closed = tokio::time::timeout(Duration::from_secs(5), async {
+        done_rx.await.unwrap_or(false)
+    })
+    .await
+    .expect("attached client reader should complete within 5 s after PaneClose");
+
+    assert!(
+        saw_closed,
+        "attached client should receive ServerMsg::Closed or ServerMsg::Detach before connection drops"
     );
 }
