@@ -12,8 +12,8 @@ use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::protocol::{
-    read_msg, write_msg, ClientHello, ClientMsg, Intent, ServerHello, ServerMsg, StatusInfo,
-    PROTOCOL_VERSION,
+    read_msg, write_msg, ClientHello, ClientMsg, CommandReply, ControlCommand, Intent, ServerHello,
+    ServerMsg, StatusInfo, PROTOCOL_VERSION,
 };
 
 /// Enables raw mode on construction, restores cooked mode on drop (including on a
@@ -179,6 +179,31 @@ pub async fn send_kill(socket_path: &Path) -> io::Result<()> {
         },
     )
     .await
+}
+
+/// Send a single control command to a running session and return its reply.
+/// Connection failure (no daemon) surfaces as the underlying `io::Error`; a
+/// clean EOF before a reply means the daemon predates the control protocol.
+pub async fn send_command(socket_path: &Path, cmd: ControlCommand) -> io::Result<CommandReply> {
+    let stream = UnixStream::connect(socket_path).await?;
+    let (mut read_half, mut write_half) = stream.into_split();
+    write_msg(
+        &mut write_half,
+        &ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Command,
+        },
+    )
+    .await?;
+    write_msg(&mut write_half, &ClientMsg::Command(cmd)).await?;
+    read_msg::<_, CommandReply>(&mut read_half)
+        .await?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "session predates the control CLI; restart it (dvlpr kill -t <name>, then reattach)",
+            )
+        })
 }
 
 async fn run_loop(
