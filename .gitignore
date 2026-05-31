@@ -9,3 +9,6 @@
 # Local Claude Code worktrees (per-session, never committed). Skills under
 # `.claude/skills/` ARE tracked — they are project-level tooling.
 /.claude/worktrees/
+
+# Internal design docs (AI/workflow scratch) — not for the public repo
+docs/superpowers/
