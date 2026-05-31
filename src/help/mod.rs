@@ -347,11 +347,10 @@ mod tests {
     }
 
     #[test]
-    fn build_view_includes_implicit_zoom_sidebar_select_rows() {
+    fn build_view_includes_implicit_zoom_and_select_rows() {
         let cfg = Config::default();
         let v = build_view(&HelpState::default(), cfg.prefix, &cfg.keys);
         assert!(v.keybindings.iter().any(|r| r.keys == "C-b 0"));
-        assert!(v.keybindings.iter().any(|r| r.keys == "C-b s"));
         assert!(v.keybindings.iter().any(|r| r.keys == "C-b 1-9"));
     }
 
@@ -545,7 +544,8 @@ mod tests {
     }
 
     #[test]
-    fn build_view_renders_custom_toggle_sidebar_chord() {
+    fn build_view_renders_custom_toggle_sidebar_binding() {
+        // Custom binding overrides the default.
         let keys = KeyMap {
             toggle_sidebar: KeySpec::Char('v'),
             ..KeyMap::default()
@@ -557,6 +557,16 @@ mod tests {
             .find(|r| r.desc.contains("agent-awareness sidebar"))
             .expect("toggle-sidebar row present");
         assert_eq!(toggle.keys, "C-b v");
+
+        // Default keymap must render sidebar toggle as "C-b s".
+        let default_v =
+            build_view(&HelpState::default(), KeySpec::Ctrl('b'), &KeyMap::default());
+        let default_toggle = default_v
+            .keybindings
+            .iter()
+            .find(|r| r.desc.contains("agent-awareness sidebar"))
+            .expect("toggle-sidebar row present in default keymap");
+        assert_eq!(default_toggle.keys, "C-b s");
     }
 
     #[test]
