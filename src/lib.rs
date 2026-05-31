@@ -2,6 +2,7 @@ pub mod agent_meta;
 pub mod client;
 pub mod compositor;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod detect;
 pub mod dialog;
