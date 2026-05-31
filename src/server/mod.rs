@@ -308,9 +308,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                                 // Commit a standalone Escape whose deadline already
                                 // passed BEFORE interpreting the new bytes.
                                 if matches!(st.escape_deadline, Some(dl) if dl <= now) {
-                                    evs.extend(st.parser.flush_escape_timeout());
+                                    evs.extend(st.parser.flush_escape_timeout(false));
                                 }
-                                evs.extend(st.parser.feed(&keymap, &bytes));
+                                evs.extend(st.parser.feed(&keymap, &bytes, false));
                                 st.escape_deadline = st
                                     .parser
                                     .pending_escape()
@@ -385,7 +385,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     let events = match clients.get_mut(&id) {
                         Some(st) => {
                             st.escape_deadline = None;
-                            st.parser.flush_escape_timeout()
+                            st.parser.flush_escape_timeout(false)
                         }
                         None => Vec::new(),
                     };
@@ -806,6 +806,10 @@ fn apply_events(
                 // no other side effect. DO NOT add `session.input(b"\x1b[I")` here
                 // — that would write focus bytes into the pane PTY, the exact
                 // leak the parser intercept is fixing.
+            }
+            InputEvent::CopyKey(_) => {
+                // Real copy-mode routing lands in Task 11. For now this arm
+                // exists only to keep the exhaustive match compiling.
             }
         }
         *dirty = true;

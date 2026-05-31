@@ -656,7 +656,7 @@ impl Session {
         use crate::input::InputEvent;
         self.menu.as_ref()?;
         match ev {
-            InputEvent::Mouse(_) | InputEvent::FocusIn => None,
+            InputEvent::Mouse(_) | InputEvent::FocusIn | InputEvent::CopyKey(_) => None,
             InputEvent::Command(_) => Some(CommandEffect::default()),
             InputEvent::Pane(bytes) => match bytes.as_slice() {
                 b"\x1b" => {
@@ -992,6 +992,7 @@ impl Session {
             InputEvent::Mouse(_) | InputEvent::FocusIn | InputEvent::Command(_) => {
                 Some(CommandEffect::default())
             }
+            InputEvent::CopyKey(_) => None,
             InputEvent::Pane(bytes) => match bytes.as_slice() {
                 b"\x1b" => {
                     self.cancel_dialog();
@@ -1049,7 +1050,7 @@ impl Session {
         use crate::input::InputEvent;
         self.help.as_ref()?;
         match ev {
-            InputEvent::Mouse(_) | InputEvent::FocusIn => None,
+            InputEvent::Mouse(_) | InputEvent::FocusIn | InputEvent::CopyKey(_) => None,
             InputEvent::Command(crate::config::Command::ShowHelp) => None,
             InputEvent::Command(_) => Some(CommandEffect::default()),
             InputEvent::Pane(bytes) => {

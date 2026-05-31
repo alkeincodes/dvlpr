@@ -59,6 +59,9 @@ pub enum InputEvent {
     /// identity. FocusOut is intentionally not represented; the parser
     /// consumes the corresponding `ESC [ O` sequence and emits nothing.
     FocusIn,
+    /// A decoded key while copy mode is active. Routed to the session's
+    /// copy-mode handler; never reaches the pane PTY or the prefix keymap.
+    CopyKey(crate::copymode::CopyKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,10 +103,17 @@ impl InputParser {
     }
 
     /// Decode a chunk of raw client bytes into events.
-    pub fn feed(&mut self, config: &Config, bytes: &[u8]) -> Vec<InputEvent> {
+    ///
+    /// When `copy_mode` is `true`, the parser does NOT arm the prefix and does NOT
+    /// accumulate pane bytes — control bytes → `CopyKey::Ctrl`, printable bytes →
+    /// `CopyKey::Char`, and CSI sequences decode to navigation `CopyKey`s. When
+    /// `copy_mode` is `false`, parsing is byte-identical to the pre-copy-mode
+    /// behaviour (the regression test `normal_mode_prefix_still_arms_when_copy_mode_inactive_regression`
+    /// pins this).
+    pub fn feed(&mut self, config: &Config, bytes: &[u8], copy_mode: bool) -> Vec<InputEvent> {
         let mut out = Vec::new();
         for &b in bytes {
-            self.step(config, b, &mut out);
+            self.step(config, b, copy_mode, &mut out);
         }
         // Flush any accumulated Ground-mode bytes at the end of the feed.
         self.flush_ground(&mut out);
@@ -121,13 +131,19 @@ impl InputParser {
 
     /// The ESCDELAY timer fired with no continuation. In normal mode (`NEsc`) flush
     /// the lone `ESC` to the pane as a standalone Escape; in command mode (`AEsc`)
-    /// cancel the pending prefix. Resets to ground. Only ever called while
+    /// cancel the pending prefix. In copy mode (`copy_mode == true`), a pending lone
+    /// ESC becomes `InputEvent::CopyKey(CopyKey::Ctrl(0x1b))` (Exit) instead of
+    /// leaking to the pane. Resets to ground. Only ever called while
     /// `pending_escape()` holds, so committed sequences are untouched.
-    pub fn flush_escape_timeout(&mut self) -> Vec<InputEvent> {
+    pub fn flush_escape_timeout(&mut self, copy_mode: bool) -> Vec<InputEvent> {
         let mut out = Vec::new();
         match self.state {
             State::NEsc => {
-                if !self.pending.is_empty() {
+                if copy_mode {
+                    // In copy mode a standalone ESC exits; never leak it to the pane.
+                    out.push(InputEvent::CopyKey(crate::copymode::CopyKey::Ctrl(0x1b)));
+                    self.pending.clear();
+                } else if !self.pending.is_empty() {
                     out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
                 }
             }
@@ -147,10 +163,27 @@ impl InputParser {
         }
     }
 
-    fn step(&mut self, config: &Config, b: u8, out: &mut Vec<InputEvent>) {
+    fn step(&mut self, config: &Config, b: u8, copy_mode: bool, out: &mut Vec<InputEvent>) {
         match self.state {
             State::Ground => {
-                if config.prefix.matches(&Key::Char(b)) {
+                if copy_mode {
+                    // In copy mode: never arm the prefix, never accumulate pane bytes.
+                    // Control bytes → CopyKey::Ctrl; ESC → enter NEsc for CSI decoding;
+                    // printable bytes → CopyKey::Char.
+                    self.flush_ground(out);
+                    if b == ESC {
+                        // May begin a CSI (arrows / PageUp / Home/End). Buffer and
+                        // let the NEsc/NCsi machinery decode it, but in copy mode
+                        // the terminal final bytes resolve to CopyKey (see below).
+                        self.pending.clear();
+                        self.pending.push(ESC);
+                        self.state = State::NEsc;
+                    } else if b < 0x20 {
+                        out.push(InputEvent::CopyKey(crate::copymode::CopyKey::Ctrl(b)));
+                    } else {
+                        out.push(InputEvent::CopyKey(crate::copymode::CopyKey::Char(b)));
+                    }
+                } else if config.prefix.matches(&Key::Char(b)) {
                     self.flush_ground(out);
                     self.state = State::Armed;
                 } else if b == ESC {
@@ -167,17 +200,27 @@ impl InputParser {
                 if b == b'[' {
                     self.pending.push(b);
                     self.state = State::NCsi;
+                } else if copy_mode {
+                    // In copy mode, a lone ESC not followed by '[' is an Exit key.
+                    // Emit the CopyKey for the standalone ESC, reset to Ground, and
+                    // reprocess this byte normally.
+                    out.push(InputEvent::CopyKey(crate::copymode::CopyKey::Char(0x1b)));
+                    self.pending.clear();
+                    self.state = State::Ground;
+                    self.step(config, b, copy_mode, out);
                 } else {
                     // ESC was standalone or began a non-mouse sequence: flush the
                     // buffered ESC to the pane, then reprocess this byte in ground.
                     out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
                     self.state = State::Ground;
-                    self.step(config, b, out);
+                    self.step(config, b, copy_mode, out);
                 }
             }
             State::NCsi => {
                 // The SGR mouse introducer is `ESC [ <`; `<` counts only as the
                 // first byte after `[` (pending is exactly `[ESC, '[']`, len 2).
+                // This branch is mode-agnostic: copy-mode mouse drags (ESC[<…M/m)
+                // must still reach NMouse → InputEvent::Mouse.
                 if b == b'<' && self.pending.len() == 2 {
                     self.pending.push(b);
                     self.state = State::NMouse;
@@ -186,8 +229,7 @@ impl InputParser {
                     // `ESC [ O` (FocusOut), zero parameter bytes. Intercept
                     // — do NOT push the final byte and do NOT forward to the
                     // pane. A parameterized CSI with `I`/`O` terminator
-                    // (pending.len() > 2) is unaffected and falls through to
-                    // the pane below.
+                    // (pending.len() > 2) is unaffected and falls through below.
                     self.pending.clear();
                     self.state = State::Ground;
                     if b == b'I' {
@@ -196,12 +238,19 @@ impl InputParser {
                     // FocusOut emits nothing.
                 } else {
                     self.pending.push(b);
-                    // A CSI final byte (0x40..=0x7e) ends the sequence; forward the
-                    // whole thing (params/intermediates included) to the pane
-                    // unchanged. Bound the buffer so a sequence that never
-                    // terminates can't grow without limit.
+                    // A CSI final byte (0x40..=0x7e) ends the sequence.
                     if (0x40..=0x7e).contains(&b) || self.pending.len() >= MAX_CSI_SEQ {
-                        out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
+                        if copy_mode {
+                            // In copy mode: map to a CopyKey; never push pane bytes.
+                            if let Some(ck) = csi_to_copykey(&self.pending) {
+                                out.push(InputEvent::CopyKey(ck));
+                            }
+                            // Unmapped CSI sequences are silently dropped in copy mode.
+                        } else {
+                            // Normal mode: forward the whole sequence to the pane unchanged.
+                            out.push(InputEvent::Pane(std::mem::take(&mut self.pending)));
+                        }
+                        self.pending.clear();
                         self.state = State::Ground;
                     }
                 }
@@ -223,7 +272,7 @@ impl InputParser {
                     // from ground — a stray byte after a corrupt prefix is not lost.
                     self.pending.clear();
                     self.state = State::Ground;
-                    self.step(config, b, out);
+                    self.step(config, b, copy_mode, out);
                 }
             }
             State::Armed => {
@@ -246,7 +295,7 @@ impl InputParser {
                     // process this byte normally.
                     self.pending.clear();
                     self.state = State::Ground;
-                    self.step(config, b, out);
+                    self.step(config, b, copy_mode, out);
                 }
             }
             State::ACsi => {
@@ -296,6 +345,31 @@ impl InputParser {
                 }
             }
         }
+    }
+}
+
+/// Map a buffered CSI (`pending` = ESC [ … final) to a copy-mode key. Returns
+/// `None` for sequences copy mode does not bind.
+fn csi_to_copykey(pending: &[u8]) -> Option<crate::copymode::CopyKey> {
+    use crate::copymode::CopyKey;
+    let final_byte = *pending.last()?;
+    // params are between "ESC [" (2 bytes) and the final byte
+    let params = pending.get(2..pending.len().saturating_sub(1))?;
+    match final_byte {
+        b'A' => Some(CopyKey::Up),
+        b'B' => Some(CopyKey::Down),
+        b'C' => Some(CopyKey::Right),
+        b'D' => Some(CopyKey::Left),
+        b'H' => Some(CopyKey::Home),
+        b'F' => Some(CopyKey::End),
+        b'~' => match params {
+            b"5" => Some(CopyKey::PageUp),
+            b"6" => Some(CopyKey::PageDown),
+            b"1" | b"7" => Some(CopyKey::Home),
+            b"4" | b"8" => Some(CopyKey::End),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -364,7 +438,7 @@ mod tests {
     fn parse_all(bytes: &[u8]) -> Vec<InputEvent> {
         let cfg = Config::default();
         let mut p = InputParser::new();
-        p.feed(&cfg, bytes)
+        p.feed(&cfg, bytes, false)
     }
 
     #[test]
@@ -475,10 +549,10 @@ mod tests {
     fn fragmented_prefix_arrow_across_feeds() {
         let cfg = Config::default();
         let mut p = InputParser::new();
-        assert_eq!(p.feed(&cfg, &[0x02, 0x1b]), vec![]); // Ctrl-b ESC, waiting
-        assert_eq!(p.feed(&cfg, b"["), vec![]); // CSI, waiting
+        assert_eq!(p.feed(&cfg, &[0x02, 0x1b], false), vec![]); // Ctrl-b ESC, waiting
+        assert_eq!(p.feed(&cfg, b"[", false), vec![]); // CSI, waiting
         assert_eq!(
-            p.feed(&cfg, b"B"),
+            p.feed(&cfg, b"B", false),
             vec![InputEvent::Command(Command::SplitHorizontal)]
         );
     }
@@ -487,10 +561,10 @@ mod tests {
     fn lone_trailing_escape_is_pending_then_flushes_to_pane() {
         let cfg = Config::default();
         let mut p = InputParser::new();
-        assert_eq!(p.feed(&cfg, &[0x1b]), vec![]); // ESC alone, buffered
+        assert_eq!(p.feed(&cfg, &[0x1b], false), vec![]); // ESC alone, buffered
         assert!(p.pending_escape());
         // Timer fires: standalone Escape goes to the pane.
-        assert_eq!(p.flush_escape_timeout(), vec![InputEvent::Pane(vec![0x1b])]);
+        assert_eq!(p.flush_escape_timeout(false), vec![InputEvent::Pane(vec![0x1b])]);
         assert!(!p.pending_escape());
     }
 
@@ -537,12 +611,12 @@ mod tests {
     fn fragmented_mouse_across_feeds() {
         let cfg = Config::default();
         let mut p = InputParser::new();
-        assert_eq!(p.feed(&cfg, b"\x1b[<0;5"), vec![]); // partial, buffered
+        assert_eq!(p.feed(&cfg, b"\x1b[<0;5", false), vec![]); // partial, buffered
                                                         // A committed mouse sequence is NOT pending_escape: it waits for completion
                                                         // without a timer, so a fragmented report is never flushed to the pane.
         assert!(!p.pending_escape());
         assert_eq!(
-            p.feed(&cfg, b";7M"),
+            p.feed(&cfg, b";7M", false),
             vec![InputEvent::Mouse(MouseEvent {
                 button: 0,
                 col: 5,
@@ -583,7 +657,7 @@ mod tests {
         let cfg = Config::default();
         let mut p = InputParser::new();
         assert_eq!(
-            p.feed(&cfg, b"\x1b[<0;5Z"),
+            p.feed(&cfg, b"\x1b[<0;5Z", false),
             vec![InputEvent::Pane(vec![b'Z'])]
         );
         assert!(!p.pending_escape());
@@ -776,5 +850,70 @@ mod tests {
         let events = parse_all(b"\x1b[<35;10;5M");
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], InputEvent::Mouse(_)));
+    }
+
+    // ── Copy-mode tests ──────────────────────────────────────────────────────
+
+    fn parse_copy(bytes: &[u8]) -> Vec<InputEvent> {
+        let cfg = Config::default();
+        let mut p = InputParser::new();
+        p.feed(&cfg, bytes, /*copy_mode*/ true)
+    }
+
+    #[test]
+    fn copy_mode_ctrl_b_does_not_arm_prefix_and_surfaces_as_copykey() {
+        use crate::copymode::CopyKey;
+        assert_eq!(parse_copy(&[0x02]), vec![InputEvent::CopyKey(CopyKey::Ctrl(0x02))]);
+    }
+
+    #[test]
+    fn copy_mode_plain_char_is_a_copykey_not_pane_bytes() {
+        use crate::copymode::CopyKey;
+        assert_eq!(parse_copy(b"j"), vec![InputEvent::CopyKey(CopyKey::Char(b'j'))]);
+    }
+
+    #[test]
+    fn copy_mode_arrow_and_pageup_decode() {
+        use crate::copymode::CopyKey;
+        assert_eq!(parse_copy(b"\x1b[A"), vec![InputEvent::CopyKey(CopyKey::Up)]);
+        assert_eq!(parse_copy(b"\x1b[5~"), vec![InputEvent::CopyKey(CopyKey::PageUp)]);
+        assert_eq!(parse_copy(b"\x1b[6~"), vec![InputEvent::CopyKey(CopyKey::PageDown)]);
+        assert_eq!(parse_copy(b"\x1b[H"), vec![InputEvent::CopyKey(CopyKey::Home)]);
+        assert_eq!(parse_copy(b"\x1b[F"), vec![InputEvent::CopyKey(CopyKey::End)]);
+    }
+
+    #[test]
+    fn normal_mode_prefix_still_arms_when_copy_mode_inactive_regression() {
+        // copy_mode = false: the existing prefix behavior is byte-identical.
+        let cfg = Config::default();
+        let mut p = InputParser::new();
+        assert_eq!(
+            p.feed(&cfg, &[0x02, b'x'], false),
+            vec![InputEvent::Command(crate::config::Command::ClosePane)]
+        );
+    }
+
+    #[test]
+    fn copy_mode_lone_esc_at_chunk_end_flushes_as_exit_not_pane() {
+        use crate::copymode::CopyKey;
+        let cfg = Config::default();
+        let mut p = InputParser::new();
+        // ESC as the final byte: parser parks in NEsc, emitting nothing yet.
+        assert!(p.feed(&cfg, b"\x1b", true).is_empty());
+        // The timer fires: in copy mode this must be an Exit CopyKey, NOT Pane(ESC).
+        assert_eq!(p.flush_escape_timeout(true), vec![InputEvent::CopyKey(CopyKey::Ctrl(0x1b))]);
+    }
+
+    #[test]
+    fn copy_mode_sgr_mouse_still_reaches_nmouse() {
+        // SGR mouse drags in copy mode (ESC[<…M/m) must still decode as Mouse events,
+        // not be eaten or mapped to CopyKey — so the copy-mode mouse-drag handler
+        // (Task 12) can receive them.
+        let evs = parse_copy(b"\x1b[<0;3;2M");
+        assert_eq!(evs.len(), 1, "expected exactly one event, got {evs:?}");
+        assert!(
+            matches!(evs[0], InputEvent::Mouse(_)),
+            "expected Mouse event, got {evs:?}"
+        );
     }
 }
