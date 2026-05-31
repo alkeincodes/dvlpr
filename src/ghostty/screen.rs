@@ -121,11 +121,13 @@ impl GhosttyScreen {
         if x >= self.cols || y >= self.rows {
             return ' ';
         }
-        // SAFETY: an ACTIVE-screen point at (x, y); `gref.size` set per the API's
+        // SAFETY: a VIEWPORT point at (x, y); `gref.size` set per the API's
         // sized-struct contract; all out-params are valid; errors fall back to space.
+        // With the viewport at the live bottom (default, unscrolled), this is
+        // identical to an ACTIVE read; when scrolled, this reads scrollback history.
         unsafe {
             let point = sys::GhosttyPoint {
-                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
                 value: sys::GhosttyPointValue {
                     coordinate: sys::GhosttyPointCoordinate { x, y: y as u32 },
                 },
@@ -154,6 +156,44 @@ impl GhosttyScreen {
         }
     }
 
+    /// Read the codepoint at active-area row `y` (0-based, top of the LIVE
+    /// active screen), independent of any scrollback scroll position. Used by
+    /// `tail_text` so agent-state classification never reads scrolled history.
+    fn active_cell(&self, x: u16, y: u16) -> char {
+        if x >= self.cols || y >= self.rows {
+            return ' ';
+        }
+        // SAFETY: an ACTIVE-screen point always refers to the live active area
+        // regardless of viewport scroll; same sized-GridRef contract as `cell`.
+        unsafe {
+            let point = sys::GhosttyPoint {
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+                value: sys::GhosttyPointValue {
+                    coordinate: sys::GhosttyPointCoordinate { x, y: y as u32 },
+                },
+            };
+            let mut gref: sys::GhosttyGridRef = mem::zeroed();
+            gref.size = mem::size_of::<sys::GhosttyGridRef>();
+            if sys::ghostty_terminal_grid_ref(self.term, point, &mut gref) != 0 {
+                return ' ';
+            }
+            let mut cell: sys::GhosttyCell = 0;
+            if sys::ghostty_grid_ref_cell(&gref, &mut cell) != 0 {
+                return ' ';
+            }
+            let mut cp: u32 = 0;
+            if sys::ghostty_cell_get(
+                cell,
+                sys::GhosttyCellData_GHOSTTY_CELL_DATA_CODEPOINT,
+                (&raw mut cp).cast(),
+            ) != 0
+            {
+                return ' ';
+            }
+            char::from_u32(cp).filter(|c| !c.is_control()).unwrap_or(' ')
+        }
+    }
+
     /// Return the last `rows` rows of the screen as a single flat string
     /// with `'\n'` row separators. Plain text only — styling is dropped.
     /// Returns an empty string if `rows == 0`. If `rows` exceeds the
@@ -172,7 +212,7 @@ impl GhosttyScreen {
         for y in start_y..self.rows {
             let mut line = String::with_capacity(self.cols as usize);
             for x in 0..self.cols {
-                line.push(self.cell(x, y));
+                line.push(self.active_cell(x, y));
             }
             // Strip trailing whitespace per row.
             while line.ends_with(' ') {
@@ -194,11 +234,13 @@ impl GhosttyScreen {
         if x >= self.cols || y >= self.rows {
             return (' ', CellStyle::default());
         }
-        // SAFETY: same ACTIVE-screen point + sized GhosttyGridRef contract as `cell`;
+        // SAFETY: same VIEWPORT point + sized GhosttyGridRef contract as `cell`;
         // all out-params are valid; every error path falls back to a default cell.
+        // VIEWPORT follows the scroll position so the compositor renders scrollback
+        // correctly; at the unscrolled bottom, VIEWPORT == ACTIVE.
         unsafe {
             let point = sys::GhosttyPoint {
-                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_ACTIVE,
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_VIEWPORT,
                 value: sys::GhosttyPointValue {
                     coordinate: sys::GhosttyPointCoordinate { x, y: y as u32 },
                 },
@@ -276,6 +318,48 @@ impl GhosttyScreen {
             );
         }
         n
+    }
+
+    /// Scroll the viewport to the live bottom (active area). Idempotent.
+    pub fn scroll_viewport_bottom(&mut self) {
+        // SAFETY: `term` is valid; BOTTOM ignores the value union.
+        unsafe {
+            sys::ghostty_terminal_scroll_viewport(
+                self.term,
+                sys::GhosttyTerminalScrollViewport {
+                    tag: sys::GhosttyTerminalScrollViewportTag_GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+                    value: sys::GhosttyTerminalScrollViewportValue { delta: 0 },
+                },
+            );
+        }
+    }
+
+    /// Scroll the viewport to the top of scrollback.
+    pub fn scroll_viewport_top(&mut self) {
+        // SAFETY: `term` is valid; TOP ignores the value union.
+        unsafe {
+            sys::ghostty_terminal_scroll_viewport(
+                self.term,
+                sys::GhosttyTerminalScrollViewport {
+                    tag: sys::GhosttyTerminalScrollViewportTag_GHOSTTY_SCROLL_VIEWPORT_TOP,
+                    value: sys::GhosttyTerminalScrollViewportValue { delta: 0 },
+                },
+            );
+        }
+    }
+
+    /// Scroll the viewport by `delta` rows (negative = up into history).
+    pub fn scroll_viewport_delta(&mut self, delta: isize) {
+        // SAFETY: `term` is valid; DELTA reads `value.delta`.
+        unsafe {
+            sys::ghostty_terminal_scroll_viewport(
+                self.term,
+                sys::GhosttyTerminalScrollViewport {
+                    tag: sys::GhosttyTerminalScrollViewportTag_GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                    value: sys::GhosttyTerminalScrollViewportValue { delta },
+                },
+            );
+        }
     }
 
     pub fn cursor(&self) -> (u16, u16) {
@@ -621,6 +705,47 @@ mod tests {
         // OSC 2 ; window-title BEL — sets only the window title.
         s.feed(b"\x1b]2;window-title\x07");
         assert_eq!(s.title().as_deref(), Some("window-title"));
+    }
+
+    #[test]
+    fn viewport_and_active_reads_match_at_bottom() {
+        // Parity: with the viewport at the bottom (not scrolled), VIEWPORT reads
+        // are identical to the historical ACTIVE reads.
+        let mut s = GhosttyScreen::new(10, 3, 100);
+        s.feed(b"ab\r\ncd\r\nef");
+        assert_eq!(s.cell(0, 0), 'a');
+        assert_eq!(s.cell(1, 0), 'b');
+        assert_eq!(s.cell(0, 2), 'e');
+    }
+
+    #[test]
+    fn scroll_up_then_styled_cell_reads_scrolled_content() {
+        let mut s = GhosttyScreen::new(10, 2, 100);
+        for i in 0..10 {
+            s.feed(format!("row{i:02}\r\n").as_bytes());
+        }
+        // Live bottom shows the last rows; scroll up by 5 and the viewport top row
+        // should now read scrolled-back content (not the live bottom).
+        s.scroll_viewport_delta(-5);
+        let top: String = (0..s.cols()).map(|x| s.cell(x, 0)).collect();
+        assert!(top.trim_end().starts_with("row"), "viewport top after scroll: {top:?}");
+        s.scroll_viewport_bottom();
+        let bottom_top: String = (0..s.cols()).map(|x| s.cell(x, 0)).collect();
+        assert_ne!(top, bottom_top, "scrolling must change what the viewport top shows");
+    }
+
+    #[test]
+    fn tail_text_classifies_against_live_bottom_even_when_scrolled() {
+        // Collateral guard: agent-state classification must read the LIVE screen
+        // bottom, not the scrolled viewport.
+        let mut s = GhosttyScreen::new(10, 2, 100);
+        for i in 0..10 {
+            s.feed(format!("r{i}\r\n").as_bytes());
+        }
+        s.feed(b"LIVE9");        // last line at the live bottom
+        s.scroll_viewport_delta(-8); // scroll far up into history
+        let tail = s.tail_text(2);
+        assert!(tail.contains("LIVE9"), "tail must read live bottom, got {tail:?}");
     }
 
     #[test]
