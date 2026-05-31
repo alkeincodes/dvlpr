@@ -160,6 +160,30 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
+/// Build the per-pane spawn argv for a resume. `None` → empty (default shell).
+/// The shell path is passed as argv[0] AND the trailing `$0` positional, and the
+/// `-c` string re-execs it via `exec "$0"` — no shell-path interpolation, no
+/// reliance on a `SHELL` env var. The id is assumed already UUID-validated by
+/// `persist::plan_restore` (non-agent panes arrive as `None`).
+fn restore_command(agent: &crate::persist::AgentResume, shell: &str) -> Vec<String> {
+    let verb = match agent {
+        crate::persist::AgentResume::None => return Vec::new(),
+        crate::persist::AgentResume::Claude { session_id, .. } => {
+            format!("claude --resume {session_id}")
+        }
+        crate::persist::AgentResume::Codex { session_id, .. } => {
+            format!("codex resume {session_id}")
+        }
+    };
+    vec![
+        shell.to_string(),
+        "-i".into(),
+        "-c".into(),
+        format!("{verb}; exec \"$0\""),
+        shell.to_string(),
+    ]
+}
+
 /// Outcome of `Session::refresh_agent_states`. Tracks whether anything
 /// changed (gates redraws) and which pane(s) just transitioned into
 /// `Blocked` (drives the sound trigger in `server::run`).
@@ -263,6 +287,41 @@ impl Session {
                 meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
                 meta_err_seen: std::collections::HashSet::new(),
                 cwd: None,
+                agent_resume: crate::persist::AgentResume::None,
+                captured_for_pid: None,
+            },
+        );
+        Ok((id, rx))
+    }
+
+    /// Like `spawn_pane`, but with an explicit cwd + command (empty = default shell).
+    fn spawn_pane_with(
+        &mut self,
+        rect: Rect,
+        cwd: &str,
+        command: &[String],
+    ) -> io::Result<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
+        let w = rect.w.max(1);
+        let h = rect.h.max(1);
+        let (runtime, rx) = PaneRuntime::spawn(command, cwd, w, h, &self.session_name)?;
+        let screen = GhosttyScreen::new(w, h);
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        self.panes.insert(
+            id,
+            Pane {
+                runtime,
+                screen,
+                agent_id_pid: None,
+                agent: None,
+                agent_state: detect::AgentState::Idle,
+                idle_streak: 0,
+                session_label: None,
+                branch: None,
+                meta_last_refresh: std::time::Instant::now()
+                    - std::time::Duration::from_secs(60),
+                meta_err_seen: std::collections::HashSet::new(),
+                cwd: Some(cwd.to_string()),
                 agent_resume: crate::persist::AgentResume::None,
                 captured_for_pid: None,
             },
@@ -4597,5 +4656,38 @@ mod tests {
             crate::persist::AgentResume::None,
             "non-agent pane must have its stale agent_resume cleared"
         );
+    }
+
+    #[test]
+    fn resume_argv_uses_positional_dollar_zero_and_validated_uuid() {
+        let shell = "/bin/zsh";
+        let claude = restore_command(
+            &crate::persist::AgentResume::Claude {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: "/t.jsonl".into(),
+            },
+            shell,
+        );
+        assert_eq!(
+            claude,
+            vec![
+                "/bin/zsh".to_string(),
+                "-i".into(),
+                "-c".into(),
+                "claude --resume 11111111-2222-3333-4444-555555555555; exec \"$0\"".into(),
+                "/bin/zsh".into(),
+            ]
+        );
+        // Codex verb.
+        let codex = restore_command(
+            &crate::persist::AgentResume::Codex {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: "/t.jsonl".into(),
+            },
+            shell,
+        );
+        assert!(codex[3].starts_with("codex resume 11111111-"));
+        // None → empty (default shell).
+        assert!(restore_command(&crate::persist::AgentResume::None, shell).is_empty());
     }
 }
