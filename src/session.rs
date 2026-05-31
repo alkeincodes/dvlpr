@@ -1418,6 +1418,78 @@ impl Session {
         self.copy_mode.as_ref().map(|cm| cm.pane)
     }
 
+    /// Apply a decoded copy-mode key. Returns a `CopyEffect` (OSC 52 bytes on yank).
+    pub fn handle_copy_mode_key(&mut self, key: crate::copymode::CopyKey) -> CopyEffect {
+        use crate::copymode::{resolve_copy_key, CopyAction};
+        let Some(mut cm) = self.copy_mode.take() else {
+            return CopyEffect::default();
+        };
+        let Some(pane) = self.panes.get_mut(&cm.pane) else {
+            return CopyEffect::default(); // pane vanished; stay exited
+        };
+        let cols = pane.screen.cols();
+        let rows = pane.screen.rows();
+        let total = pane.screen.total_rows();
+        let scrollback = pane.screen.scrollback_rows();
+        let half = (rows / 2).max(1);
+
+        match resolve_copy_key(&key) {
+            CopyAction::Exit => {
+                pane.screen.scroll_viewport_bottom();
+                // cm dropped (not put back) → exited
+                return CopyEffect::default();
+            }
+            CopyAction::Yank => {
+                let emit = cm.selection.map(|sel| {
+                    let (a, b) = sel.normalized();
+                    let text = pane.screen.selection_text(a.x, a.y, b.x, b.y);
+                    osc52(&text)
+                });
+                pane.screen.scroll_viewport_bottom();
+                // exited
+                return CopyEffect { emit };
+            }
+            CopyAction::ToggleSelect => {
+                let here = crate::copymode::unproject(
+                    cm.cursor.0,
+                    cm.cursor.1,
+                    cm.scroll_offset,
+                    rows,
+                    total,
+                );
+                cm.toggle_select(here);
+            }
+            CopyAction::Move(m) => {
+                apply_motion(&mut cm, m, cols, rows, half, scrollback, total, &mut pane.screen);
+                // If a selection is active, extend its head to the new cursor.
+                if cm.selection.is_some() {
+                    let here = crate::copymode::unproject(
+                        cm.cursor.0,
+                        cm.cursor.1,
+                        cm.scroll_offset,
+                        rows,
+                        total,
+                    );
+                    cm.set_head(here);
+                }
+            }
+            CopyAction::None => {}
+        }
+        cm.clamp_to_screen(total, cols);
+        self.copy_mode = Some(cm);
+        CopyEffect::default()
+    }
+
+    #[cfg(test)]
+    pub fn copy_mode_cursor_for_test(&self) -> Option<(u16, u16)> {
+        self.copy_mode.as_ref().map(|cm| cm.cursor)
+    }
+
+    #[cfg(test)]
+    pub fn copy_mode_has_selection_for_test(&self) -> bool {
+        self.copy_mode.as_ref().is_some_and(|cm| cm.selection.is_some())
+    }
+
     fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
         let wi = self.active_window;
         let Some(win) = self.windows.get(wi) else {
@@ -2387,6 +2459,149 @@ impl Session {
     }
 }
 
+/// Apply a movement to the copy-mode cursor, scrolling the pane's viewport when
+/// the cursor crosses the top/bottom edge. `cols`/`rows` are the pane viewport
+/// size; `half` is the half-page step; `scrollback`/`total` bound how far up we
+/// can scroll. Cursor coords are viewport-relative; vertical movement past an
+/// edge converts to a viewport scroll and adjusts `scroll_offset` (rows up from
+/// the live bottom; 0 = bottom).
+#[allow(clippy::too_many_arguments)]
+fn apply_motion(
+    cm: &mut crate::copymode::CopyModeState,
+    m: crate::copymode::Motion,
+    cols: u16,
+    rows: u16,
+    half: u16,
+    scrollback: usize,
+    total: usize,
+    screen: &mut GhosttyScreen,
+) {
+    use crate::copymode::Motion;
+    let last_col = cols.saturating_sub(1);
+    let last_row = rows.saturating_sub(1);
+    // Max rows we can scroll up: bounded by both configured scrollback and what
+    // history actually exists (total - viewport rows).
+    let max_offset = scrollback.min(total.saturating_sub(rows as usize));
+    // Scroll up into history by up to `n` rows; bumps `off` by what actually moved.
+    let scroll_up = |screen: &mut GhosttyScreen, off: &mut usize, n: usize| {
+        let n = n.min(max_offset.saturating_sub(*off));
+        if n > 0 {
+            screen.scroll_viewport_delta(-(n as isize));
+            *off += n;
+        }
+    };
+    // Scroll back down toward the live bottom by up to `n` rows.
+    let scroll_down = |screen: &mut GhosttyScreen, off: &mut usize, n: usize| {
+        let n = n.min(*off);
+        if n > 0 {
+            screen.scroll_viewport_delta(n as isize);
+            *off -= n;
+        }
+    };
+    match m {
+        Motion::Left => cm.cursor.0 = cm.cursor.0.saturating_sub(1),
+        Motion::Right => cm.cursor.0 = (cm.cursor.0 + 1).min(last_col),
+        Motion::Up => {
+            if cm.cursor.1 > 0 {
+                cm.cursor.1 -= 1;
+            } else {
+                scroll_up(screen, &mut cm.scroll_offset, 1);
+            }
+        }
+        Motion::Down => {
+            if cm.cursor.1 < last_row {
+                cm.cursor.1 += 1;
+            } else {
+                scroll_down(screen, &mut cm.scroll_offset, 1);
+            }
+        }
+        Motion::LineStart => cm.cursor.0 = 0,
+        Motion::LineEnd => {
+            // Last non-space cell on the cursor's row, else column 0.
+            let row = cm.cursor.1;
+            let mut end = 0u16;
+            for x in 0..cols {
+                if screen.cell(x, row) != ' ' {
+                    end = x;
+                }
+            }
+            cm.cursor.0 = end;
+        }
+        Motion::WordFwd => {
+            // Advance past the current word (non-spaces), then over spaces to the
+            // next word start, staying within the row.
+            let row = cm.cursor.1;
+            let mut x = cm.cursor.0;
+            while x < last_col && screen.cell(x, row) != ' ' {
+                x += 1;
+            }
+            while x < last_col && screen.cell(x, row) == ' ' {
+                x += 1;
+            }
+            cm.cursor.0 = x;
+        }
+        Motion::WordBack => {
+            // Step back over spaces, then to the start of the previous word.
+            let row = cm.cursor.1;
+            let mut x = cm.cursor.0;
+            while x > 0 && screen.cell(x - 1, row) == ' ' {
+                x -= 1;
+            }
+            while x > 0 && screen.cell(x - 1, row) != ' ' {
+                x -= 1;
+            }
+            cm.cursor.0 = x;
+        }
+        Motion::Top => {
+            screen.scroll_viewport_top();
+            cm.scroll_offset = max_offset;
+            cm.cursor.1 = 0;
+        }
+        Motion::Bottom => {
+            screen.scroll_viewport_bottom();
+            cm.scroll_offset = 0;
+            cm.cursor.1 = last_row;
+        }
+        Motion::HalfPageUp => scroll_up(screen, &mut cm.scroll_offset, half as usize),
+        Motion::HalfPageDown => scroll_down(screen, &mut cm.scroll_offset, half as usize),
+        Motion::PageUp => scroll_up(screen, &mut cm.scroll_offset, rows as usize),
+        Motion::PageDown => scroll_down(screen, &mut cm.scroll_offset, rows as usize),
+    }
+}
+
+/// Build an OSC 52 clipboard-write sequence for `text`: ESC ] 52 ; c ; <b64> ESC \.
+fn osc52(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2 + 16);
+    out.extend_from_slice(b"\x1b]52;c;");
+    base64_encode_into(text.as_bytes(), &mut out);
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
+/// Minimal standard-alphabet base64 (no crate dependency).
+fn base64_encode_into(input: &[u8], out: &mut Vec<u8>) {
+    const T: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize]);
+        out.push(T[((n >> 12) & 63) as usize]);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize]
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize]
+        } else {
+            b'='
+        });
+    }
+}
+
 /// Pure decision function: does the closed-menu right-click branch open
 /// a pane menu for this hit? Returns `Some(pane_id)` only for
 /// `Hit::Pane(_)`; every other hit (Tab, Divider, SidebarEntry,
@@ -2531,6 +2746,140 @@ mod tests {
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
         let _ = session.pane_exited(pane);
         assert!(!session.copy_mode_active());
+    }
+
+    // --- Task 9: handle_copy_mode_key, apply_motion, osc52 ---
+
+    /// Build a session and immediately feed `bytes` into the focused pane's screen.
+    async fn test_session_feeding(
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+        bytes: &[u8],
+    ) -> (
+        Session,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::pane::PaneOutput>,
+    ) {
+        let (mut session, pane_id, rx) = copy_test_session(cols, rows, scrollback).await;
+        session.feed(pane_id, bytes);
+        (session, pane_id, rx)
+    }
+
+    #[tokio::test]
+    async fn copy_mode_j_k_move_cursor_within_viewport() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let before = session.copy_mode_cursor_for_test().unwrap();
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'k'));
+        let after = session.copy_mode_cursor_for_test().unwrap();
+        assert!(after.1 <= before.1, "k moves up (or pins at top)");
+    }
+
+    #[tokio::test]
+    async fn copy_mode_v_then_motion_extends_selection() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'v'));
+        assert!(session.copy_mode_has_selection_for_test());
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'l'));
+        assert!(session.copy_mode_has_selection_for_test());
+    }
+
+    #[tokio::test]
+    async fn copy_mode_y_yanks_and_exits_with_osc52_bytes() {
+        let (mut session, pane, mut _rx) =
+            test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'v'));
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'$'));
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'y'));
+        assert!(!session.copy_mode_active(), "y exits copy mode");
+        let bytes = eff.emit.expect("yank must produce OSC 52 bytes");
+        assert!(
+            bytes.starts_with(b"\x1b]52;c;"),
+            "OSC 52 prefix, got {bytes:?}"
+        );
+        assert!(bytes.ends_with(b"\x1b\\"), "ST terminator");
+        let _ = pane;
+    }
+
+    #[tokio::test]
+    async fn copy_mode_q_exits_without_emitting() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'q'));
+        assert!(!session.copy_mode_active());
+        assert!(eff.emit.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_mode_up_at_top_row_scrolls_viewport() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        // Feed enough lines to build scrollback.
+        let pane_id = session.copy_mode_pane().unwrap_or(
+            session
+                .panes
+                .keys()
+                .copied()
+                .next()
+                .expect("at least one pane"),
+        );
+        for i in 0..20u8 {
+            session.feed(pane_id, format!("line{i}\r\n").as_bytes());
+        }
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Force cursor to top row.
+        {
+            let cm = session.copy_mode.as_mut().unwrap();
+            cm.cursor.1 = 0;
+        }
+        let offset_before = session.copy_mode.as_ref().unwrap().scroll_offset;
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'k'));
+        let offset_after = session.copy_mode.as_ref().unwrap().scroll_offset;
+        assert!(
+            offset_after >= offset_before,
+            "k at row 0 must scroll up (or be at scrollback limit)"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_mode_down_at_bottom_with_no_offset_is_noop() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Put cursor at last row with scroll_offset = 0 (live bottom).
+        {
+            let cm = session.copy_mode.as_mut().unwrap();
+            cm.cursor.1 = 4; // last_row = rows-1 = 4
+            cm.scroll_offset = 0;
+        }
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'j'));
+        let cm = session.copy_mode.as_ref().unwrap();
+        assert_eq!(cm.scroll_offset, 0, "j at live bottom must not change offset");
+        assert_eq!(cm.cursor.1, 4, "cursor stays at last row");
+    }
+
+    #[test]
+    fn base64_encode_into_hi() {
+        let mut out = Vec::new();
+        super::base64_encode_into(b"hi", &mut out);
+        assert_eq!(&out, b"aGk=");
+    }
+
+    #[test]
+    fn base64_encode_into_man() {
+        let mut out = Vec::new();
+        super::base64_encode_into(b"Man", &mut out);
+        assert_eq!(&out, b"TWFu");
+    }
+
+    #[test]
+    fn osc52_structure() {
+        let result = super::osc52("hi");
+        assert!(result.starts_with(b"\x1b]52;c;"));
+        assert!(result.ends_with(b"\x1b\\"));
+        // The base64 of "hi" is "aGk="
+        assert!(result.windows(4).any(|w| w == b"aGk="));
     }
 
     #[tokio::test]
