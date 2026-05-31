@@ -45,6 +45,9 @@ async fn main() {
             let code = dvlpr::update::run();
             std::process::exit(code);
         }
+        Cmd::Control(args) => {
+            std::process::exit(dvlpr::control::run(&args).await);
+        }
         Cmd::Usage(msg) => {
             eprintln!("{msg}");
             std::process::exit(2);
@@ -89,6 +92,9 @@ enum Cmd {
     Version,
     /// `dvlpr update` — fetch the latest GH release and replace this binary.
     Update,
+    /// `dvlpr <window|pane|sidebar> …` or `dvlpr @name …` — a control command.
+    /// The raw args (after the binary name) are parsed by `control::run`.
+    Control(Vec<String>),
     /// A usage error to print on stderr (exit 2)
     Usage(String),
 }
@@ -117,6 +123,14 @@ fn parse_args(args: &[String]) -> Cmd {
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
         return Cmd::Version;
+    }
+    // Control CLI: `window|pane|sidebar …` or a leading `@name`. These nouns are
+    // reserved (so `dvlpr window` no longer means "attach session 'window'").
+    // Placed after the help/version checks so `dvlpr window --help` still shows help.
+    if let Some(first) = args.first() {
+        if matches!(first.as_str(), "window" | "pane" | "sidebar") || first.starts_with('@') {
+            return Cmd::Control(args.to_vec());
+        }
     }
     match args.first().map(String::as_str) {
         None => Cmd::Run {
@@ -540,5 +554,36 @@ mod tests {
         ));
         // `-h` after `update` still routes to Help (Help check runs first).
         assert_eq!(parse_args(&v(&["update", "-h"])), Cmd::Help);
+    }
+
+    #[test]
+    fn routes_control_nouns_and_at_prefix() {
+        assert_eq!(
+            parse_args(&v(&["window", "new"])),
+            Cmd::Control(v(&["window", "new"]))
+        );
+        assert_eq!(
+            parse_args(&v(&["pane", "split", "right"])),
+            Cmd::Control(v(&["pane", "split", "right"]))
+        );
+        assert_eq!(
+            parse_args(&v(&["sidebar", "toggle"])),
+            Cmd::Control(v(&["sidebar", "toggle"]))
+        );
+        assert_eq!(
+            parse_args(&v(&["@work", "window", "new"])),
+            Cmd::Control(v(&["@work", "window", "new"]))
+        );
+    }
+
+    #[test]
+    fn control_noun_with_help_flag_routes_to_help() {
+        assert_eq!(parse_args(&v(&["window", "--help"])), Cmd::Help);
+    }
+
+    #[test]
+    fn control_is_allowed_inside_a_session() {
+        let c = Cmd::Control(v(&["pane", "zoom"]));
+        assert_eq!(nested_block(&c, Some("parent")), None);
     }
 }
