@@ -370,6 +370,12 @@ impl GhosttyScreen {
     /// `y` is measured from the top of the full screen (scrollback + active),
     /// matching the `SCREEN` point tag.
     pub fn selection_text(&self, start_x: u16, start_y: usize, end_x: u16, end_y: usize) -> String {
+        // SCREEN-point y is a u32 in the C ABI; a usize row index above u32::MAX is
+        // out of range (the documented empty-string result) rather than a silent
+        // truncation to a wrong wrapped row.
+        let (Ok(start_y), Ok(end_y)) = (u32::try_from(start_y), u32::try_from(end_y)) else {
+            return String::new();
+        };
         // SAFETY: all FFI below uses sized structs (size set), SCREEN-tag points,
         // and the documented buffer-size query protocol; every error path returns
         // an empty string.
@@ -379,7 +385,7 @@ impl GhosttyScreen {
             let start_point = sys::GhosttyPoint {
                 tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
                 value: sys::GhosttyPointValue {
-                    coordinate: sys::GhosttyPointCoordinate { x: start_x, y: start_y as u32 },
+                    coordinate: sys::GhosttyPointCoordinate { x: start_x, y: start_y },
                 },
             };
             if sys::ghostty_terminal_grid_ref(self.term, start_point, &mut start_ref) != 0 {
@@ -390,7 +396,7 @@ impl GhosttyScreen {
             let end_point = sys::GhosttyPoint {
                 tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
                 value: sys::GhosttyPointValue {
-                    coordinate: sys::GhosttyPointCoordinate { x: end_x, y: end_y as u32 },
+                    coordinate: sys::GhosttyPointCoordinate { x: end_x, y: end_y },
                 },
             };
             if sys::ghostty_terminal_grid_ref(self.term, end_point, &mut end_ref) != 0 {
