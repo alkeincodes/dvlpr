@@ -184,7 +184,7 @@ impl Compositor {
 
         // Sidebar (if visible).
         if let Some(sb) = regions.sidebar {
-            draw_sidebar(&mut buf, cols, sb, theme, agent_entries);
+            draw_sidebar(&mut buf, cols, sb, theme, agent_entries, "");
         }
 
         // Menu overlay — painted last so it covers panes / dividers / tabs /
@@ -662,6 +662,12 @@ fn draw_tabs(
     }
 }
 
+/// Minimum sidebar height (rows) needed to spare its bottom row for the
+/// toggle-hint footer. Below this the footer is omitted: rows 0/1 are the
+/// header + divider and the first content row is row 3, so the footer row
+/// (rect.h - 1) must be >= 4, i.e. rect.h >= 5.
+const SIDEBAR_FOOTER_MIN_H: u16 = 5;
+
 /// Fill the sidebar region with the AGENTS header, a separator, and
 /// two rows per agent entry:
 ///   row a: " <icon> <session-label>"
@@ -673,6 +679,7 @@ fn draw_sidebar(
     rect: crate::layout::Rect,
     theme: &crate::theme::Theme,
     entries: &[crate::session::AgentEntry],
+    toggle_hint: &str,
 ) {
     if rect.h < 3 {
         return;
@@ -732,6 +739,11 @@ fn draw_sidebar(
             ch: '├',
             style: sep_style,
         };
+    }
+
+    if !toggle_hint.is_empty() && rect.h >= SIDEBAR_FOOTER_MIN_H {
+        let faint_style = CellStyle { faint: true, ..CellStyle::default() };
+        write_cell(buf, rect.y + rect.h - 1, rect.x + 1, toggle_hint, faint_style);
     }
 
     if entries.is_empty() {
@@ -2014,7 +2026,7 @@ mod tests {
         };
         let theme = crate::theme::Theme::default();
         let entries: Vec<crate::session::AgentEntry> = vec![];
-        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "");
         let row0: String = (0..cols).map(|x| buf[x as usize].ch).collect();
         assert!(row0.contains("AGENTS"), "row0: {row0:?}");
     }
@@ -2029,7 +2041,7 @@ mod tests {
         // Place the sidebar at a non-zero x so we exercise rect.x, not col 0.
         let rect = layout::Rect { x: 4, y: 0, w: 16, h: rows };
         let theme = crate::theme::Theme::default();
-        draw_sidebar(&mut buf, cols, rect, &theme, &[]);
+        draw_sidebar(&mut buf, cols, rect, &theme, &[], "");
         let sep_row0 = buf[(0 * cols as usize) + rect.x as usize].ch;
         let junction = buf[(1 * cols as usize) + rect.x as usize].ch;
         let after_junction = buf[(1 * cols as usize) + (rect.x as usize) + 1].ch;
@@ -2059,7 +2071,7 @@ mod tests {
             session_label: None,
             branch: None,
         }];
-        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "");
         // Icon is now on row 3 (header + divider + blank), at column rect.x + 2.
         let icon_idx = (3 * cols as usize) + 2;
         assert_eq!(buf[icon_idx].ch, '●');
@@ -2089,8 +2101,8 @@ mod tests {
             session_label: None,
             branch: None,
         }];
-        draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries);
-        draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries);
+        draw_sidebar(&mut buf_latte, cols, rect, &latte, &entries, "");
+        draw_sidebar(&mut buf_mocha, cols, rect, &mocha, &entries, "");
         // Icon is now on row 3, at column rect.x + 2.
         let icon_idx = (3 * cols as usize) + 2;
         assert_ne!(buf_latte[icon_idx].style.fg, buf_mocha[icon_idx].style.fg);
@@ -2112,7 +2124,7 @@ mod tests {
             session_label: None,
             branch: None,
         }];
-        draw_sidebar(&mut buf, cols, rect, &theme, &entries);
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "");
         let icon_idx = (3 * cols as usize) + 2;
         assert_eq!(buf[icon_idx].ch, '✓');
         assert_eq!(buf[icon_idx].style.fg, theme.agent_done_fg);
@@ -2130,7 +2142,7 @@ mod tests {
             h: rows,
         };
         let theme = crate::theme::Theme::default();
-        draw_sidebar(&mut buf, cols, rect, &theme, &[]);
+        draw_sidebar(&mut buf, cols, rect, &theme, &[], "");
         // Empty placeholder is now "(no agents)" centered at row 3.
         let row3: String = (0..cols)
             .map(|x| buf[(3 * cols as usize) + x as usize].ch)
@@ -2161,7 +2173,7 @@ mod tests {
             h: 12,
         };
         let mut buf = vec![StyledCell::default(); 26 * 12];
-        draw_sidebar(&mut buf, 26, rect, &theme, &entries);
+        draw_sidebar(&mut buf, 26, rect, &theme, &entries, "");
 
         // Row a contains the session label (after header + divider + blank).
         let row_a = row_text(&buf, 26, 3);
@@ -2170,6 +2182,112 @@ mod tests {
         let row_b = row_text(&buf, 26, 4);
         assert!(row_b.contains("W1"), "row b = {row_b:?}");
         assert!(row_b.contains("main"), "row b = {row_b:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_renders_faint_footer_on_bottom_row() {
+        let cols: u16 = 20;
+        let rows: u16 = 8;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
+        let last = rows - 1;
+        let footer: String = (0..cols)
+            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
+            .collect();
+        assert!(footer.contains("C-b s: hide"), "footer row: {footer:?}");
+        let idx = (last as usize) * (cols as usize) + 1; // first hint col (rect.x + 1)
+        assert!(buf[idx].style.faint, "footer must be faint");
+    }
+
+    #[test]
+    fn draw_sidebar_omits_footer_when_too_short() {
+        let cols: u16 = 20;
+        let rows: u16 = 4; // < SIDEBAR_FOOTER_MIN_H (5)
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
+        let last = rows - 1;
+        let footer: String = (0..cols)
+            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
+            .collect();
+        assert!(!footer.contains("hide"), "no footer when too short: {footer:?}");
+    }
+
+    #[test]
+    fn draw_sidebar_omits_footer_when_hint_empty() {
+        let cols: u16 = 20;
+        let rows: u16 = 8;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "");
+        let last = rows - 1;
+        let footer: String = (0..cols)
+            .map(|x| buf[(last as usize) * (cols as usize) + x as usize].ch)
+            .collect();
+        // The vertical separator '│' on rect.x is always present; only the hint
+        // text must be absent on an empty hint.
+        assert_eq!(
+            footer.trim_matches(|c| c == '│' || c == ' '),
+            "",
+            "empty hint draws no footer: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn draw_sidebar_footer_coexists_with_entries() {
+        // h = 12 => max_entries = (12-3)/3 = 3; entries occupy rows 3/4, 6/7, 9/10;
+        // footer goes on row 11. The footer must not clobber the last entry (row 10).
+        let cols: u16 = 26;
+        let rows: u16 = 12;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let mk = |label: &str, branch: &str| crate::session::AgentEntry {
+            session_name: "ses".to_string(),
+            window_index: 0,
+            pane_id: 0,
+            agent: crate::detect::Agent::Claude,
+            state: crate::detect::AgentState::Working,
+            session_label: Some(label.to_string()),
+            branch: Some(branch.to_string()),
+        };
+        let entries = vec![mk("one", "b1"), mk("two", "b2"), mk("three", "b3")];
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, "C-b s: hide");
+        let row_text = |y: u16| -> String {
+            (0..cols)
+                .map(|x| buf[(y as usize) * (cols as usize) + x as usize].ch)
+                .collect()
+        };
+        assert!(row_text(9).contains("three"), "row9: {:?}", row_text(9));
+        assert!(row_text(11).contains("C-b s: hide"), "row11: {:?}", row_text(11));
+    }
+
+    #[test]
+    fn draw_sidebar_footer_is_clipped_to_width() {
+        let cols: u16 = 20;
+        let rows: u16 = 8;
+        let mut buf = vec![StyledCell::default(); (cols as usize) * (rows as usize)];
+        let rect = layout::Rect { x: 0, y: 0, w: cols, h: rows };
+        let theme = crate::theme::Theme::default();
+        let entries: Vec<crate::session::AgentEntry> = vec![];
+        let long = "C-b s: hide ".repeat(8); // far wider than 20 cols
+        draw_sidebar(&mut buf, cols, rect, &theme, &entries, &long);
+        let last = (rows - 1) as usize;
+        let footer: String = (0..cols)
+            .map(|x| buf[last * (cols as usize) + x as usize].ch)
+            .collect();
+        assert!(footer.contains("C-b s"), "clipped footer still starts the hint");
+        let above: String = (0..cols)
+            .map(|x| buf[(last - 1) * (cols as usize) + x as usize].ch)
+            .collect();
+        assert!(!above.contains("hide"), "hint did not bleed onto the row above");
     }
 
     #[test]
@@ -2191,7 +2309,7 @@ mod tests {
             h: 12,
         };
         let mut buf = vec![StyledCell::default(); 18 * 12];
-        draw_sidebar(&mut buf, 18, rect, &theme, &entries);
+        draw_sidebar(&mut buf, 18, rect, &theme, &entries, "");
 
         let row_a = row_text(&buf, 18, 3);
         assert!(row_a.contains('…'), "row a = {row_a:?}");
@@ -2217,7 +2335,7 @@ mod tests {
             h: 12,
         };
         let mut buf = vec![StyledCell::default(); 26 * 12];
-        draw_sidebar(&mut buf, 26, rect, &theme, &entries);
+        draw_sidebar(&mut buf, 26, rect, &theme, &entries, "");
 
         let row_b = row_text(&buf, 26, 4);
         assert!(row_b.contains("<no git>"), "row b = {row_b:?}");
