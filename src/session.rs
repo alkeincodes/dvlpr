@@ -311,6 +311,56 @@ impl Session {
         self.snapshot_dirty = true;
     }
 
+    /// Build a persistable snapshot of the current layout + per-pane restore identity.
+    pub fn snapshot(&self) -> crate::persist::SessionSnapshot {
+        use crate::persist::*;
+        let windows = self
+            .windows
+            .iter()
+            .map(|w| {
+                let order = layout::all_panes(&w.root);
+                let focused_leaf = order.iter().position(|p| *p == w.focused).unwrap_or(0);
+                WindowSnapshot {
+                    name: w.name.clone(),
+                    name_pinned: w.name_pinned,
+                    zoomed: w.zoomed,
+                    focused_leaf,
+                    layout: self.node_snapshot(&w.root),
+                }
+            })
+            .collect();
+        SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: self.session_name.clone(),
+            sidebar_visible: self.sidebar_visible,
+            sidebar_width: self.sidebar_width,
+            active_window: self.active_window,
+            windows,
+        }
+    }
+
+    fn node_snapshot(&self, node: &layout::Node) -> crate::persist::NodeSnapshot {
+        use crate::persist::*;
+        match node {
+            layout::Node::Leaf(id) => {
+                let pane = self.panes.get(id);
+                NodeSnapshot::Leaf(PaneSnapshot {
+                    cwd: pane.and_then(|p| p.cwd.clone()).unwrap_or_else(|| self.cwd.clone()),
+                    agent: pane.map(|p| p.agent_resume.clone()).unwrap_or(AgentResume::None),
+                })
+            }
+            layout::Node::Split { dir, ratio, first, second } => NodeSnapshot::Split {
+                dir: match dir {
+                    layout::SplitDir::Horizontal => SplitDirSnap::Horizontal,
+                    layout::SplitDir::Vertical => SplitDirSnap::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(self.node_snapshot(first)),
+                second: Box::new(self.node_snapshot(second)),
+            },
+        }
+    }
+
 
     /// Post-parser keyboard intercept. Returns `true` if the event was
     /// consumed (caller skips its normal dispatch). Returns `None` when the
@@ -4333,5 +4383,26 @@ mod tests {
         let mut eff = CommandEffect::default();
         s.split_focused(layout::SplitDir::Vertical, &mut eff);
         assert!(s.take_snapshot_dirty(), "a split must trigger a snapshot write");
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_tree_shape_names_and_focus() {
+        let (mut s, _id, _rx) = snapshot_test_session();
+        // One vertical split → two leaves; focus is the new (second) leaf.
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+
+        let snap = s.snapshot();
+        assert_eq!(snap.session_name, "work");
+        assert_eq!(snap.windows.len(), 1);
+        match &snap.windows[0].layout {
+            crate::persist::NodeSnapshot::Split { first, second, .. } => {
+                assert!(matches!(**first, crate::persist::NodeSnapshot::Leaf(_)));
+                assert!(matches!(**second, crate::persist::NodeSnapshot::Leaf(_)));
+            }
+            _ => panic!("expected a split"),
+        }
+        // Focus is the second leaf (index 1 in tree order).
+        assert_eq!(snap.windows[0].focused_leaf, 1);
     }
 }
