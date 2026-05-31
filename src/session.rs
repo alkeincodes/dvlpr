@@ -3105,7 +3105,7 @@ mod tests {
         let sb = regions.sidebar.expect("sidebar visible at 120x30");
         let footer_y = (sb.y + sb.h - 1) as usize;
         let row: String = (0..cols).map(|x| grid.cells[footer_y * cols + x].ch).collect();
-        assert!(row.contains("C-b s"), "footer chord on sidebar bottom row: {row:?}");
+        assert!(row.contains("C-b s: hide"), "footer hint on sidebar bottom row: {row:?}");
     }
 
     #[tokio::test]
