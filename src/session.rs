@@ -427,18 +427,30 @@ impl Session {
         match node {
             NodeSnapshot::Leaf(_) => {
                 let pr = plan.next();
-                let (cwd, command) = match pr {
+                // Capture the validated plan agent so we can seed the new pane's
+                // `agent_resume` cache. The resume command is built from this same
+                // agent, so seeding it keeps the on-disk snapshot truthful BEFORE
+                // the live agent is re-detected (otherwise the first snapshot tick
+                // would re-persist `agent_resume: None` and a second crash would
+                // restore a plain shell, losing the conversation).
+                let (cwd, command, seed_agent) = match pr {
                     Some(p) => {
                         let cwd = if p.cwd_exists {
                             p.cwd.clone()
                         } else {
                             home.to_string()
                         };
-                        (cwd, restore_command(&p.agent, shell))
+                        (cwd, restore_command(&p.agent, shell), p.agent.clone())
                     }
-                    None => (home.to_string(), Vec::new()),
+                    None => (home.to_string(), Vec::new(), crate::persist::AgentResume::None),
                 };
                 let (id, rx) = self.spawn_pane_with(rect, &cwd, &command)?;
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.agent_resume = seed_agent;
+                    // Leave `captured_for_pid = None` so the live agent's transcript
+                    // is re-verified/updated once it paints (it may continue under a
+                    // new session id).
+                }
                 rxs.push((id, rx));
                 Ok((layout::Node::Leaf(id), vec![id]))
             }
@@ -1663,6 +1675,25 @@ impl Session {
         }
     }
 
+    /// Read back a pane's persisted agent-resume value (mirror of
+    /// `set_pane_agent_resume_for_test`) so restore/seed tests can assert it.
+    #[cfg(test)]
+    pub fn pane_agent_resume_for_test(&self, id: PaneId) -> crate::persist::AgentResume {
+        self.panes
+            .get(&id)
+            .map(|p| p.agent_resume.clone())
+            .unwrap_or(crate::persist::AgentResume::None)
+    }
+
+    /// Force a pane's `captured_for_pid`, simulating a previously-CONFIRMED live
+    /// agent so `refresh_restore_meta`'s clear branch is observable.
+    #[cfg(test)]
+    pub fn set_pane_captured_for_pid_for_test(&mut self, id: PaneId, pid: Option<i32>) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.captured_for_pid = pid;
+        }
+    }
+
     /// Force a pane's agent classification (the `kind` that drives
     /// `refresh_restore_meta`'s clear-vs-capture branch).
     #[cfg(test)]
@@ -1768,8 +1799,8 @@ impl Session {
             // during a transient missing-foreground window.
             match (kind, fg_pid) {
                 (Some(k), Some(pid)) if pane.captured_for_pid != Some(pid) => {
-                    let resume = match resolve_transcript(pid, k) {
-                        Some((path, sid)) => match k {
+                    if let Some((path, sid)) = resolve_transcript(pid, k) {
+                        let resume = match k {
                             detect::Agent::Claude => crate::persist::AgentResume::Claude {
                                 session_id: sid,
                                 transcript: path.to_string_lossy().to_string(),
@@ -1778,14 +1809,18 @@ impl Session {
                                 session_id: sid,
                                 transcript: path.to_string_lossy().to_string(),
                             },
-                        },
-                        None => crate::persist::AgentResume::None,
-                    };
-                    if pane.agent_resume != resume {
-                        pane.agent_resume = resume;
-                        changed = true;
+                        };
+                        if pane.agent_resume != resume {
+                            pane.agent_resume = resume;
+                            changed = true;
+                        }
+                        // Lock the capture to this pid only once it's CONFIRMED.
+                        pane.captured_for_pid = Some(pid);
                     }
-                    pane.captured_for_pid = Some(pid);
+                    // else: the agent's transcript fd isn't open yet (it's still
+                    // booting), or this was a transient failure. Keep the seeded /
+                    // previously-captured resume and retry on the next tick — do NOT
+                    // set `captured_for_pid`, and do NOT wipe `agent_resume`.
                 }
                 (Some(_), _) => {
                     // Still classified as an agent. If we have a fresh pid it was
@@ -1794,13 +1829,19 @@ impl Session {
                     // a transient missing pid must not clear a valid resume.
                 }
                 (None, _) => {
-                    // Pane is no longer an agent; clear any stale capture. Runs
-                    // regardless of foreground pid presence.
-                    if pane.agent_resume != crate::persist::AgentResume::None {
-                        pane.agent_resume = crate::persist::AgentResume::None;
-                        changed = true;
+                    // No agent classification right now. Only clear when we had a
+                    // CONFIRMED live agent (real pid) that is now gone — i.e. the
+                    // pane became a plain shell. A restored/seeded pane briefly
+                    // runs the shell before `claude`/`codex` paints, so its `kind`
+                    // is transiently `None`; that seeded-but-unconfirmed state must
+                    // keep its resume id (captured_for_pid is still None).
+                    if pane.captured_for_pid.is_some() {
+                        if pane.agent_resume != crate::persist::AgentResume::None {
+                            pane.agent_resume = crate::persist::AgentResume::None;
+                            changed = true;
+                        }
+                        pane.captured_for_pid = None;
                     }
-                    pane.captured_for_pid = None;
                 }
             }
         }
@@ -4780,10 +4821,13 @@ mod tests {
     // Fix 2: when a pane stops being an agent (kind == None) it must have its
     // stale `agent_resume` cleared even if the foreground pid is momentarily
     // absent — the clearing branch must not be gated behind a present fg_pid.
+    // The clear only fires for a CONFIRMED prior capture (captured_for_pid set);
+    // a seeded-but-unconfirmed restore pane is covered by a separate test.
     #[tokio::test]
     async fn refresh_restore_meta_clears_agent_resume_when_pane_stops_being_agent() {
         let (mut s, id, _rx) = snapshot_test_session();
-        // Seed a prior Claude capture, then classify the pane as a non-agent.
+        // Seed a prior Claude capture confirmed against a real pid, then classify
+        // the pane as a non-agent (the live agent process has exited).
         s.set_pane_agent_resume_for_test(
             id,
             crate::persist::AgentResume::Claude {
@@ -4791,6 +4835,7 @@ mod tests {
                 transcript: "/tmp/transcript.jsonl".into(),
             },
         );
+        s.set_pane_captured_for_pid_for_test(id, Some(4242));
         s.set_pane_agent_kind_for_test(id, None);
 
         let changed = s.refresh_restore_meta(
@@ -4808,6 +4853,139 @@ mod tests {
             leaf.agent,
             crate::persist::AgentResume::None,
             "non-agent pane must have its stale agent_resume cleared"
+        );
+    }
+
+    // BRANCH-review fix (re-snapshot degradation): a restored agent pane must
+    // carry its validated resume id from the moment of restore. Otherwise the
+    // first 1s snapshot tick (the session starts dirty) would re-persist
+    // `agent_resume: None` before the live agent is re-detected, and a SECOND
+    // crash would restore a plain shell — losing the conversation.
+    #[tokio::test]
+    async fn restore_seeds_agent_resume_from_plan() {
+        use crate::persist::{
+            AgentResume, NodeSnapshot, PaneSnapshot, SessionSnapshot, SCHEMA_VERSION,
+        };
+
+        // An EXISTING cwd + an EXISTING transcript file (both under the workspace)
+        // so plan_restore keeps the agent instead of downgrading it. The session
+        // id is a canonical UUID (also required by plan_restore validation).
+        std::fs::create_dir_all("./.tmp_seed_cwd").unwrap();
+        let cwd = std::fs::canonicalize("./.tmp_seed_cwd")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let transcript = "./.tmp_seed_transcript.jsonl";
+        std::fs::write(transcript, b"{}\n").unwrap();
+        let transcript_abs = std::fs::canonicalize(transcript)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let session_id = "11111111-2222-3333-4444-555555555555".to_string();
+
+        let seeded = AgentResume::Claude {
+            session_id: session_id.clone(),
+            transcript: transcript_abs.clone(),
+        };
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "seed".into(),
+            sidebar_visible: false,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![crate::persist::WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Leaf(PaneSnapshot {
+                    cwd: cwd.clone(),
+                    agent: seeded.clone(),
+                }),
+            }],
+        };
+
+        let (r, _rxs) = Session::restore(
+            snap,
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        let leaves = layout::all_panes(&r.windows[0].root);
+        assert_eq!(leaves.len(), 1);
+        // Immediately after restore — before any agent re-detection — the pane
+        // must already hold the validated resume id, so an immediate snapshot
+        // would preserve it.
+        assert_eq!(
+            r.pane_agent_resume_for_test(leaves[0]),
+            seeded,
+            "restored pane must be seeded with the validated plan agent_resume"
+        );
+
+        let _ = std::fs::remove_dir_all("./.tmp_seed_cwd");
+        let _ = std::fs::remove_file(transcript);
+    }
+
+    // BRANCH-review fix: while a restored agent pane is still in its transient
+    // shell phase (claude/codex not yet painted → kind == None, no confirmed
+    // capture), a refresh that can't find the transcript yet must NOT wipe the
+    // seeded resume — it retries on the next tick instead.
+    #[tokio::test]
+    async fn refresh_restore_meta_keeps_seed_during_shell_phase() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        let seeded = crate::persist::AgentResume::Claude {
+            session_id: "abc-123".into(),
+            transcript: "/tmp/seed.jsonl".into(),
+        };
+        s.set_pane_agent_resume_for_test(id, seeded.clone());
+        // Transient shell phase: not yet classified, never confirmed.
+        s.set_pane_agent_kind_for_test(id, None);
+        s.set_pane_captured_for_pid_for_test(id, None);
+
+        // Resolver finds no transcript yet.
+        let _ = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            seeded,
+            "seeded resume must survive the transient shell phase (not yet confirmed)"
+        );
+    }
+
+    // BRANCH-review fix: once a live agent has been CONFIRMED (captured_for_pid
+    // set) and it later exits (kind → None), the stale resume must be cleared so
+    // the pane snapshots as a plain shell, and that counts as a change.
+    #[tokio::test]
+    async fn refresh_restore_meta_clears_after_confirmed_agent_exits() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        s.set_pane_agent_resume_for_test(
+            id,
+            crate::persist::AgentResume::Claude {
+                session_id: "abc-123".into(),
+                transcript: "/tmp/seed.jsonl".into(),
+            },
+        );
+        // A previously-confirmed live agent on a real pid, now gone.
+        s.set_pane_captured_for_pid_for_test(id, Some(9999));
+        s.set_pane_agent_kind_for_test(id, None);
+
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert!(changed, "clearing a confirmed-but-now-gone agent counts as a change");
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            crate::persist::AgentResume::None,
+            "a confirmed agent that exited must have its resume cleared"
         );
     }
 
