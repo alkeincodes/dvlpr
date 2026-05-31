@@ -392,6 +392,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     }
                     Event::ClientGone(id) => {
                         remove_client(&mut clients, &mut foreground, &mut session, &mut dirty, id);
+                        // If the departing client owned copy mode, clear the owner
+                        // and exit copy mode so the session is not permanently
+                        // frozen: no live client can exit it (prefix [ is a no-op
+                        // when copy mode is already active; non-owners parse normally).
+                        if copy_mode_owner == Some(id) {
+                            copy_mode_owner = None;
+                            session.exit_copy_mode();
+                            dirty = true;
+                        }
                     }
                     Event::PaneOutput { pane_id, output } => match output {
                         PaneOutput::Bytes(bytes) => {
@@ -835,9 +844,7 @@ fn apply_events(
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
                 if session.copy_mode_active() && copy_mode_owner == Some(id) {
-                    // Only the copy-mode owner's mouse events drive copy mode. A
-                    // non-owner's mouse reports fall through to normal handle_mouse below
-                    // so they don't hijack the owner's selection.
+                    // Only the copy-mode owner's mouse events drive copy mode.
                     let eff = session.handle_copy_mode_mouse(m);
                     if let Some(bytes) = eff.emit {
                         // debug_assert: OSC 52 must only reach the owner.
@@ -847,6 +854,12 @@ fn apply_events(
                         }
                     }
                     *dirty = true;
+                } else if session.copy_mode_active() {
+                    // Copy mode is active but this client is NOT the owner.
+                    // Drop the mouse event entirely: forwarding it to handle_mouse
+                    // would hit handle_mouse's belt-and-suspenders copy-mode guard
+                    // (added for non-server callers) and mutate the owner's
+                    // selection. Non-owner mouse is ignored while copy mode is active.
                 } else {
                     let eff = if let Some(st) = clients.get_mut(&id) {
                         session.handle_mouse(m, &mut st.drag)

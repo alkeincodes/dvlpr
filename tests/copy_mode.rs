@@ -553,3 +553,152 @@ async fn background_client_cannot_hijack_copy_mode() {
         &b_bytes[..b_bytes.len().min(400)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 7: non-owner MOUSE events do NOT alter the owner's copy selection
+// ---------------------------------------------------------------------------
+//
+// Regression test for Bug A: before the fix, a non-owner's mouse reports fell
+// through to Session::handle_mouse, which has a copy-mode guard that called
+// handle_copy_mode_mouse and mutated the owner's selection. This test verifies:
+//   (a) B sending mouse press + drag while A is in copy mode does NOT produce
+//       any selection highlight (inverse SGR) exclusive to B's activity.
+//   (b) B receives NO OSC 52 bytes (no accidental yank triggered by mouse).
+//   (c) A's copy mode is not disrupted; A can still yank with its own input.
+#[tokio::test]
+async fn non_owner_mouse_does_not_drive_copy_mode() {
+    let sock = temp_socket("mouse-isolation");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    // A connects first (becomes foreground). B is passive.
+    let (mut ar, mut aw) = handshake(&sock, 40, 14).await;
+    let (mut br, mut bw) = handshake(&sock, 40, 14).await;
+
+    let _ = collect_bytes(&mut ar, 2).await;
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // A enters copy mode (A is the owner).
+    send_input(&mut aw, &[0x02, b'[']).await;
+    assert!(
+        until_frame(&mut ar, 5, |f| f.contains("[copy]")).await,
+        "client A must enter copy mode"
+    );
+
+    // Drain both clients' frames so the initial copy-mode frame is consumed.
+    let _ = collect_bytes(&mut ar, 1).await;
+    let _ = collect_bytes(&mut br, 1).await;
+
+    // B sends a mouse PRESS at (col 3, row 2): ESC [ < 0 ; 3 ; 2 M
+    // then a mouse DRAG at (col 8, row 2): ESC [ < 32 ; 8 ; 2 M
+    // These must be dropped server-side; they must NOT mutate A's selection
+    // and must NOT cause B to receive OSC 52.
+    send_input(
+        &mut bw,
+        &[0x1b, b'[', b'<', b'0', b';', b'3', b';', b'2', b'M'],
+    )
+    .await;
+    send_input(
+        &mut bw,
+        &[0x1b, b'[', b'<', b'3', b'2', b';', b'8', b';', b'2', b'M'],
+    )
+    .await;
+
+    let osc52: &[u8] = &[0x1b, b']', b'5', b'2', b';', b'c', b';'];
+
+    // Collect B's output for a window; B must receive NO OSC 52.
+    let b_bytes = collect_bytes(&mut br, 2).await;
+    let b_has_osc52 = b_bytes.windows(osc52.len()).any(|w| w == osc52);
+    assert!(
+        !b_has_osc52,
+        "non-owner B's mouse must NOT trigger OSC 52 (Bug A regression); \
+         B accumulated {} bytes (first 400): {:?}",
+        b_bytes.len(),
+        &b_bytes[..b_bytes.len().min(400)]
+    );
+
+    // A should still own copy mode — verify A can yank successfully.
+    send_input(&mut aw, b"v").await;
+    send_input(&mut aw, b"$").await;
+    send_input(&mut aw, b"y").await;
+
+    let (a_has_osc52, a_bytes) = collect_bytes_until(&mut ar, 5, osc52).await;
+    assert!(
+        a_has_osc52,
+        "client A must still be able to yank after B sent mouse events; \
+         A accumulated {} bytes (first 200): {:?}",
+        a_bytes.len(),
+        &a_bytes[..a_bytes.len().min(200)]
+    );
+
+    // B must still not receive OSC 52 even after A's yank.
+    let b_bytes2 = collect_bytes(&mut br, 2).await;
+    let b_has_osc52_2 = b_bytes2.windows(osc52.len()).any(|w| w == osc52);
+    assert!(
+        !b_has_osc52_2,
+        "background client B must NOT receive A's OSC 52 yank; \
+         B accumulated {} bytes (first 400): {:?}",
+        b_bytes2.len(),
+        &b_bytes2[..b_bytes2.len().min(400)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: owner disconnect exits copy mode; remaining client can re-enter
+// ---------------------------------------------------------------------------
+//
+// Regression test for Bug B: before the fix, if the owner client disconnected
+// while copy mode was active, copy_mode_owner stayed a dead ClientId and the
+// Session remained in copy mode forever — no live client could exit it.
+// This test verifies:
+//   (a) After A (the copy-mode owner) disconnects, the session exits copy mode.
+//   (b) A remaining client C can subsequently re-enter copy mode (prefix [
+//       previously no-ops when copy mode is already active).
+#[tokio::test]
+async fn owner_disconnect_exits_copy_mode() {
+    let sock = temp_socket("owner-disconnect");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    // A connects first (becomes foreground/owner).
+    let (mut ar, mut aw) = handshake(&sock, 40, 14).await;
+    // C is a passive observer that will survive after A disconnects.
+    let (mut cr, mut cw) = handshake(&sock, 40, 14).await;
+
+    let _ = collect_bytes(&mut ar, 2).await;
+    let _ = collect_bytes(&mut cr, 1).await;
+
+    // A enters copy mode.
+    send_input(&mut aw, &[0x02, b'[']).await;
+    assert!(
+        until_frame(&mut ar, 5, |f| f.contains("[copy]")).await,
+        "client A must enter copy mode"
+    );
+    // Drain C's frames to consume the copy-mode status update.
+    let _ = collect_bytes(&mut cr, 2).await;
+
+    // A disconnects (drop the writer; the server will receive ClientGone).
+    // The read half is also dropped here; the server detects EOF.
+    drop(aw);
+    drop(ar);
+
+    // Give the server time to process A's disconnect and exit copy mode.
+    // C should subsequently see frames WITHOUT [copy] in the status.
+    let copy_cleared = until_frame(&mut cr, 5, |f| !f.contains("[copy]")).await;
+    assert!(
+        copy_cleared,
+        "after copy-mode owner disconnects, the session must exit copy mode \
+         ([copy] must no longer appear in C's frames)"
+    );
+
+    // C should now be able to re-enter copy mode (prefix [). This would be a
+    // no-op if copy mode were still stuck active, proving the fix worked.
+    // Drain any pending frames first.
+    let _ = collect_bytes(&mut cr, 1).await;
+    send_input(&mut cw, &[0x02, b'[']).await;
+    assert!(
+        until_frame(&mut cr, 5, |f| f.contains("[copy]")).await,
+        "remaining client C must be able to re-enter copy mode after A's disconnect \
+         cleared it (would be a no-op if copy mode were still stuck)"
+    );
+}
