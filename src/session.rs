@@ -329,6 +329,142 @@ impl Session {
         Ok((id, rx))
     }
 
+    /// Build a `Session` from a snapshot, spawning each pane with its restore command.
+    /// Returns the session and the per-pane output receivers (caller wires forwarders).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        snap: crate::persist::SessionSnapshot,
+        plan: &crate::persist::RestorePlan,
+        cols: u16,
+        rows: u16,
+        theme: crate::theme::Theme,
+        prefix: crate::config::KeySpec,
+        keys: crate::config::KeyMap,
+    ) -> io::Result<(Self, Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>)> {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let mut session = Session {
+            session_name: snap.session_name.clone(),
+            windows: Vec::new(),
+            active_window: 0,
+            panes: HashMap::new(),
+            compositor: Compositor::new(),
+            theme,
+            next_pane_id: 1,
+            cols,
+            rows,
+            command: Vec::new(),
+            cwd: std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            sidebar_visible: snap.sidebar_visible,
+            menu: None,
+            sidebar_width: snap.sidebar_width,
+            prefix,
+            keys,
+            help: None,
+            dialog: None,
+            snapshot_dirty: true,
+        };
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let content = layout::compute_regions(
+            Rect {
+                x: 0,
+                y: 0,
+                w: cols,
+                h: rows.saturating_sub(1).max(1),
+            },
+            snap.sidebar_visible,
+            snap.sidebar_width,
+        )
+        .content_area;
+
+        let mut rxs = Vec::new();
+        // Pull plan panes in tree order to mirror snapshot ordering.
+        let mut plan_iter = plan.panes.iter();
+        for w in &snap.windows {
+            let (root, focus_order) =
+                session.build_node(&w.layout, content, &shell, &home, &mut plan_iter, &mut rxs)?;
+            let focused = *focus_order
+                .get(w.focused_leaf)
+                .or_else(|| focus_order.first())
+                .unwrap();
+            session.windows.push(Window {
+                name: w.name.clone(),
+                name_pinned: w.name_pinned,
+                root,
+                focused,
+                zoomed: w.zoomed,
+            });
+        }
+        session.active_window = snap.active_window.min(session.windows.len().saturating_sub(1));
+        session.relayout_all();
+        Ok((session, rxs))
+    }
+
+    /// Recursively rebuild a layout node, spawning a pane per leaf. Returns the node
+    /// and the leaf PaneIds in tree order (for focus mapping).
+    #[allow(clippy::too_many_arguments)]
+    fn build_node<'a>(
+        &mut self,
+        node: &crate::persist::NodeSnapshot,
+        rect: Rect,
+        shell: &str,
+        home: &str,
+        plan: &mut impl Iterator<Item = &'a crate::persist::PaneRestore>,
+        rxs: &mut Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>,
+    ) -> io::Result<(layout::Node, Vec<PaneId>)> {
+        use crate::persist::NodeSnapshot;
+        match node {
+            NodeSnapshot::Leaf(_) => {
+                let pr = plan.next();
+                let (cwd, command) = match pr {
+                    Some(p) => {
+                        let cwd = if p.cwd_exists {
+                            p.cwd.clone()
+                        } else {
+                            home.to_string()
+                        };
+                        (cwd, restore_command(&p.agent, shell))
+                    }
+                    None => (home.to_string(), Vec::new()),
+                };
+                let (id, rx) = self.spawn_pane_with(rect, &cwd, &command)?;
+                rxs.push((id, rx));
+                Ok((layout::Node::Leaf(id), vec![id]))
+            }
+            NodeSnapshot::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let d = match dir {
+                    crate::persist::SplitDirSnap::Horizontal => layout::SplitDir::Horizontal,
+                    crate::persist::SplitDirSnap::Vertical => layout::SplitDir::Vertical,
+                };
+                // Children get the parent `rect` as a NOMINAL initial size. There is no
+                // public `layout::split_rect`, and duplicating the private
+                // `layout::split_area` here would be pointless: `relayout_all` (called
+                // once at the end of `restore`) recomputes every pane rect from the tree
+                // + ratios and resizes each PTY/screen, so the approximate initial size
+                // only lasts a few ms before first paint.
+                let (fnode, mut forder) = self.build_node(first, rect, shell, home, plan, rxs)?;
+                let (snode, sorder) = self.build_node(second, rect, shell, home, plan, rxs)?;
+                forder.extend(sorder);
+                Ok((
+                    layout::Node::Split {
+                        dir: d,
+                        ratio: *ratio,
+                        first: Box::new(fnode),
+                        second: Box::new(snode),
+                    },
+                    forder,
+                ))
+            }
+        }
+    }
+
     /// Return the configured sidebar width (columns).
     pub fn sidebar_width(&self) -> u16 {
         self.sidebar_width
@@ -4689,5 +4825,67 @@ mod tests {
         assert!(codex[3].starts_with("codex resume 11111111-"));
         // None → empty (default shell).
         assert!(restore_command(&crate::persist::AgentResume::None, shell).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_round_trips_tree_focus_and_active_window() {
+        // Build a 2-window session: window 0 has a vertical split, window 1 a single pane.
+        let (mut s, _id, _rx) = snapshot_test_session();
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+        s.new_window(None, &mut eff); // window 1
+                                      // Snapshot, then force every pane's agent to None + a real cwd so restore
+                                      // spawns plain shells (no claude/codex needed). The test sandbox only
+                                      // allows spawning inside the workspace tree, so use "." (not "/tmp").
+        let mut snap = s.snapshot();
+        for w in &mut snap.windows {
+            set_all_cwd(&mut w.layout, ".");
+        }
+        let plan = crate::persist::plan_restore(&snap);
+
+        let (r, rxs) = Session::restore(
+            snap.clone(),
+            &plan,
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        let back = r.snapshot();
+        // Same window count, same active window, same tree shapes, same focus indices.
+        assert_eq!(back.windows.len(), snap.windows.len());
+        assert_eq!(back.active_window, snap.active_window);
+        for (a, b) in snap.windows.iter().zip(&back.windows) {
+            assert_eq!(node_shape(&a.layout), node_shape(&b.layout));
+            assert_eq!(a.focused_leaf, b.focused_leaf);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.zoomed, b.zoomed);
+        }
+        assert_eq!(rxs.len(), 3); // 2 panes in window 0 + 1 in window 1
+    }
+
+    // Test helpers.
+    fn set_all_cwd(node: &mut crate::persist::NodeSnapshot, cwd: &str) {
+        match node {
+            crate::persist::NodeSnapshot::Leaf(p) => {
+                p.cwd = cwd.into();
+                p.agent = crate::persist::AgentResume::None;
+            }
+            crate::persist::NodeSnapshot::Split { first, second, .. } => {
+                set_all_cwd(first, cwd);
+                set_all_cwd(second, cwd);
+            }
+        }
+    }
+    fn node_shape(node: &crate::persist::NodeSnapshot) -> String {
+        match node {
+            crate::persist::NodeSnapshot::Leaf(_) => "L".into(),
+            crate::persist::NodeSnapshot::Split { first, second, dir, .. } => {
+                format!("({:?} {} {})", dir, node_shape(first), node_shape(second))
+            }
+        }
     }
 }
