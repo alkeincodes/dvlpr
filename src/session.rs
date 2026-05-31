@@ -929,9 +929,19 @@ impl Session {
 
     /// Clear the active window's zoom flag (called before any layout change so the
     /// user never lands in a "split happened but I can't see it" state).
+    ///
+    /// Marks the snapshot dirty whenever it actually flips a window from
+    /// zoomed -> unzoomed. Callers often unzoom first and only mark dirty after a
+    /// follow-up op that can no-op or fail (e.g. `split_focused` bailing on tiny
+    /// geometry, or a spawn failure), so persisting the unzoom here guarantees it
+    /// survives the daemon snapshot cadence regardless of what the caller does next.
+    /// A no-op unzoom (nothing was zoomed) does NOT mark dirty.
     fn unzoom_active(&mut self) {
         if let Some(win) = self.windows.get_mut(self.active_window) {
-            win.zoomed = false;
+            if win.zoomed {
+                win.zoomed = false;
+                self.mark_snapshot_dirty();
+            }
         }
     }
 
@@ -1420,6 +1430,36 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// Drive `unzoom_active` directly so a test can assert its dirty-marking
+    /// contract independently of any follow-up split/new-window that might
+    /// no-op or fail.
+    #[cfg(test)]
+    pub fn unzoom_active_for_test(&mut self) {
+        self.unzoom_active();
+    }
+
+    /// Seed a pane's persisted agent-resume value, simulating a prior capture so
+    /// `refresh_restore_meta` clearing behavior is observable.
+    #[cfg(test)]
+    pub fn set_pane_agent_resume_for_test(
+        &mut self,
+        id: PaneId,
+        resume: crate::persist::AgentResume,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.agent_resume = resume;
+        }
+    }
+
+    /// Force a pane's agent classification (the `kind` that drives
+    /// `refresh_restore_meta`'s clear-vs-capture branch).
+    #[cfg(test)]
+    pub fn set_pane_agent_kind_for_test(&mut self, id: PaneId, kind: Option<detect::Agent>) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.agent = kind;
+        }
+    }
+
     #[cfg(test)]
     fn tab_bar_state(&self) -> (Vec<String>, bool) {
         let names: Vec<String> = self.windows.iter().map(|w| w.name.clone()).collect();
@@ -1499,27 +1539,31 @@ impl Session {
             .map(|(id, p)| (*id, p.runtime.foreground_pid(), p.agent))
             .collect();
         for (id, fg_pid, kind) in work {
-            let Some(pid) = fg_pid else { continue };
             let Some(pane) = self.panes.get_mut(&id) else { continue };
-            // cwd: every pane.
-            if let Some(dir) = resolve_cwd(pid) {
-                let s = dir.to_string_lossy().to_string();
-                if pane.cwd.as_deref() != Some(s.as_str()) {
-                    pane.cwd = Some(s);
-                    changed = true;
+            // cwd: every pane, but only when a foreground pid exists to resolve.
+            if let Some(pid) = fg_pid {
+                if let Some(dir) = resolve_cwd(pid) {
+                    let s = dir.to_string_lossy().to_string();
+                    if pane.cwd.as_deref() != Some(s.as_str()) {
+                        pane.cwd = Some(s);
+                        changed = true;
+                    }
                 }
             }
-            // agent transcript: lazy, pid-keyed.
-            match kind {
-                Some(k) if pane.captured_for_pid != Some(pid) => {
+            // agent transcript: lazy, pid-keyed. This MUST run for every pane —
+            // including panes with no current foreground pid — so a pane that
+            // stops being an agent gets its stale `agent_resume` cleared even
+            // during a transient missing-foreground window.
+            match (kind, fg_pid) {
+                (Some(k), Some(pid)) if pane.captured_for_pid != Some(pid) => {
                     let resume = match resolve_transcript(pid, k) {
-                        Some((path, id)) => match k {
+                        Some((path, sid)) => match k {
                             detect::Agent::Claude => crate::persist::AgentResume::Claude {
-                                session_id: id,
+                                session_id: sid,
                                 transcript: path.to_string_lossy().to_string(),
                             },
                             detect::Agent::Codex => crate::persist::AgentResume::Codex {
-                                session_id: id,
+                                session_id: sid,
                                 transcript: path.to_string_lossy().to_string(),
                             },
                         },
@@ -1531,15 +1575,21 @@ impl Session {
                     }
                     pane.captured_for_pid = Some(pid);
                 }
-                None => {
-                    // Pane is no longer an agent; clear any stale capture.
+                (Some(_), _) => {
+                    // Still classified as an agent. If we have a fresh pid it was
+                    // already handled above (or is unchanged); if the foreground
+                    // pid is momentarily gone, leave the existing resume as-is —
+                    // a transient missing pid must not clear a valid resume.
+                }
+                (None, _) => {
+                    // Pane is no longer an agent; clear any stale capture. Runs
+                    // regardless of foreground pid presence.
                     if pane.agent_resume != crate::persist::AgentResume::None {
                         pane.agent_resume = crate::persist::AgentResume::None;
                         changed = true;
                     }
                     pane.captured_for_pid = None;
                 }
-                _ => {}
             }
         }
         changed
@@ -4483,5 +4533,69 @@ mod tests {
         );
         assert!(changed);
         assert_eq!(s.pane_cwd_for_test(id).as_deref(), Some("/work"));
+    }
+
+    // Fix 1: unzoom_active must persist the unzoom itself (mark snapshot dirty)
+    // whenever it really flips zoomed -> unzoomed, because callers often unzoom
+    // first and only mark dirty after a follow-up op that can no-op or fail. A
+    // no-op unzoom (nothing was zoomed) must NOT mark dirty.
+    #[tokio::test]
+    async fn unzoom_marks_snapshot_dirty() {
+        let (mut s, _id, _rx) = snapshot_test_session();
+        // Two panes so a zoom is meaningful, then zoom the active window.
+        s.apply_command(Command::SplitVertical);
+        s.apply_command(Command::ToggleZoom);
+        assert!(s.active_zoomed_for_test(), "window should be zoomed");
+        // Consume any pending dirty from the split/zoom.
+        let _ = s.take_snapshot_dirty();
+
+        // A real unzoom (zoomed -> unzoomed) must mark dirty on its own.
+        s.unzoom_active_for_test();
+        assert!(!s.active_zoomed_for_test());
+        assert!(
+            s.take_snapshot_dirty(),
+            "a real unzoom must mark the snapshot dirty even if no follow-up op does"
+        );
+
+        // A no-op unzoom (nothing was zoomed) must NOT mark dirty.
+        s.unzoom_active_for_test();
+        assert!(
+            !s.take_snapshot_dirty(),
+            "a no-op unzoom must not mark the snapshot dirty"
+        );
+    }
+
+    // Fix 2: when a pane stops being an agent (kind == None) it must have its
+    // stale `agent_resume` cleared even if the foreground pid is momentarily
+    // absent — the clearing branch must not be gated behind a present fg_pid.
+    #[tokio::test]
+    async fn refresh_restore_meta_clears_agent_resume_when_pane_stops_being_agent() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Seed a prior Claude capture, then classify the pane as a non-agent.
+        s.set_pane_agent_resume_for_test(
+            id,
+            crate::persist::AgentResume::Claude {
+                session_id: "abc-123".into(),
+                transcript: "/tmp/transcript.jsonl".into(),
+            },
+        );
+        s.set_pane_agent_kind_for_test(id, None);
+
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert!(changed, "clearing a stale agent_resume counts as a change");
+        let snap = s.snapshot();
+        let leaf = match &snap.windows[0].layout {
+            crate::persist::NodeSnapshot::Leaf(l) => l,
+            _ => panic!("expected single leaf"),
+        };
+        assert_eq!(
+            leaf.agent,
+            crate::persist::AgentResume::None,
+            "non-agent pane must have its stale agent_resume cleared"
+        );
     }
 }
