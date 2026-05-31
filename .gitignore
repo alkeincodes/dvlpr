@@ -11,4 +11,4 @@
 /.claude/worktrees/
 
 # Internal design docs (AI/workflow scratch) — not for the public repo
-docs/superpowers/
+docs/
