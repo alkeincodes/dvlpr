@@ -30,6 +30,7 @@ fn build_session() -> (
         dvlpr::config::KeySpec::Ctrl('b'),
         dvlpr::config::KeyMap::default(),
         dvlpr::layout::SIDEBAR_WIDTH_DEFAULT,
+        0,
     )
     .expect("Session::new")
 }

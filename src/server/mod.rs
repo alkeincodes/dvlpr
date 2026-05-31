@@ -215,6 +215,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 initial_theme,
                 runtime_cfg.prefix,
                 runtime_cfg.keys,
+                runtime_cfg.scrollback,
             )?;
             (s, rxs)
         } else {
@@ -228,6 +229,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 runtime_cfg.prefix,
                 runtime_cfg.keys,
                 runtime_cfg.sidebar.width,
+                runtime_cfg.scrollback,
             )?;
             (s, vec![(first_pane, first_rx)])
         };

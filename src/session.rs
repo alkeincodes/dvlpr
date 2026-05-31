@@ -135,6 +135,12 @@ pub struct Session {
     /// mutually exclusive with `menu`. See
     /// `docs/superpowers/specs/2026-05-29-window-tab-rename-design.md`.
     dialog: Option<crate::dialog::WindowNameDialog>,
+    /// The active copy-mode session, if any. At most one across the whole
+    /// session; mutually exclusive with menu/help/dialog. Pane-scoped.
+    copy_mode: Option<crate::copymode::CopyModeState>,
+    /// Per-pane scrollback history limit (rows), from config. Threaded into
+    /// every `GhosttyScreen::new`. 0 disables copy-mode scrolling.
+    scrollback: usize,
     /// Set by structural mutators; the daemon's snapshot cadence consumes it.
     snapshot_dirty: bool,
 }
@@ -147,6 +153,14 @@ pub struct CommandEffect {
     pub spawned: Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>,
     pub closed: Vec<PaneRuntime>,
     pub detach: bool,
+}
+
+/// Side effects of a copy-mode key/mouse event the server must perform. Currently
+/// only foreground-client byte emission (OSC 52 yank). `Session` has no client
+/// concept, so it returns the bytes; the server targets the issuing/foreground client.
+#[derive(Default)]
+pub struct CopyEffect {
+    pub emit: Option<Vec<u8>>,
 }
 
 /// Minimum cells along the split axis for a split to be allowed (two 2-cell
@@ -249,6 +263,7 @@ impl Session {
         prefix: crate::config::KeySpec,
         keys: crate::config::KeyMap,
         sidebar_width: u16,
+        scrollback: usize,
     ) -> io::Result<(Self, PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
         // Clamp to at least 1x1 (matches GhosttyScreen/PaneRuntime resize behavior).
         let cols = cols.max(1);
@@ -276,6 +291,8 @@ impl Session {
             keys,
             help: None,
             dialog: None,
+            copy_mode: None,
+            scrollback,
             snapshot_dirty: true,
         };
         // The status bar is always present, so the pane fills the content area
@@ -311,7 +328,7 @@ impl Session {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
         let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h, &self.session_name)?;
-        let screen = GhosttyScreen::new(w, h, 0);
+        let screen = GhosttyScreen::new(w, h, self.scrollback);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         self.panes.insert(
@@ -345,7 +362,7 @@ impl Session {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
         let (runtime, rx) = PaneRuntime::spawn(command, cwd, w, h, &self.session_name)?;
-        let screen = GhosttyScreen::new(w, h, 0);
+        let screen = GhosttyScreen::new(w, h, self.scrollback);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         self.panes.insert(
@@ -387,6 +404,7 @@ impl Session {
         theme: crate::theme::Theme,
         prefix: crate::config::KeySpec,
         keys: crate::config::KeyMap,
+        scrollback: usize,
     ) -> io::Result<(Self, Vec<PaneSpawn>)> {
         // Re-walk the snapshot to derive the plan locally; see doc comment above.
         let plan = crate::persist::plan_restore(&snap);
@@ -411,6 +429,8 @@ impl Session {
             keys,
             help: None,
             dialog: None,
+            copy_mode: None,
+            scrollback,
             snapshot_dirty: true,
         };
 
@@ -1295,6 +1315,7 @@ impl Session {
             }
             Command::NextWindow => {
                 if !self.windows.is_empty() {
+                    self.exit_copy_mode();
                     self.unzoom_active();
                     self.active_window = (self.active_window + 1) % self.windows.len();
                     self.mark_snapshot_dirty();
@@ -1303,6 +1324,7 @@ impl Session {
             }
             Command::PrevWindow => {
                 if !self.windows.is_empty() {
+                    self.exit_copy_mode();
                     self.unzoom_active();
                     let n = self.windows.len();
                     self.active_window = (self.active_window + n - 1) % n;
@@ -1314,6 +1336,7 @@ impl Session {
                 if n >= 1 {
                     let idx = n - 1;
                     if idx < self.windows.len() {
+                        self.exit_copy_mode();
                         self.unzoom_active();
                         self.active_window = idx;
                         self.mark_snapshot_dirty();
@@ -1345,12 +1368,54 @@ impl Session {
                     }
                 };
             }
-            // Real handling lands in Task 8 (enter copy mode); a no-op arm here
-            // keeps the match exhaustive so the crate compiles after Task 1.
-            Command::EnterCopyMode => {}
+            Command::EnterCopyMode => {
+                self.enter_copy_mode();
+            }
         }
         self.reconcile_menu();
         eff
+    }
+
+    /// Enter copy mode on the focused pane. No-op when scrollback is disabled.
+    /// Closes any open menu/help/dialog (mutual exclusion).
+    fn enter_copy_mode(&mut self) {
+        if self.scrollback == 0 || self.copy_mode.is_some() {
+            return;
+        }
+        let Some(win) = self.windows.get(self.active_window) else {
+            return;
+        };
+        let pane = win.focused;
+        let cursor = self
+            .panes
+            .get(&pane)
+            .map(|p| p.screen.cursor())
+            .unwrap_or((0, 0));
+        self.menu = None;
+        self.help = None;
+        self.dialog = None;
+        self.copy_mode = Some(crate::copymode::CopyModeState::enter(pane, cursor));
+    }
+
+    /// Exit copy mode: restore the frozen pane's viewport to the live bottom and
+    /// clear all copy-mode state. Safe to call when copy mode is inactive.
+    pub fn exit_copy_mode(&mut self) {
+        if let Some(cm) = self.copy_mode.take() {
+            if let Some(pane) = self.panes.get_mut(&cm.pane) {
+                pane.screen.scroll_viewport_bottom();
+            }
+        }
+    }
+
+    /// True while copy mode is active. Read by the server to set the parser's
+    /// copy-mode bit and compute per-client mouse capture.
+    pub fn copy_mode_active(&self) -> bool {
+        self.copy_mode.is_some()
+    }
+
+    /// The pane copy mode is frozen on, if active.
+    pub fn copy_mode_pane(&self) -> Option<crate::layout::PaneId> {
+        self.copy_mode.as_ref().map(|cm| cm.pane)
     }
 
     fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
@@ -1452,6 +1517,11 @@ impl Session {
         match self.panes.remove(&pane_id) {
             Some(pane) => removed.push(pane.runtime),
             None => return removed, // already gone
+        }
+        // If copy mode is frozen on the exiting pane, clear it. The pane is
+        // already gone from the map, so there is nothing to scroll to bottom.
+        if self.copy_mode.as_ref().is_some_and(|cm| cm.pane == pane_id) {
+            self.copy_mode = None;
         }
         // If the exiting pane is in the active (possibly zoomed) window, unzoom so the
         // surviving sibling layout becomes visible — parity with the `ClosePane` command.
@@ -2367,6 +2437,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("Session::new");
         // Pin a hidden sidebar as the geometry baseline so pane-width / cursor
@@ -2389,9 +2460,77 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         s
+    }
+
+    /// Build a session with the given dimensions and scrollback for copy-mode tests.
+    async fn copy_test_session(
+        cols: u16,
+        rows: u16,
+        scrollback: usize,
+    ) -> (
+        Session,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::pane::PaneOutput>,
+    ) {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let (mut session, pane_id, rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            cols,
+            rows,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            scrollback,
+        )
+        .expect("copy_test_session");
+        session.sidebar_visible = false;
+        session.relayout_all();
+        (session, pane_id, rx)
+    }
+
+    // --- Task 8: copy_mode field, scrollback threading, enter/exit/auto-exit ---
+
+    #[tokio::test]
+    async fn enter_copy_mode_sets_state_and_closes_overlays() {
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 2000).await;
+        session.set_help_for_test(Some(crate::help::HelpState::default()));
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session.copy_mode_active());
+        assert_eq!(session.copy_mode_pane(), Some(pane));
+        assert!(!session.help_open_for_test()); // overlay closed
+    }
+
+    #[tokio::test]
+    async fn enter_copy_mode_is_noop_when_scrollback_zero() {
+        let (mut session, _pane, _rx) = copy_test_session(40, 12, 0).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(!session.copy_mode_active());
+    }
+
+    #[tokio::test]
+    async fn exit_copy_mode_restores_bottom_and_clears_state() {
+        let (mut session, _pane, _rx) = copy_test_session(40, 12, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        session.exit_copy_mode();
+        assert!(!session.copy_mode_active());
+    }
+
+    #[tokio::test]
+    async fn pane_exit_auto_exits_copy_mode_for_that_pane() {
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let _ = session.pane_exited(pane);
+        assert!(!session.copy_mode_active());
     }
 
     #[tokio::test]
@@ -2498,6 +2637,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
 
@@ -2537,6 +2677,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
 
@@ -2568,6 +2709,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
 
@@ -2606,6 +2748,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
 
@@ -2636,6 +2779,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         let eff = session.apply_command(Command::SplitHorizontal);
@@ -2661,6 +2805,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         let eff = session.apply_command(Command::NewWindow);
@@ -2716,6 +2861,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -2743,6 +2889,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         let eff = session.apply_command(Command::Detach);
@@ -2765,6 +2912,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         // Two horizontal splits => three panes in one window; newest pane is focused.
@@ -2801,6 +2949,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         // Vertical split: left = first (focused after split is the NEW right pane).
@@ -2842,6 +2991,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         session.apply_command(Command::SplitVertical);
@@ -2906,6 +3056,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         let grid = session.compose();
@@ -2927,6 +3078,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         // First resolve to "claude": name changes -> true.
@@ -2949,6 +3101,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // now two panes
@@ -2986,6 +3139,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -3007,6 +3161,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical); // two panes in the active window
@@ -3031,6 +3186,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         // Window 1 (index 0) gets a second pane; remember one of its pane ids.
@@ -3057,6 +3213,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -3080,6 +3237,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::SplitVertical);
@@ -3102,6 +3260,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .unwrap();
         session.apply_command(Command::NewWindow); // 2 windows -> tab bar has tabs
@@ -3141,6 +3300,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         session.apply_command(Command::NewWindow); // window 1
@@ -3246,6 +3406,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("Session::new");
         assert!(session.sidebar_visible, "sidebar open by default");
@@ -3273,6 +3434,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            0,
         )
         .expect("session");
         let grid = session.compose();
@@ -3981,6 +4143,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             30, // sidebar_width
+            0,
         )
         .expect("Session::new");
         assert_eq!(session.sidebar_width(), 30);
@@ -5032,6 +5195,7 @@ mod tests {
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
             26,
+            0,
         )
         .unwrap()
     }
@@ -5379,6 +5543,7 @@ mod tests {
             crate::theme::Theme::default(),
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
+            0,
         )
         .unwrap();
 
@@ -5516,6 +5681,7 @@ mod tests {
             crate::theme::Theme::default(),
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
+            0,
         )
         .unwrap();
 
@@ -5596,6 +5762,7 @@ mod tests {
             crate::theme::Theme::default(),
             crate::config::KeySpec::Ctrl('b'),
             crate::config::KeyMap::default(),
+            0,
         )
         .unwrap();
 
