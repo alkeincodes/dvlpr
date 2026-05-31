@@ -530,6 +530,44 @@ impl Session {
         closed
     }
 
+    /// Apply a rename to window `window`: empty name un-pins (revert to the
+    /// auto-namer); non-empty sets and pins it. Shared by the rename dialog and
+    /// the control CLI so the pin semantics live in one place.
+    fn set_window_name(&mut self, window: usize, name: String) {
+        if window >= self.windows.len() {
+            return;
+        }
+        if name.is_empty() {
+            self.windows[window].name_pinned = false;
+            self.refresh_window_names(crate::procinfo::process_name);
+        } else {
+            let w = &mut self.windows[window];
+            w.name = name;
+            w.name_pinned = true;
+        }
+    }
+
+    /// Create a new window (optionally with a pinned name) and focus it. Public
+    /// entry point for the control CLI; mirrors `Command::NewWindow` but allows a name.
+    pub fn new_named_window(&mut self, name: Option<String>) -> CommandEffect {
+        let mut eff = CommandEffect::default();
+        self.unzoom_active();
+        self.menu = None;
+        self.new_window(name, &mut eff);
+        eff
+    }
+
+    /// Rename the active window (set + pin). Empty name reverts to the auto-namer.
+    pub fn rename_active_window(&mut self, name: String) {
+        self.set_window_name(self.active_window, name);
+    }
+
+    /// Close the active window, returning the removed `PaneRuntime`s for the caller
+    /// to tear down off the async runtime.
+    pub fn close_active_window(&mut self) -> Vec<PaneRuntime> {
+        self.close_window(self.active_window)
+    }
+
     /// Resolve an activated menu item to its effect, given the menu's kind.
     /// Pane items dispatch their `Command`; tab items act on the kind's window.
     fn dispatch_menu_action(
@@ -571,20 +609,7 @@ impl Session {
                 self.new_window(pinned, &mut eff);
             }
             crate::dialog::DialogMode::RenameWindow { window } => {
-                // Do NOT hold a `&mut Window` across `refresh_window_names`
-                // (that would be a mutable-borrow conflict). Index for the flag
-                // write and release the borrow before re-deriving.
-                if window < self.windows.len() {
-                    if value.is_empty() {
-                        // Un-pin: revert to auto and re-derive immediately.
-                        self.windows[window].name_pinned = false;
-                        self.refresh_window_names(crate::procinfo::process_name);
-                    } else {
-                        let w = &mut self.windows[window];
-                        w.name = value;
-                        w.name_pinned = true;
-                    }
-                }
+                self.set_window_name(window, value);
             }
         }
         eff
@@ -2081,6 +2106,35 @@ mod tests {
         for rt in session.shutdown() {
             rt.close();
         }
+    }
+
+    #[tokio::test]
+    async fn new_named_window_appends_named_window_and_focuses_it() {
+        let mut session = test_session();
+        let before = session.window_count();
+        let _eff = session.new_named_window(Some("api".to_string()));
+        assert_eq!(session.window_count(), before + 1);
+        assert_eq!(session.window_names_for_test().last().unwrap(), "api");
+        assert_eq!(session.active_window_index(), session.window_count() - 1);
+    }
+
+    #[tokio::test]
+    async fn rename_active_window_sets_and_pins_name() {
+        let mut session = test_session();
+        session.rename_active_window("db".to_string());
+        let idx = session.active_window_index();
+        assert_eq!(session.window_names_for_test()[idx], "db");
+    }
+
+    #[tokio::test]
+    async fn close_active_window_removes_a_window() {
+        let mut session = test_session();
+        session.new_named_window(None);
+        let before = session.window_count();
+        for rt in session.close_active_window() {
+            rt.close();
+        }
+        assert_eq!(session.window_count(), before - 1);
     }
 
     #[tokio::test]
