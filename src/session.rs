@@ -19,6 +19,10 @@ use crate::input::{MouseEvent, MouseKind};
 use crate::layout::{self, Node, PaneId, Rect, SplitDir, SplitPath};
 use crate::pane::{PaneOutput, PaneRuntime};
 
+/// A freshly-spawned pane and its output receiver; the daemon wires one
+/// forwarder per entry. Used by `Session::restore`'s return.
+type PaneSpawn = (PaneId, mpsc::UnboundedReceiver<PaneOutput>);
+
 struct Pane {
     runtime: PaneRuntime,
     screen: GhosttyScreen,
@@ -347,7 +351,7 @@ impl Session {
         theme: crate::theme::Theme,
         prefix: crate::config::KeySpec,
         keys: crate::config::KeyMap,
-    ) -> io::Result<(Self, Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>)> {
+    ) -> io::Result<(Self, Vec<PaneSpawn>)> {
         // Re-walk the snapshot to derive the plan locally; see doc comment above.
         let plan = crate::persist::plan_restore(&snap);
         let cols = cols.max(1);
@@ -1770,15 +1774,16 @@ impl Session {
         changed
     }
 
-    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus a lazy
-    /// agent-transcript capture keyed on the foreground pid. Returns true if any
-    /// pane's cwd or agent_resume changed (→ caller marks the snapshot dirty).
-    /// Resolvers are injected for testability (prod: `procinfo::pid_cwd` and
-    /// `procinfo::agent_transcript`).
+    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus the agent's
+    /// transcript identity discovered BY CWD (agents open-append-close their
+    /// transcripts, so there is no fd to enumerate — see `procinfo::agent_transcript`).
+    /// Returns true if any pane's cwd or agent_resume changed (→ caller marks the
+    /// snapshot dirty). Resolvers are injected for testability (prod:
+    /// `procinfo::pid_cwd` and `procinfo::agent_transcript`).
     pub fn refresh_restore_meta(
         &mut self,
         resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
-        resolve_transcript: impl Fn(i32, detect::Agent) -> Option<(std::path::PathBuf, String)>,
+        resolve_transcript: impl Fn(&str, detect::Agent) -> Option<(std::path::PathBuf, String)>,
     ) -> bool {
         let mut changed = false;
         // Collect (id, fg_pid, agent_kind) first to avoid borrow conflicts.
@@ -1799,42 +1804,40 @@ impl Session {
                     }
                 }
             }
-            // agent transcript: lazy, pid-keyed. This MUST run for every pane —
-            // including panes with no current foreground pid — so a pane that
-            // stops being an agent gets its stale `agent_resume` cleared even
-            // during a transient missing-foreground window.
-            match (kind, fg_pid) {
-                (Some(k), Some(pid)) if pane.captured_for_pid != Some(pid) => {
-                    if let Some((path, sid)) = resolve_transcript(pid, k) {
-                        let resume = match k {
-                            detect::Agent::Claude => crate::persist::AgentResume::Claude {
-                                session_id: sid,
-                                transcript: path.to_string_lossy().to_string(),
-                            },
-                            detect::Agent::Codex => crate::persist::AgentResume::Codex {
-                                session_id: sid,
-                                transcript: path.to_string_lossy().to_string(),
-                            },
-                        };
-                        if pane.agent_resume != resume {
-                            pane.agent_resume = resume;
-                            changed = true;
+            // agent transcript: discovered by the pane's cwd, re-run each tick so we
+            // converge on the LIVE session id right after launch (and after a /clear
+            // spawns a new transcript). A directory read is cheap.
+            match kind {
+                Some(k) => {
+                    // Discover only when we know the pane's cwd. A `None` result means
+                    // the transcript isn't on disk yet (still booting) or this is a
+                    // restored pane in its transient shell phase — keep the seeded /
+                    // previously-captured resume and retry next tick; never wipe it here.
+                    if let Some(cwd) = pane.cwd.clone() {
+                        if let Some((path, sid)) = resolve_transcript(&cwd, k) {
+                            let resume = match k {
+                                detect::Agent::Claude => crate::persist::AgentResume::Claude {
+                                    session_id: sid,
+                                    transcript: path.to_string_lossy().to_string(),
+                                },
+                                detect::Agent::Codex => crate::persist::AgentResume::Codex {
+                                    session_id: sid,
+                                    transcript: path.to_string_lossy().to_string(),
+                                },
+                            };
+                            if pane.agent_resume != resume {
+                                pane.agent_resume = resume;
+                                changed = true;
+                            }
+                            // Mark CONFIRMED so the clear branch below knows a real
+                            // agent was live here (used when it later exits to a shell).
+                            if let Some(pid) = fg_pid {
+                                pane.captured_for_pid = Some(pid);
+                            }
                         }
-                        // Lock the capture to this pid only once it's CONFIRMED.
-                        pane.captured_for_pid = Some(pid);
                     }
-                    // else: the agent's transcript fd isn't open yet (it's still
-                    // booting), or this was a transient failure. Keep the seeded /
-                    // previously-captured resume and retry on the next tick — do NOT
-                    // set `captured_for_pid`, and do NOT wipe `agent_resume`.
                 }
-                (Some(_), _) => {
-                    // Still classified as an agent. If we have a fresh pid it was
-                    // already handled above (or is unchanged); if the foreground
-                    // pid is momentarily gone, leave the existing resume as-is —
-                    // a transient missing pid must not clear a valid resume.
-                }
-                (None, _) => {
+                None => {
                     // No agent classification right now. Only clear when we had a
                     // CONFIRMED live agent (real pid) that is now gone — i.e. the
                     // pane became a plain shell. A restored/seeded pane briefly
@@ -4819,6 +4822,37 @@ mod tests {
         );
         assert!(changed);
         assert_eq!(s.pane_cwd_for_test(id).as_deref(), Some("/work"));
+    }
+
+    #[tokio::test]
+    async fn refresh_restore_meta_captures_agent_resume_via_cwd() {
+        // The core capture path that the fd-based discovery broke in production:
+        // a Claude pane whose transcript is discovered BY CWD must populate
+        // `agent_resume` so it lands in the snapshot (and thus the restore).
+        let (mut s, id, _rx) = snapshot_test_session();
+        s.set_pane_agent_kind_for_test(id, Some(detect::Agent::Claude));
+        let tpath =
+            "/home/u/.claude/projects/-work-proj/11111111-2222-3333-4444-555555555555.jsonl";
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work/proj")),
+            |cwd, kind| {
+                // The resolver is now driven by CWD (not pid).
+                assert_eq!(cwd, "/work/proj");
+                assert_eq!(kind, detect::Agent::Claude);
+                Some((
+                    std::path::PathBuf::from(tpath),
+                    "11111111-2222-3333-4444-555555555555".to_string(),
+                ))
+            },
+        );
+        assert!(changed);
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            crate::persist::AgentResume::Claude {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: tpath.into(),
+            }
+        );
     }
 
     // Fix 1: unzoom_active must persist the unzoom itself (mark snapshot dirty)

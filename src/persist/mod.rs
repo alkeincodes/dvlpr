@@ -458,6 +458,6 @@ mod tests {
         };
         let plan = plan_restore(&snap);
         assert!(matches!(plan.panes[0].agent, AgentResume::None));
-        assert_eq!(plan.panes[0].cwd_exists, false);
+        assert!(!plan.panes[0].cwd_exists);
     }
 }

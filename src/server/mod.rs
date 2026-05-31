@@ -205,7 +205,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             24,
             initial_theme,
             runtime_cfg.prefix,
-            runtime_cfg.keys.clone(),
+            runtime_cfg.keys,
         )?;
         (s, rxs)
     } else {
@@ -217,7 +217,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             24,
             initial_theme,
             runtime_cfg.prefix,
-            runtime_cfg.keys.clone(),
+            runtime_cfg.keys,
             runtime_cfg.sidebar.width,
         )?;
         (s, vec![(first_pane, first_rx)])
