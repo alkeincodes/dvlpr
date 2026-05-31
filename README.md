@@ -265,6 +265,7 @@ new-window = "c"
 next-window = "n"
 prev-window = "p"
 detach = "d"
+toggle-sidebar = "s"
 ```
 
 ### Restoring the pre-v0.2.0 `Ctrl-A` prefix
