@@ -371,9 +371,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         &ev_tx, &mut dirty, id, events,
                     );
                 }
-                // Skip compose when the session is empty — a control command may have
-                // closed the last pane and the daemon is mid-shutdown; rendering zero
-                // windows is both pointless and a panic risk (compose indexes
+                // Defensive: never compose a window-less session. Control commands
+                // refuse to close the last pane/window, so they can't empty it; this
+                // guards the synchronous keystroke/last-pane-exit teardown path, where
+                // rendering zero windows is pointless and a panic risk (compose indexes
                 // self.windows[self.active_window] unconditionally).
                 if dirty && !clients.is_empty() && !session.is_empty() {
                     let snapshot = Arc::new(FrameSnapshot { grid: session.compose(), menu_open: session.menu_open() });
