@@ -142,6 +142,97 @@ fn set_mode(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: u32) {}
 
+/// Strict canonical UUID check: 8-4-4-4-12 hex with hyphens. Both Claude and Codex
+/// session ids are canonical UUIDs. Anything else is rejected (never interpolated).
+pub fn is_canonical_uuid(s: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != groups.len() {
+        return false;
+    }
+    parts
+        .iter()
+        .zip(groups)
+        .all(|(p, n)| p.len() == n && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// One pane's resolved restore outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneRestore {
+    pub cwd: String,
+    pub cwd_exists: bool,
+    pub agent: AgentResume,
+    pub downgraded: Option<&'static str>,
+}
+
+/// Tree-ordered plan: one `PaneRestore` per leaf, in `all_panes` DFS order, plus
+/// per-window structure carried implicitly by the caller re-walking the snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestorePlan {
+    pub panes: Vec<PaneRestore>,
+    pub window_count: usize,
+}
+
+impl RestorePlan {
+    pub fn summary(&self) -> String {
+        let downgrades = self.panes.iter().filter(|p| p.downgraded.is_some()).count();
+        let w = self.window_count;
+        let p = self.panes.len();
+        let base = format!(
+            "{w} window{}, {p} pane{}",
+            if w == 1 { "" } else { "s" },
+            if p == 1 { "" } else { "s" }
+        );
+        if downgrades == 0 {
+            base
+        } else {
+            format!("{base} ({downgrades} → shell)")
+        }
+    }
+}
+
+/// Pure: decide resume-vs-downgrade for each leaf by checking the persisted
+/// transcript path and cwd existence. Shared by the CLI (summary) and the daemon
+/// (spawn), so the message and behavior use identical logic.
+pub fn plan_restore(snap: &SessionSnapshot) -> RestorePlan {
+    let mut panes = Vec::new();
+    for w in &snap.windows {
+        collect_panes(&w.layout, &mut panes);
+    }
+    RestorePlan { panes, window_count: snap.windows.len() }
+}
+
+fn collect_panes(node: &NodeSnapshot, out: &mut Vec<PaneRestore>) {
+    match node {
+        NodeSnapshot::Leaf(p) => out.push(resolve_pane(p)),
+        NodeSnapshot::Split { first, second, .. } => {
+            collect_panes(first, out);
+            collect_panes(second, out);
+        }
+    }
+}
+
+fn resolve_pane(p: &PaneSnapshot) -> PaneRestore {
+    let cwd_exists = Path::new(&p.cwd).is_dir();
+    // Reason strings are checked in priority order; cwd loss downgrades any pane.
+    let (agent, downgraded) = match &p.agent {
+        AgentResume::None => (AgentResume::None, None),
+        ag @ (AgentResume::Claude { session_id, transcript }
+        | AgentResume::Codex { session_id, transcript }) => {
+            if !is_canonical_uuid(session_id) {
+                (AgentResume::None, Some("invalid session id"))
+            } else if !Path::new(transcript).exists() {
+                (AgentResume::None, Some("transcript missing"))
+            } else if !cwd_exists {
+                (AgentResume::None, Some("cwd missing"))
+            } else {
+                (ag.clone(), None)
+            }
+        }
+    };
+    PaneRestore { cwd: p.cwd.clone(), cwd_exists, agent, downgraded }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +328,97 @@ mod tests {
         delete(&path);
         assert!(!path.exists());
         delete(&path); // second call must not panic
+    }
+
+    #[test]
+    fn is_canonical_uuid_accepts_only_canonical_form() {
+        assert!(is_canonical_uuid("019d30c1-5e55-74f1-84bc-e8a8c3b3024c"));
+        assert!(is_canonical_uuid("11111111-2222-3333-4444-555555555555"));
+        assert!(!is_canonical_uuid("------------------------------------"));
+        assert!(!is_canonical_uuid("1111111122223333444455555555555")); // no hyphens
+        assert!(!is_canonical_uuid("zzzzzzzz-2222-3333-4444-555555555555"));
+        assert!(!is_canonical_uuid("11111111-2222-3333-4444-555555555555; rm -rf /"));
+    }
+
+    #[test]
+    fn plan_restore_resumes_present_transcript_and_downgrades_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.jsonl");
+        std::fs::write(&present, b"x").unwrap();
+        let cwd_ok = dir.path().to_string_lossy().to_string();
+
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "w".into(),
+            sidebar_visible: true,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Split {
+                    dir: SplitDirSnap::Vertical,
+                    ratio: 0.5,
+                    // Pane A: present transcript + existing cwd → resume.
+                    first: Box::new(NodeSnapshot::Leaf(PaneSnapshot {
+                        cwd: cwd_ok.clone(),
+                        agent: AgentResume::Claude {
+                            session_id: "11111111-2222-3333-4444-555555555555".into(),
+                            transcript: present.to_string_lossy().to_string(),
+                        },
+                    })),
+                    // Pane B: missing transcript → downgrade to shell.
+                    second: Box::new(NodeSnapshot::Leaf(PaneSnapshot {
+                        cwd: cwd_ok.clone(),
+                        agent: AgentResume::Codex {
+                            session_id: "99999999-2222-3333-4444-555555555555".into(),
+                            transcript: dir.path().join("gone.jsonl").to_string_lossy().to_string(),
+                        },
+                    })),
+                },
+            }],
+        };
+
+        let plan = plan_restore(&snap);
+        assert_eq!(plan.panes.len(), 2);
+        assert!(matches!(plan.panes[0].agent, AgentResume::Claude { .. }));
+        assert_eq!(plan.panes[0].downgraded, None);
+        assert!(matches!(plan.panes[1].agent, AgentResume::None));
+        assert_eq!(plan.panes[1].downgraded, Some("transcript missing"));
+        assert!(plan.summary().contains("1 window"));
+        assert!(plan.summary().contains("2 panes"));
+        assert!(plan.summary().contains("1 → shell"));
+    }
+
+    #[test]
+    fn plan_restore_downgrades_when_cwd_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("t.jsonl");
+        std::fs::write(&present, b"x").unwrap();
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "w".into(),
+            sidebar_visible: true,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Leaf(PaneSnapshot {
+                    cwd: dir.path().join("vanished").to_string_lossy().to_string(),
+                    agent: AgentResume::Claude {
+                        session_id: "11111111-2222-3333-4444-555555555555".into(),
+                        transcript: present.to_string_lossy().to_string(),
+                    },
+                }),
+            }],
+        };
+        let plan = plan_restore(&snap);
+        assert!(matches!(plan.panes[0].agent, AgentResume::None));
+        assert_eq!(plan.panes[0].cwd_exists, false);
     }
 }
