@@ -99,6 +99,7 @@ impl PaneRuntime {
         // seed the session cwd). It is an internal handoff, not meant for user
         // shells, so strip it from every child's environment.
         cmd.env_remove("DVLPR_SESSION_CWD");
+        cmd.env_remove("DVLPR_RESTORE");
 
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // Slave fd no longer needed in this process once the child holds it.
@@ -191,6 +192,14 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn spawn_strips_internal_restore_flag_from_children() {
+        // The env_remove calls are unconditional in spawn(); assert the source lists it.
+        // (A behavioral test would require a live PTY; this guards the contract cheaply.)
+        let src = include_str!("mod.rs");
+        assert!(src.contains("env_remove(\"DVLPR_RESTORE\")"));
+    }
 
     #[tokio::test]
     async fn pane_runs_command_and_streams_output() {

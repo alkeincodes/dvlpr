@@ -25,7 +25,7 @@ pub fn acquire_instance_lock(lock_path: &Path) -> io::Result<std::fs::File> {
 }
 
 /// Spawn `dvlpr server <name>` detached from the controlling terminal.
-pub fn spawn_detached_server(name: &str) -> io::Result<()> {
+pub fn spawn_detached_server(name: &str, restore: bool) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     cmd.arg("server")
@@ -39,6 +39,9 @@ pub fn spawn_detached_server(name: &str) -> io::Result<()> {
     // PaneRuntime::spawn strips it from each child so it never reaches user shells.
     if let Ok(cwd) = std::env::current_dir() {
         cmd.env("DVLPR_SESSION_CWD", cwd);
+    }
+    if restore {
+        cmd.env("DVLPR_RESTORE", "1");
     }
     unsafe {
         cmd.pre_exec(|| {

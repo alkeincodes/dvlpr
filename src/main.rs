@@ -250,7 +250,7 @@ fn session_socket(session: &str) -> std::io::Result<std::path::PathBuf> {
 async fn run_or_attach(session: &str) -> std::io::Result<()> {
     let path = session_socket(session)?;
     if !socket::is_live(&path).await {
-        daemon::spawn_detached_server(session)?;
+        daemon::spawn_detached_server(session, false)?;
         let mut up = false;
         for _ in 0..100 {
             if socket::is_live(&path).await {
