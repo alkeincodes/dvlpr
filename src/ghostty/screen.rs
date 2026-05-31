@@ -362,6 +362,95 @@ impl GhosttyScreen {
         }
     }
 
+    /// Extract the text covered by the SCREEN-space inclusive range
+    /// `(start_x, start_y)`..=`(end_x, end_y)` via libghostty's formatter,
+    /// unwrapping soft wraps and trimming trailing whitespace. Returns an
+    /// empty string on any FFI failure or out-of-range endpoint.
+    ///
+    /// `y` is measured from the top of the full screen (scrollback + active),
+    /// matching the `SCREEN` point tag.
+    pub fn selection_text(&self, start_x: u16, start_y: usize, end_x: u16, end_y: usize) -> String {
+        // SAFETY: all FFI below uses sized structs (size set), SCREEN-tag points,
+        // and the documented buffer-size query protocol; every error path returns
+        // an empty string.
+        unsafe {
+            let mut start_ref: sys::GhosttyGridRef = mem::zeroed();
+            start_ref.size = mem::size_of::<sys::GhosttyGridRef>();
+            let start_point = sys::GhosttyPoint {
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
+                value: sys::GhosttyPointValue {
+                    coordinate: sys::GhosttyPointCoordinate { x: start_x, y: start_y as u32 },
+                },
+            };
+            if sys::ghostty_terminal_grid_ref(self.term, start_point, &mut start_ref) != 0 {
+                return String::new();
+            }
+            let mut end_ref: sys::GhosttyGridRef = mem::zeroed();
+            end_ref.size = mem::size_of::<sys::GhosttyGridRef>();
+            let end_point = sys::GhosttyPoint {
+                tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
+                value: sys::GhosttyPointValue {
+                    coordinate: sys::GhosttyPointCoordinate { x: end_x, y: end_y as u32 },
+                },
+            };
+            if sys::ghostty_terminal_grid_ref(self.term, end_point, &mut end_ref) != 0 {
+                return String::new();
+            }
+
+            let mut selection: sys::GhosttySelection = mem::zeroed();
+            selection.size = mem::size_of::<sys::GhosttySelection>();
+            selection.start = start_ref;
+            selection.end = end_ref;
+            selection.rectangle = false;
+
+            let mut screen_extra: sys::GhosttyFormatterScreenExtra = mem::zeroed();
+            screen_extra.size = mem::size_of::<sys::GhosttyFormatterScreenExtra>();
+            let mut extra: sys::GhosttyFormatterTerminalExtra = mem::zeroed();
+            extra.size = mem::size_of::<sys::GhosttyFormatterTerminalExtra>();
+            extra.screen = screen_extra;
+
+            let opts = sys::GhosttyFormatterTerminalOptions {
+                size: mem::size_of::<sys::GhosttyFormatterTerminalOptions>(),
+                emit: sys::GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN,
+                unwrap: true,
+                trim: true,
+                extra,
+                selection: &selection,
+            };
+
+            let mut formatter: sys::GhosttyFormatter = ptr::null_mut();
+            if sys::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.term, opts) != 0
+                || formatter.is_null()
+            {
+                return String::new();
+            }
+
+            // Query the required length (buf = null → OUT_OF_SPACE with size).
+            let mut needed: usize = 0;
+            let rc = sys::ghostty_formatter_format_buf(formatter, ptr::null_mut(), 0, &mut needed);
+            // SUCCESS with 0 needed means empty output; OUT_OF_SPACE means `needed` is the size.
+            if needed == 0 {
+                sys::ghostty_formatter_free(formatter);
+                return String::new();
+            }
+            let mut buf = vec![0u8; needed];
+            let mut written: usize = 0;
+            let rc2 = sys::ghostty_formatter_format_buf(
+                formatter,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut written,
+            );
+            sys::ghostty_formatter_free(formatter);
+            let _ = rc;
+            if rc2 != sys::GhosttyResult_GHOSTTY_SUCCESS {
+                return String::new();
+            }
+            buf.truncate(written);
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    }
+
     pub fn cursor(&self) -> (u16, u16) {
         let mut cx: u16 = 0;
         let mut cy: u16 = 0;
@@ -746,6 +835,32 @@ mod tests {
         s.scroll_viewport_delta(-8); // scroll far up into history
         let tail = s.tail_text(2);
         assert!(tail.contains("LIVE9"), "tail must read live bottom, got {tail:?}");
+    }
+
+    #[test]
+    fn selection_text_extracts_a_single_line_range() {
+        let mut s = GhosttyScreen::new(20, 3, 100);
+        s.feed(b"hello world");
+        // Whole first row, columns 0..=10.
+        let txt = s.selection_text(0, 0, 10, 0);
+        assert!(txt.contains("hello"), "got {txt:?}");
+        assert!(txt.contains("world"), "got {txt:?}");
+    }
+
+    #[test]
+    fn selection_text_unwraps_a_soft_wrapped_line() {
+        let mut s = GhosttyScreen::new(5, 4, 100);
+        // 8 chars into a 5-col screen soft-wraps onto row 1.
+        s.feed(b"abcdefgh");
+        // Select the whole wrapped logical line (rows 0..=1).
+        let txt = s.selection_text(0, 0, 4, 1);
+        assert!(txt.contains("abcdefgh"), "soft-wrap should unwrap to one line: {txt:?}");
+    }
+
+    #[test]
+    fn selection_text_empty_for_inverted_or_oob_range_is_safe() {
+        let s = GhosttyScreen::new(5, 2, 0);
+        let _ = s.selection_text(0, 0, 4, 0); // must not panic
     }
 
     #[test]
