@@ -342,9 +342,9 @@ mod tests {
         // Slash-command / settings menus reuse the same `❯ N.` selection
         // widget as permission prompts. When the input box is still
         // visible at the bottom, the user is navigating — NOT waiting on
-        // the agent. Matches the reference's documented design: "Claude uses the
-        // same generic Select widget for both permission flows and
-        // ordinary slash/settings menus."
+        // the agent. Claude reuses the same generic Select widget for both
+        // permission flows and ordinary slash/settings menus, so the visible
+        // input box is the disambiguator.
         let tail = "Available commands:\n\
                     ❯ 1. /help\n\
                       2. /model\n\
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn classify_claude_working_spinner_verb_ascii_three_dots() {
-        // Some Claude renderings (and the Pi agent in the reference) use ASCII
+        // Some Claude renderings (and some other agent TUIs) use ASCII
         // `...` rather than the Unicode `…`. Match both.
         let tail = "Working...\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
