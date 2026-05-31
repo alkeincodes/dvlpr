@@ -263,14 +263,20 @@ async fn right_click_from_b_while_menu_is_open_reanchors_to_b() {
     let _ = collect_frames(&mut ar, 1).await;
     let _ = collect_frames(&mut br, 1).await;
 
-    send_input(&mut bw, b"\x1b[<2;60;10M").await;
-    // Generous collect window: under the full parallel `cargo test` run this
-    // multi-client round-trip is slow; 2s flaked, 8s is robust.
-    let frames_b = collect_frames(&mut br, 8).await;
+    // Reanchor only fires when the second right-click lands on a PANE. The
+    // always-on AGENTS sidebar (SIDEBAR_WIDTH_DEFAULT = 26) occupies the right
+    // 26 cols, so in an 80-col viewport the pane spans cols 1..=54 and the
+    // sidebar cols 55..=80. Click col 40 — firmly inside the pane. (Col 60
+    // lands in the sidebar, where a right-click closes the menu rather than
+    // reanchoring; that was the real cause of the earlier failure, which had
+    // been misdiagnosed as a timeout and papered over by widening the window.)
+    send_input(&mut bw, b"\x1b[<2;40;10M").await;
 
+    // Condition-based wait: returns as soon as the reanchored corner appears,
+    // only spending the full window on a genuine failure.
     let corner = "┌".as_bytes();
     assert!(
-        frames_contain(&frames_b, corner),
+        until_frame_contains(&mut br, 8, corner).await,
         "client B did not see a reanchored menu corner glyph"
     );
 }
