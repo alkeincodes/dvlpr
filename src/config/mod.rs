@@ -27,7 +27,7 @@ pub enum Command {
     PrevWindow,
     SelectWindow(usize), // 1-based window number from the digit keys
     ToggleZoom,          // C-b 0: fullscreen the focused pane (toggle)
-    ToggleSidebar,       // C-b s: show/hide agent-awareness sidebar
+    ToggleSidebar,       // default C-b s: show/hide agent-awareness sidebar
     Detach,
     ShowHelp, // C-b ?: open/close the help overlay (toggle)
 }
@@ -167,6 +167,7 @@ pub struct KeyMap {
     pub prev_window: KeySpec,
     pub detach: KeySpec,
     pub help: KeySpec,
+    pub toggle_sidebar: KeySpec,
 }
 
 impl Default for KeyMap {
@@ -180,6 +181,7 @@ impl Default for KeyMap {
             prev_window: KeySpec::Char('p'),
             detach: KeySpec::Char('d'),
             help: KeySpec::Char('?'),
+            toggle_sidebar: KeySpec::Char('s'),
         }
     }
 }
@@ -254,6 +256,8 @@ struct RawKeys {
     prev_window: Option<String>,
     detach: Option<String>,
     help: Option<String>,
+    #[serde(rename = "toggle-sidebar")]
+    toggle_sidebar: Option<String>,
 }
 
 /// Raw `[theme]` table. Only `flavor` exists in v1; missing/unknown falls back
@@ -382,6 +386,11 @@ impl Config {
                 prev_window: spec_or_default(&raw.keys.prev_window, "prev-window", d.prev_window),
                 detach: spec_or_default(&raw.keys.detach, "detach", d.detach),
                 help: spec_or_default(&raw.keys.help, "help", d.help),
+                toggle_sidebar: spec_or_default(
+                    &raw.keys.toggle_sidebar,
+                    "toggle-sidebar",
+                    d.toggle_sidebar,
+                ),
             },
             theme,
             sidebar: sidebar_from_raw(&raw.sidebar),
@@ -409,6 +418,8 @@ impl Config {
             Some(Command::Detach)
         } else if k.help.matches(key) {
             Some(Command::ShowHelp)
+        } else if k.toggle_sidebar.matches(key) {
+            Some(Command::ToggleSidebar)
         } else {
             None
         }
@@ -459,6 +470,7 @@ mod tests {
         assert_eq!(c.keys.prev_window, KeySpec::Char('p'));
         assert_eq!(c.keys.detach, KeySpec::Char('d'));
         assert_eq!(c.keys.help, KeySpec::Char('?'));
+        assert_eq!(c.keys.toggle_sidebar, KeySpec::Char('s'));
     }
 
     #[test]
@@ -721,5 +733,24 @@ flavor = "one-dark"
             c.resolve(&Key::Char(b'c')),
             Some(Command::OpenNewWindowDialog)
         );
+    }
+
+    #[test]
+    fn config_parses_explicit_toggle_sidebar() {
+        let cfg = Config::from_toml_str("[keys]\ntoggle-sidebar = \"v\"\n");
+        assert_eq!(cfg.keys.toggle_sidebar, KeySpec::Char('v'));
+    }
+
+    #[test]
+    fn resolve_maps_default_s_to_toggle_sidebar() {
+        let cfg = Config::default();
+        assert_eq!(cfg.resolve(&Key::Char(b's')), Some(Command::ToggleSidebar));
+    }
+
+    #[test]
+    fn resolve_maps_custom_key_to_toggle_sidebar() {
+        let cfg = Config::from_toml_str("[keys]\ntoggle-sidebar = \"v\"\n");
+        assert_eq!(cfg.resolve(&Key::Char(b'v')), Some(Command::ToggleSidebar));
+        assert_eq!(cfg.resolve(&Key::Char(b's')), None);
     }
 }

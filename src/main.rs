@@ -264,7 +264,21 @@ fn session_socket(session: &str) -> std::io::Result<std::path::PathBuf> {
 async fn run_or_attach(session: &str) -> std::io::Result<()> {
     let path = session_socket(session)?;
     if !socket::is_live(&path).await {
-        daemon::spawn_detached_server(session)?;
+        let snap_path = dvlpr::persist::snapshot_path(session);
+        let restore = match dvlpr::persist::load(&snap_path) {
+            Some(snap) => {
+                let plan = dvlpr::persist::plan_restore(&snap);
+                if prompt_restore(session, &plan) {
+                    println!("Restoring {}.", plan.summary());
+                    true
+                } else {
+                    dvlpr::persist::archive(&snap_path);
+                    false
+                }
+            }
+            None => false,
+        };
+        daemon::spawn_detached_server(session, restore)?;
         let mut up = false;
         for _ in 0..100 {
             if socket::is_live(&path).await {
@@ -281,6 +295,27 @@ async fn run_or_attach(session: &str) -> std::io::Result<()> {
         }
     }
     client::attach(&path).await
+}
+
+/// Prompt `Found a saved layout … Restore? [Y/n]`. Default Yes (Enter). A
+/// non-interactive stdin (not a TTY) returns Yes without blocking.
+fn prompt_restore(session: &str, plan: &dvlpr::persist::RestorePlan) -> bool {
+    use std::io::IsTerminal;
+    eprint!(
+        "Found a saved layout for '{session}' ({}). Restore? [Y/n] ",
+        plan.summary()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if !std::io::stdin().is_terminal() {
+        eprintln!("(non-interactive: restoring)");
+        return true;
+    }
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return true;
+    }
+    let ans = line.trim().to_ascii_lowercase();
+    ans.is_empty() || ans == "y" || ans == "yes"
 }
 
 /// attach an existing session; error if it is not live.

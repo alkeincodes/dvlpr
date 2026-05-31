@@ -19,6 +19,10 @@ use crate::input::{MouseEvent, MouseKind};
 use crate::layout::{self, Node, PaneId, Rect, SplitDir, SplitPath};
 use crate::pane::{PaneOutput, PaneRuntime};
 
+/// A freshly-spawned pane and its output receiver; the daemon wires one
+/// forwarder per entry. Used by `Session::restore`'s return.
+type PaneSpawn = (PaneId, mpsc::UnboundedReceiver<PaneOutput>);
+
 struct Pane {
     runtime: PaneRuntime,
     screen: GhosttyScreen,
@@ -51,6 +55,15 @@ struct Pane {
     /// we don't spam the log on every tick for a persistent failure.
     #[allow(dead_code)]
     meta_err_seen: std::collections::HashSet<std::io::ErrorKind>,
+    /// Pane's last-known cwd, captured for every pane (agent or not) on the
+    /// snapshot cadence. None until first resolve.
+    cwd: Option<String>,
+    /// Agent-resume identity captured lazily from the foreground process's open
+    /// transcript. None until captured (or non-agent).
+    agent_resume: crate::persist::AgentResume,
+    /// Foreground pid the `agent_resume` capture is keyed to; recapture when the
+    /// foreground pid changes.
+    captured_for_pid: Option<i32>,
 }
 
 struct Window {
@@ -98,8 +111,8 @@ pub struct Session {
     rows: u16,
     command: Vec<String>,
     cwd: String,
-    /// True when the user has toggled the agent-awareness sidebar visible.
-    /// Default: false (hidden). Toggled by Command::ToggleSidebar.
+    /// Whether the agent-awareness sidebar is shown. Default: true (open) — it's
+    /// the product's headline feature. Toggled by Command::ToggleSidebar.
     /// `layout::compute_regions` may still suppress the sidebar's visual
     /// presence if the viewport is too narrow (see SIDEBAR_MIN_CONTENT_COLS).
     sidebar_visible: bool,
@@ -122,6 +135,8 @@ pub struct Session {
     /// mutually exclusive with `menu`. See
     /// `docs/superpowers/specs/2026-05-29-window-tab-rename-design.md`.
     dialog: Option<crate::dialog::WindowNameDialog>,
+    /// Set by structural mutators; the daemon's snapshot cadence consumes it.
+    snapshot_dirty: bool,
 }
 
 /// Side effects of a command that the run loop must perform: attach a forwarder
@@ -147,6 +162,30 @@ fn initial_window_name(command: &[String]) -> String {
         Some(c) => c.rsplit('/').next().unwrap_or(c).to_string(),
         None => "shell".to_string(),
     }
+}
+
+/// Build the per-pane spawn argv for a resume. `None` → empty (default shell).
+/// The shell path is passed as argv[0] AND the trailing `$0` positional, and the
+/// `-c` string re-execs it via `exec "$0"` — no shell-path interpolation, no
+/// reliance on a `SHELL` env var. The id is assumed already UUID-validated by
+/// `persist::plan_restore` (non-agent panes arrive as `None`).
+fn restore_command(agent: &crate::persist::AgentResume, shell: &str) -> Vec<String> {
+    let verb = match agent {
+        crate::persist::AgentResume::None => return Vec::new(),
+        crate::persist::AgentResume::Claude { session_id, .. } => {
+            format!("claude --resume {session_id}")
+        }
+        crate::persist::AgentResume::Codex { session_id, .. } => {
+            format!("codex resume {session_id}")
+        }
+    };
+    vec![
+        shell.to_string(),
+        "-i".into(),
+        "-c".into(),
+        format!("{verb}; exec \"$0\""),
+        shell.to_string(),
+    ]
 }
 
 /// Outcome of `Session::refresh_agent_states`. Tracks whether anything
@@ -200,6 +239,7 @@ impl Session {
             keys,
             help: None,
             dialog: None,
+            snapshot_dirty: true,
         };
         // The status bar is always present, so the pane fills the content area
         // (viewport minus the bar row), not the whole viewport.
@@ -250,9 +290,209 @@ impl Session {
                 branch: None,
                 meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
                 meta_err_seen: std::collections::HashSet::new(),
+                cwd: None,
+                agent_resume: crate::persist::AgentResume::None,
+                captured_for_pid: None,
             },
         );
         Ok((id, rx))
+    }
+
+    /// Like `spawn_pane`, but with an explicit cwd + command (empty = default shell).
+    fn spawn_pane_with(
+        &mut self,
+        rect: Rect,
+        cwd: &str,
+        command: &[String],
+    ) -> io::Result<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)> {
+        let w = rect.w.max(1);
+        let h = rect.h.max(1);
+        let (runtime, rx) = PaneRuntime::spawn(command, cwd, w, h, &self.session_name)?;
+        let screen = GhosttyScreen::new(w, h);
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        self.panes.insert(
+            id,
+            Pane {
+                runtime,
+                screen,
+                agent_id_pid: None,
+                agent: None,
+                agent_state: detect::AgentState::Idle,
+                idle_streak: 0,
+                session_label: None,
+                branch: None,
+                meta_last_refresh: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                meta_err_seen: std::collections::HashSet::new(),
+                cwd: Some(cwd.to_string()),
+                agent_resume: crate::persist::AgentResume::None,
+                captured_for_pid: None,
+            },
+        );
+        Ok((id, rx))
+    }
+
+    /// Build a `Session` from a snapshot, spawning each pane with its restore command.
+    /// Returns the session and the per-pane output receivers (caller wires forwarders).
+    #[allow(clippy::too_many_arguments)]
+    /// Rebuild a live session from a persisted snapshot. The restore plan is
+    /// computed HERE from `snap` (not passed in) so the per-leaf resume commands
+    /// are structurally locked to the snapshot's DFS leaf order: both
+    /// `plan_restore`/`collect_panes` and the `build_node` walk recurse
+    /// first-then-second over the SAME `snap`, so plan pane `k` always maps to
+    /// snapshot leaf `k`. A foreign/stale plan can no longer be substituted.
+    /// Phase 5's server caller therefore invokes
+    /// `Session::restore(snap, 80, 24, theme, prefix, keys)` with no plan arg.
+    pub fn restore(
+        snap: crate::persist::SessionSnapshot,
+        cols: u16,
+        rows: u16,
+        theme: crate::theme::Theme,
+        prefix: crate::config::KeySpec,
+        keys: crate::config::KeyMap,
+    ) -> io::Result<(Self, Vec<PaneSpawn>)> {
+        // Re-walk the snapshot to derive the plan locally; see doc comment above.
+        let plan = crate::persist::plan_restore(&snap);
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let mut session = Session {
+            session_name: snap.session_name.clone(),
+            windows: Vec::new(),
+            active_window: 0,
+            panes: HashMap::new(),
+            compositor: Compositor::new(),
+            theme,
+            next_pane_id: 1,
+            cols,
+            rows,
+            command: Vec::new(),
+            cwd: std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+            sidebar_visible: snap.sidebar_visible,
+            menu: None,
+            sidebar_width: snap.sidebar_width,
+            prefix,
+            keys,
+            help: None,
+            dialog: None,
+            snapshot_dirty: true,
+        };
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let content = layout::compute_regions(
+            Rect {
+                x: 0,
+                y: 0,
+                w: cols,
+                h: rows.saturating_sub(1).max(1),
+            },
+            snap.sidebar_visible,
+            snap.sidebar_width,
+        )
+        .content_area;
+
+        let mut rxs = Vec::new();
+        // Pull plan panes in tree order to mirror snapshot ordering.
+        let mut plan_iter = plan.panes.iter();
+        for w in &snap.windows {
+            let (root, focus_order) =
+                session.build_node(&w.layout, content, &shell, &home, &mut plan_iter, &mut rxs)?;
+            let focused = *focus_order
+                .get(w.focused_leaf)
+                .or_else(|| focus_order.first())
+                .unwrap();
+            session.windows.push(Window {
+                name: w.name.clone(),
+                name_pinned: w.name_pinned,
+                root,
+                focused,
+                zoomed: w.zoomed,
+            });
+        }
+        session.active_window = snap
+            .active_window
+            .min(session.windows.len().saturating_sub(1));
+        session.relayout_all();
+        Ok((session, rxs))
+    }
+
+    /// Recursively rebuild a layout node, spawning a pane per leaf. Returns the node
+    /// and the leaf PaneIds in tree order (for focus mapping).
+    #[allow(clippy::too_many_arguments)]
+    fn build_node<'a>(
+        &mut self,
+        node: &crate::persist::NodeSnapshot,
+        rect: Rect,
+        shell: &str,
+        home: &str,
+        plan: &mut impl Iterator<Item = &'a crate::persist::PaneRestore>,
+        rxs: &mut Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>,
+    ) -> io::Result<(layout::Node, Vec<PaneId>)> {
+        use crate::persist::NodeSnapshot;
+        match node {
+            NodeSnapshot::Leaf(_) => {
+                let pr = plan.next();
+                // Capture the validated plan agent so we can seed the new pane's
+                // `agent_resume` cache. The resume command is built from this same
+                // agent, so seeding it keeps the on-disk snapshot truthful BEFORE
+                // the live agent is re-detected (otherwise the first snapshot tick
+                // would re-persist `agent_resume: None` and a second crash would
+                // restore a plain shell, losing the conversation).
+                let (cwd, command, seed_agent) = match pr {
+                    Some(p) => {
+                        let cwd = if p.cwd_exists {
+                            p.cwd.clone()
+                        } else {
+                            home.to_string()
+                        };
+                        (cwd, restore_command(&p.agent, shell), p.agent.clone())
+                    }
+                    None => (
+                        home.to_string(),
+                        Vec::new(),
+                        crate::persist::AgentResume::None,
+                    ),
+                };
+                let (id, rx) = self.spawn_pane_with(rect, &cwd, &command)?;
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.agent_resume = seed_agent;
+                    // Leave `captured_for_pid = None` so the live agent's transcript
+                    // is re-verified/updated once it paints (it may continue under a
+                    // new session id).
+                }
+                rxs.push((id, rx));
+                Ok((layout::Node::Leaf(id), vec![id]))
+            }
+            NodeSnapshot::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let d = match dir {
+                    crate::persist::SplitDirSnap::Horizontal => layout::SplitDir::Horizontal,
+                    crate::persist::SplitDirSnap::Vertical => layout::SplitDir::Vertical,
+                };
+                // Children get the parent `rect` as a NOMINAL initial size. There is no
+                // public `layout::split_rect`, and duplicating the private
+                // `layout::split_area` here would be pointless: `relayout_all` (called
+                // once at the end of `restore`) recomputes every pane rect from the tree
+                // + ratios and resizes each PTY/screen, so the approximate initial size
+                // only lasts a few ms before first paint.
+                let (fnode, mut forder) = self.build_node(first, rect, shell, home, plan, rxs)?;
+                let (snode, sorder) = self.build_node(second, rect, shell, home, plan, rxs)?;
+                forder.extend(sorder);
+                Ok((
+                    layout::Node::Split {
+                        dir: d,
+                        ratio: *ratio,
+                        first: Box::new(fnode),
+                        second: Box::new(snode),
+                    },
+                    forder,
+                ))
+            }
+        }
     }
 
     /// Return the configured sidebar width (columns).
@@ -277,6 +517,7 @@ impl Session {
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.relayout_all();
+        self.mark_snapshot_dirty();
     }
 
     /// True if the context menu is currently open. Exposed for
@@ -284,6 +525,82 @@ impl Session {
     /// itself stays encapsulated.
     pub fn menu_open(&self) -> bool {
         self.menu.is_some()
+    }
+
+    /// True if a structural change occurred since the last `take_snapshot_dirty`.
+    pub fn take_snapshot_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.snapshot_dirty, false)
+    }
+
+    /// Re-request a snapshot so the next snapshot tick writes again. Used by the
+    /// server to retry after a transient `write_atomic` failure (the dirty bit
+    /// was already consumed by `take_snapshot_dirty`, so without this the write
+    /// would not be retried until the next structural/volatile change).
+    pub fn request_snapshot(&mut self) {
+        self.snapshot_dirty = true;
+    }
+
+    fn mark_snapshot_dirty(&mut self) {
+        self.snapshot_dirty = true;
+    }
+
+    /// Build a persistable snapshot of the current layout + per-pane restore identity.
+    pub fn snapshot(&self) -> crate::persist::SessionSnapshot {
+        use crate::persist::*;
+        let windows = self
+            .windows
+            .iter()
+            .map(|w| {
+                let order = layout::all_panes(&w.root);
+                let focused_leaf = order.iter().position(|p| *p == w.focused).unwrap_or(0);
+                WindowSnapshot {
+                    name: w.name.clone(),
+                    name_pinned: w.name_pinned,
+                    zoomed: w.zoomed,
+                    focused_leaf,
+                    layout: self.node_snapshot(&w.root),
+                }
+            })
+            .collect();
+        SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: self.session_name.clone(),
+            sidebar_visible: self.sidebar_visible,
+            sidebar_width: self.sidebar_width,
+            active_window: self.active_window,
+            windows,
+        }
+    }
+
+    fn node_snapshot(&self, node: &layout::Node) -> crate::persist::NodeSnapshot {
+        use crate::persist::*;
+        match node {
+            layout::Node::Leaf(id) => {
+                let pane = self.panes.get(id);
+                NodeSnapshot::Leaf(PaneSnapshot {
+                    cwd: pane
+                        .and_then(|p| p.cwd.clone())
+                        .unwrap_or_else(|| self.cwd.clone()),
+                    agent: pane
+                        .map(|p| p.agent_resume.clone())
+                        .unwrap_or(AgentResume::None),
+                })
+            }
+            layout::Node::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => NodeSnapshot::Split {
+                dir: match dir {
+                    layout::SplitDir::Horizontal => SplitDirSnap::Horizontal,
+                    layout::SplitDir::Vertical => SplitDirSnap::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(self.node_snapshot(first)),
+                second: Box::new(self.node_snapshot(second)),
+            },
+        }
     }
 
     /// Post-parser keyboard intercept. Returns `true` if the event was
@@ -545,6 +862,9 @@ impl Session {
             w.name = name;
             w.name_pinned = true;
         }
+        // A rename changes restorable state; flag a fresh snapshot (shared by the
+        // rename dialog and the control CLI so the cadence stays correct for both).
+        self.mark_snapshot_dirty();
     }
 
     /// Create a new window (optionally with a pinned name) and focus it. Public
@@ -820,6 +1140,11 @@ impl Session {
         let win = &self.windows[self.active_window];
         let agent_entries = self.agent_entries();
         let help_view = self.help.as_ref().map(|h| self.build_help_view(h));
+        let toggle_hint = format!(
+            "{} {}: hide",
+            crate::help::render_keyspec(&self.prefix),
+            crate::help::render_keyspec(&self.keys.toggle_sidebar),
+        );
         self.compositor.compose(
             viewport,
             &win.root,
@@ -836,6 +1161,7 @@ impl Session {
             self.menu.as_ref(),
             help_view.as_ref(),
             self.dialog.as_ref(),
+            &toggle_hint,
         )
     }
 
@@ -888,9 +1214,19 @@ impl Session {
 
     /// Clear the active window's zoom flag (called before any layout change so the
     /// user never lands in a "split happened but I can't see it" state).
+    ///
+    /// Marks the snapshot dirty whenever it actually flips a window from
+    /// zoomed -> unzoomed. Callers often unzoom first and only mark dirty after a
+    /// follow-up op that can no-op or fail (e.g. `split_focused` bailing on tiny
+    /// geometry, or a spawn failure), so persisting the unzoom here guarantees it
+    /// survives the daemon snapshot cadence regardless of what the caller does next.
+    /// A no-op unzoom (nothing was zoomed) does NOT mark dirty.
     fn unzoom_active(&mut self) {
         if let Some(win) = self.windows.get_mut(self.active_window) {
-            win.zoomed = false;
+            if win.zoomed {
+                win.zoomed = false;
+                self.mark_snapshot_dirty();
+            }
         }
     }
 
@@ -923,6 +1259,7 @@ impl Session {
                 if !self.windows.is_empty() {
                     self.unzoom_active();
                     self.active_window = (self.active_window + 1) % self.windows.len();
+                    self.mark_snapshot_dirty();
                 }
                 self.menu = None;
             }
@@ -931,6 +1268,7 @@ impl Session {
                     self.unzoom_active();
                     let n = self.windows.len();
                     self.active_window = (self.active_window + n - 1) % n;
+                    self.mark_snapshot_dirty();
                 }
                 self.menu = None;
             }
@@ -940,6 +1278,7 @@ impl Session {
                     if idx < self.windows.len() {
                         self.unzoom_active();
                         self.active_window = idx;
+                        self.mark_snapshot_dirty();
                     }
                 }
                 self.menu = None;
@@ -949,6 +1288,7 @@ impl Session {
                     win.zoomed = !win.zoomed;
                 }
                 self.relayout_all();
+                self.mark_snapshot_dirty();
             }
             Command::ToggleSidebar => {
                 self.toggle_sidebar();
@@ -1017,6 +1357,7 @@ impl Session {
         );
         self.windows[wi].focused = new_id;
         self.relayout_all();
+        self.mark_snapshot_dirty();
         eff.spawned.push((new_id, rx));
     }
 
@@ -1049,6 +1390,7 @@ impl Session {
         });
         self.active_window = self.windows.len() - 1;
         self.relayout_all();
+        self.mark_snapshot_dirty();
         eff.spawned.push((id, rx));
     }
 
@@ -1114,6 +1456,7 @@ impl Session {
         }
         self.relayout_all();
         self.reconcile_menu();
+        self.mark_snapshot_dirty();
         removed
     }
 
@@ -1151,10 +1494,15 @@ impl Session {
 
     /// Focus a pane by id if it belongs to the active window.
     fn focus(&mut self, pane_id: PaneId) {
+        let mut changed = false;
         if let Some(win) = self.windows.get_mut(self.active_window) {
-            if layout::all_panes(&win.root).contains(&pane_id) {
+            if layout::all_panes(&win.root).contains(&pane_id) && win.focused != pane_id {
                 win.focused = pane_id;
+                changed = true;
             }
+        }
+        if changed {
+            self.mark_snapshot_dirty();
         }
     }
 
@@ -1320,6 +1668,7 @@ impl Session {
                 if idx < self.windows.len() {
                     self.unzoom_active();
                     self.active_window = idx;
+                    self.mark_snapshot_dirty();
                 }
                 None
             }
@@ -1345,6 +1694,7 @@ impl Session {
                 }
                 // 6. Cascade layout (zoom may have changed).
                 self.relayout_all();
+                self.mark_snapshot_dirty();
                 None
             }
             // Dispatched in handle_mouse (needs a CommandEffect); never
@@ -1363,6 +1713,55 @@ impl Session {
             .get(self.active_window)
             .map(|w| w.zoomed)
             .unwrap_or(false)
+    }
+
+    /// Drive `unzoom_active` directly so a test can assert its dirty-marking
+    /// contract independently of any follow-up split/new-window that might
+    /// no-op or fail.
+    #[cfg(test)]
+    pub fn unzoom_active_for_test(&mut self) {
+        self.unzoom_active();
+    }
+
+    /// Seed a pane's persisted agent-resume value, simulating a prior capture so
+    /// `refresh_restore_meta` clearing behavior is observable.
+    #[cfg(test)]
+    pub fn set_pane_agent_resume_for_test(
+        &mut self,
+        id: PaneId,
+        resume: crate::persist::AgentResume,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.agent_resume = resume;
+        }
+    }
+
+    /// Read back a pane's persisted agent-resume value (mirror of
+    /// `set_pane_agent_resume_for_test`) so restore/seed tests can assert it.
+    #[cfg(test)]
+    pub fn pane_agent_resume_for_test(&self, id: PaneId) -> crate::persist::AgentResume {
+        self.panes
+            .get(&id)
+            .map(|p| p.agent_resume.clone())
+            .unwrap_or(crate::persist::AgentResume::None)
+    }
+
+    /// Force a pane's `captured_for_pid`, simulating a previously-CONFIRMED live
+    /// agent so `refresh_restore_meta`'s clear branch is observable.
+    #[cfg(test)]
+    pub fn set_pane_captured_for_pid_for_test(&mut self, id: PaneId, pid: Option<i32>) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.captured_for_pid = pid;
+        }
+    }
+
+    /// Force a pane's agent classification (the `kind` that drives
+    /// `refresh_restore_meta`'s clear-vs-capture branch).
+    #[cfg(test)]
+    pub fn set_pane_agent_kind_for_test(&mut self, id: PaneId, kind: Option<detect::Agent>) {
+        if let Some(pane) = self.panes.get_mut(&id) {
+            pane.agent = kind;
+        }
     }
 
     #[cfg(test)]
@@ -1432,6 +1831,94 @@ impl Session {
                 if new != win.name {
                     win.name = new;
                     changed = true;
+                }
+            }
+        }
+        if changed {
+            self.mark_snapshot_dirty();
+        }
+        changed
+    }
+
+    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus the agent's
+    /// transcript identity discovered BY CWD (agents open-append-close their
+    /// transcripts, so there is no fd to enumerate — see `procinfo::agent_transcript`).
+    /// Returns true if any pane's cwd or agent_resume changed (→ caller marks the
+    /// snapshot dirty). Resolvers are injected for testability (prod:
+    /// `procinfo::pid_cwd` and `procinfo::agent_transcript`).
+    pub fn refresh_restore_meta(
+        &mut self,
+        resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
+        resolve_transcript: impl Fn(&str, detect::Agent) -> Option<(std::path::PathBuf, String)>,
+    ) -> bool {
+        let mut changed = false;
+        // Collect (id, fg_pid, agent_kind) first to avoid borrow conflicts.
+        let work: Vec<(PaneId, Option<i32>, Option<detect::Agent>)> = self
+            .panes
+            .iter()
+            .map(|(id, p)| (*id, p.runtime.foreground_pid(), p.agent))
+            .collect();
+        for (id, fg_pid, kind) in work {
+            let Some(pane) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            // cwd: every pane, but only when a foreground pid exists to resolve.
+            if let Some(pid) = fg_pid {
+                if let Some(dir) = resolve_cwd(pid) {
+                    let s = dir.to_string_lossy().to_string();
+                    if pane.cwd.as_deref() != Some(s.as_str()) {
+                        pane.cwd = Some(s);
+                        changed = true;
+                    }
+                }
+            }
+            // agent transcript: discovered by the pane's cwd, re-run each tick so we
+            // converge on the LIVE session id right after launch (and after a /clear
+            // spawns a new transcript). A directory read is cheap.
+            match kind {
+                Some(k) => {
+                    // Discover only when we know the pane's cwd. A `None` result means
+                    // the transcript isn't on disk yet (still booting) or this is a
+                    // restored pane in its transient shell phase — keep the seeded /
+                    // previously-captured resume and retry next tick; never wipe it here.
+                    if let Some(cwd) = pane.cwd.clone() {
+                        if let Some((path, sid)) = resolve_transcript(&cwd, k) {
+                            let resume = match k {
+                                detect::Agent::Claude => crate::persist::AgentResume::Claude {
+                                    session_id: sid,
+                                    transcript: path.to_string_lossy().to_string(),
+                                },
+                                detect::Agent::Codex => crate::persist::AgentResume::Codex {
+                                    session_id: sid,
+                                    transcript: path.to_string_lossy().to_string(),
+                                },
+                            };
+                            if pane.agent_resume != resume {
+                                pane.agent_resume = resume;
+                                changed = true;
+                            }
+                            // Mark CONFIRMED so the clear branch below knows a real
+                            // agent was live here (used when it later exits to a shell).
+                            if let Some(pid) = fg_pid {
+                                pane.captured_for_pid = Some(pid);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // No agent classification right now. Only clear when we had a
+                    // CONFIRMED live agent (real pid) that is now gone — i.e. the
+                    // pane became a plain shell. A restored/seeded pane briefly
+                    // runs the shell before `claude`/`codex` paints, so its `kind`
+                    // is transiently `None`; that seeded-but-unconfirmed state must
+                    // keep its resume id (captured_for_pid is still None).
+                    if pane.captured_for_pid.is_some() {
+                        if pane.agent_resume != crate::persist::AgentResume::None {
+                            pane.agent_resume = crate::persist::AgentResume::None;
+                            changed = true;
+                        }
+                        pane.captured_for_pid = None;
+                    }
                 }
             }
         }
@@ -1708,11 +2195,17 @@ impl Session {
         };
         layout::set_ratio(&mut win.root, path, ratio); // clamps to [0.05, 0.95]
         self.relayout_all();
+        self.mark_snapshot_dirty();
     }
 
     #[cfg(test)]
     pub fn window_pane_ids(&self, idx: usize) -> Vec<PaneId> {
         layout::all_panes(&self.windows[idx].root)
+    }
+
+    #[cfg(test)]
+    pub fn pane_cwd_for_test(&self, id: PaneId) -> Option<String> {
+        self.panes.get(&id).and_then(|p| p.cwd.clone())
     }
 
     #[cfg(test)]
@@ -2691,6 +3184,43 @@ mod tests {
         assert!(
             regions.sidebar.is_some(),
             "sidebar region present at 80 cols"
+        );
+    }
+
+    #[test]
+    fn compose_renders_toggle_hint_footer_in_sidebar() {
+        let (session, _id, _rx) = Session::new(
+            "test".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            ".".to_string(),
+            120,
+            30,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        )
+        .expect("session");
+        let grid = session.compose();
+        let cols = 120usize;
+        let regions = crate::layout::compute_regions(
+            crate::layout::Rect {
+                x: 0,
+                y: 0,
+                w: 120,
+                h: 30,
+            },
+            true,
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+        );
+        let sb = regions.sidebar.expect("sidebar visible at 120x30");
+        let footer_y = (sb.y + sb.h - 1) as usize;
+        let row: String = (0..cols)
+            .map(|x| grid.cells[footer_y * cols + x].ch)
+            .collect();
+        assert!(
+            row.contains("C-b s: hide"),
+            "footer hint on sidebar bottom row: {row:?}"
         );
     }
 
@@ -4408,5 +4938,494 @@ mod tests {
             before + 1,
             "NewWindow stays a direct create"
         );
+    }
+
+    /// Session + first pane for the snapshot/restore-meta tests. Uses a long-lived
+    /// `sleep` in the workspace dir so the spawn is allowed by the test sandbox
+    /// (cwd values used in assertions come from injected resolvers, not the spawn).
+    fn snapshot_test_session() -> (
+        Session,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::UnboundedReceiver<crate::pane::PaneOutput>,
+    ) {
+        Session::new(
+            "work".into(),
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            ".".into(),
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            26,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pane_output_does_not_mark_snapshot_dirty_but_split_does() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Consume the initial (construction) dirty flag.
+        assert!(s.take_snapshot_dirty());
+        // Ordinary terminal output is applied via feed() — must NOT mark dirty.
+        s.feed(id, b"hello world\x1b[2J some redraw traffic");
+        assert!(
+            !s.take_snapshot_dirty(),
+            "pane output must not trigger a snapshot write"
+        );
+        // A structural change DOES mark dirty.
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+        assert!(
+            s.take_snapshot_dirty(),
+            "a split must trigger a snapshot write"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_tree_shape_names_and_focus() {
+        let (mut s, _id, _rx) = snapshot_test_session();
+        // One vertical split → two leaves; focus is the new (second) leaf.
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+
+        let snap = s.snapshot();
+        assert_eq!(snap.session_name, "work");
+        assert_eq!(snap.windows.len(), 1);
+        match &snap.windows[0].layout {
+            crate::persist::NodeSnapshot::Split { first, second, .. } => {
+                assert!(matches!(**first, crate::persist::NodeSnapshot::Leaf(_)));
+                assert!(matches!(**second, crate::persist::NodeSnapshot::Leaf(_)));
+            }
+            _ => panic!("expected a split"),
+        }
+        // Focus is the second leaf (index 1 in tree order).
+        assert_eq!(snap.windows[0].focused_leaf, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_restore_meta_caches_cwd_for_non_agent_pane() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Resolver stubs: cwd resolves to /work for any pid; no agent transcript.
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+        assert!(changed);
+        assert_eq!(s.pane_cwd_for_test(id).as_deref(), Some("/work"));
+    }
+
+    #[tokio::test]
+    async fn refresh_restore_meta_captures_agent_resume_via_cwd() {
+        // The core capture path that the fd-based discovery broke in production:
+        // a Claude pane whose transcript is discovered BY CWD must populate
+        // `agent_resume` so it lands in the snapshot (and thus the restore).
+        let (mut s, id, _rx) = snapshot_test_session();
+        s.set_pane_agent_kind_for_test(id, Some(detect::Agent::Claude));
+        let tpath =
+            "/home/u/.claude/projects/-work-proj/11111111-2222-3333-4444-555555555555.jsonl";
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work/proj")),
+            |cwd, kind| {
+                // The resolver is now driven by CWD (not pid).
+                assert_eq!(cwd, "/work/proj");
+                assert_eq!(kind, detect::Agent::Claude);
+                Some((
+                    std::path::PathBuf::from(tpath),
+                    "11111111-2222-3333-4444-555555555555".to_string(),
+                ))
+            },
+        );
+        assert!(changed);
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            crate::persist::AgentResume::Claude {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: tpath.into(),
+            }
+        );
+    }
+
+    // Fix 1: unzoom_active must persist the unzoom itself (mark snapshot dirty)
+    // whenever it really flips zoomed -> unzoomed, because callers often unzoom
+    // first and only mark dirty after a follow-up op that can no-op or fail. A
+    // no-op unzoom (nothing was zoomed) must NOT mark dirty.
+    #[tokio::test]
+    async fn unzoom_marks_snapshot_dirty() {
+        let (mut s, _id, _rx) = snapshot_test_session();
+        // Two panes so a zoom is meaningful, then zoom the active window.
+        s.apply_command(Command::SplitVertical);
+        s.apply_command(Command::ToggleZoom);
+        assert!(s.active_zoomed_for_test(), "window should be zoomed");
+        // Consume any pending dirty from the split/zoom.
+        let _ = s.take_snapshot_dirty();
+
+        // A real unzoom (zoomed -> unzoomed) must mark dirty on its own.
+        s.unzoom_active_for_test();
+        assert!(!s.active_zoomed_for_test());
+        assert!(
+            s.take_snapshot_dirty(),
+            "a real unzoom must mark the snapshot dirty even if no follow-up op does"
+        );
+
+        // A no-op unzoom (nothing was zoomed) must NOT mark dirty.
+        s.unzoom_active_for_test();
+        assert!(
+            !s.take_snapshot_dirty(),
+            "a no-op unzoom must not mark the snapshot dirty"
+        );
+    }
+
+    // Fix 2: when a pane stops being an agent (kind == None) it must have its
+    // stale `agent_resume` cleared even if the foreground pid is momentarily
+    // absent — the clearing branch must not be gated behind a present fg_pid.
+    // The clear only fires for a CONFIRMED prior capture (captured_for_pid set);
+    // a seeded-but-unconfirmed restore pane is covered by a separate test.
+    #[tokio::test]
+    async fn refresh_restore_meta_clears_agent_resume_when_pane_stops_being_agent() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Seed a prior Claude capture confirmed against a real pid, then classify
+        // the pane as a non-agent (the live agent process has exited).
+        s.set_pane_agent_resume_for_test(
+            id,
+            crate::persist::AgentResume::Claude {
+                session_id: "abc-123".into(),
+                transcript: "/tmp/transcript.jsonl".into(),
+            },
+        );
+        s.set_pane_captured_for_pid_for_test(id, Some(4242));
+        s.set_pane_agent_kind_for_test(id, None);
+
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert!(changed, "clearing a stale agent_resume counts as a change");
+        let snap = s.snapshot();
+        let leaf = match &snap.windows[0].layout {
+            crate::persist::NodeSnapshot::Leaf(l) => l,
+            _ => panic!("expected single leaf"),
+        };
+        assert_eq!(
+            leaf.agent,
+            crate::persist::AgentResume::None,
+            "non-agent pane must have its stale agent_resume cleared"
+        );
+    }
+
+    // BRANCH-review fix (re-snapshot degradation): a restored agent pane must
+    // carry its validated resume id from the moment of restore. Otherwise the
+    // first 1s snapshot tick (the session starts dirty) would re-persist
+    // `agent_resume: None` before the live agent is re-detected, and a SECOND
+    // crash would restore a plain shell — losing the conversation.
+    #[tokio::test]
+    async fn restore_seeds_agent_resume_from_plan() {
+        use crate::persist::{
+            AgentResume, NodeSnapshot, PaneSnapshot, SessionSnapshot, SCHEMA_VERSION,
+        };
+
+        // An EXISTING cwd + an EXISTING transcript file (both under the workspace)
+        // so plan_restore keeps the agent instead of downgrading it. The session
+        // id is a canonical UUID (also required by plan_restore validation).
+        std::fs::create_dir_all("./.tmp_seed_cwd").unwrap();
+        let cwd = std::fs::canonicalize("./.tmp_seed_cwd")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let transcript = "./.tmp_seed_transcript.jsonl";
+        std::fs::write(transcript, b"{}\n").unwrap();
+        let transcript_abs = std::fs::canonicalize(transcript)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let session_id = "11111111-2222-3333-4444-555555555555".to_string();
+
+        let seeded = AgentResume::Claude {
+            session_id: session_id.clone(),
+            transcript: transcript_abs.clone(),
+        };
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "seed".into(),
+            sidebar_visible: false,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![crate::persist::WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Leaf(PaneSnapshot {
+                    cwd: cwd.clone(),
+                    agent: seeded.clone(),
+                }),
+            }],
+        };
+
+        let (r, _rxs) = Session::restore(
+            snap,
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        let leaves = layout::all_panes(&r.windows[0].root);
+        assert_eq!(leaves.len(), 1);
+        // Immediately after restore — before any agent re-detection — the pane
+        // must already hold the validated resume id, so an immediate snapshot
+        // would preserve it.
+        assert_eq!(
+            r.pane_agent_resume_for_test(leaves[0]),
+            seeded,
+            "restored pane must be seeded with the validated plan agent_resume"
+        );
+
+        let _ = std::fs::remove_dir_all("./.tmp_seed_cwd");
+        let _ = std::fs::remove_file(transcript);
+    }
+
+    // BRANCH-review fix: while a restored agent pane is still in its transient
+    // shell phase (claude/codex not yet painted → kind == None, no confirmed
+    // capture), a refresh that can't find the transcript yet must NOT wipe the
+    // seeded resume — it retries on the next tick instead.
+    #[tokio::test]
+    async fn refresh_restore_meta_keeps_seed_during_shell_phase() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        let seeded = crate::persist::AgentResume::Claude {
+            session_id: "abc-123".into(),
+            transcript: "/tmp/seed.jsonl".into(),
+        };
+        s.set_pane_agent_resume_for_test(id, seeded.clone());
+        // Transient shell phase: not yet classified, never confirmed.
+        s.set_pane_agent_kind_for_test(id, None);
+        s.set_pane_captured_for_pid_for_test(id, None);
+
+        // Resolver finds no transcript yet.
+        let _ = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            seeded,
+            "seeded resume must survive the transient shell phase (not yet confirmed)"
+        );
+    }
+
+    // BRANCH-review fix: once a live agent has been CONFIRMED (captured_for_pid
+    // set) and it later exits (kind → None), the stale resume must be cleared so
+    // the pane snapshots as a plain shell, and that counts as a change.
+    #[tokio::test]
+    async fn refresh_restore_meta_clears_after_confirmed_agent_exits() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        s.set_pane_agent_resume_for_test(
+            id,
+            crate::persist::AgentResume::Claude {
+                session_id: "abc-123".into(),
+                transcript: "/tmp/seed.jsonl".into(),
+            },
+        );
+        // A previously-confirmed live agent on a real pid, now gone.
+        s.set_pane_captured_for_pid_for_test(id, Some(9999));
+        s.set_pane_agent_kind_for_test(id, None);
+
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+
+        assert!(
+            changed,
+            "clearing a confirmed-but-now-gone agent counts as a change"
+        );
+        assert_eq!(
+            s.pane_agent_resume_for_test(id),
+            crate::persist::AgentResume::None,
+            "a confirmed agent that exited must have its resume cleared"
+        );
+    }
+
+    #[test]
+    fn resume_argv_uses_positional_dollar_zero_and_validated_uuid() {
+        let shell = "/bin/zsh";
+        let claude = restore_command(
+            &crate::persist::AgentResume::Claude {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: "/t.jsonl".into(),
+            },
+            shell,
+        );
+        assert_eq!(
+            claude,
+            vec![
+                "/bin/zsh".to_string(),
+                "-i".into(),
+                "-c".into(),
+                "claude --resume 11111111-2222-3333-4444-555555555555; exec \"$0\"".into(),
+                "/bin/zsh".into(),
+            ]
+        );
+        // Codex verb.
+        let codex = restore_command(
+            &crate::persist::AgentResume::Codex {
+                session_id: "11111111-2222-3333-4444-555555555555".into(),
+                transcript: "/t.jsonl".into(),
+            },
+            shell,
+        );
+        assert!(codex[3].starts_with("codex resume 11111111-"));
+        // None → empty (default shell).
+        assert!(restore_command(&crate::persist::AgentResume::None, shell).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_round_trips_tree_focus_and_active_window() {
+        // Build a 2-window session: window 0 has a vertical split, window 1 a single pane.
+        let (mut s, _id, _rx) = snapshot_test_session();
+        let mut eff = CommandEffect::default();
+        s.split_focused(layout::SplitDir::Vertical, &mut eff);
+        s.new_window(None, &mut eff); // window 1
+                                      // Snapshot, then force every pane's agent to None + a real cwd so restore
+                                      // spawns plain shells (no claude/codex needed). The test sandbox only
+                                      // allows spawning inside the workspace tree, so use "." (not "/tmp").
+        let mut snap = s.snapshot();
+        for w in &mut snap.windows {
+            set_all_cwd(&mut w.layout, ".");
+        }
+
+        let (r, rxs) = Session::restore(
+            snap.clone(),
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        let back = r.snapshot();
+        // Same window count, same active window, same tree shapes, same focus indices.
+        assert_eq!(back.windows.len(), snap.windows.len());
+        assert_eq!(back.active_window, snap.active_window);
+        for (a, b) in snap.windows.iter().zip(&back.windows) {
+            assert_eq!(node_shape(&a.layout), node_shape(&b.layout));
+            assert_eq!(a.focused_leaf, b.focused_leaf);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.zoomed, b.zoomed);
+        }
+        assert_eq!(rxs.len(), 3); // 2 panes in window 0 + 1 in window 1
+    }
+
+    /// Regression for the plan/snapshot coupling: each restored leaf must inherit
+    /// ITS OWN snapshot leaf's cwd, never a swapped sibling's. We build a split
+    /// with two leaves carrying DISTINCT existing cwds, restore, then walk the
+    /// restored root's leaves in tree order and check pane k == snapshot leaf k.
+    ///
+    /// Lockstep-test variant: workspace-subdir. The sandbox only permits PTY
+    /// spawns inside the workspace tree, so the two distinct cwds are created
+    /// UNDER the workspace (`./.tmp_restore_a`, `./.tmp_restore_b`) and cleaned
+    /// up at test end, rather than via `tempfile::tempdir()` (which lands in
+    /// /tmp and would block the spawn).
+    #[tokio::test]
+    async fn restore_maps_each_leaf_to_its_own_snapshot_cwd() {
+        use crate::persist::{
+            AgentResume, NodeSnapshot, PaneSnapshot, SessionSnapshot, SplitDirSnap, WindowSnapshot,
+            SCHEMA_VERSION,
+        };
+
+        // Two distinct, existing cwds under the workspace so plan_restore keeps
+        // them (cwd_exists == true) instead of downgrading to $HOME.
+        std::fs::create_dir_all("./.tmp_restore_a").unwrap();
+        std::fs::create_dir_all("./.tmp_restore_b").unwrap();
+        let cwd_a = std::fs::canonicalize("./.tmp_restore_a")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cwd_b = std::fs::canonicalize("./.tmp_restore_b")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(cwd_a, cwd_b);
+
+        let leaf = |cwd: &str| {
+            NodeSnapshot::Leaf(PaneSnapshot {
+                cwd: cwd.into(),
+                agent: AgentResume::None,
+            })
+        };
+        let snap = SessionSnapshot {
+            schema_version: SCHEMA_VERSION,
+            session_name: "lockstep".into(),
+            sidebar_visible: false,
+            sidebar_width: 26,
+            active_window: 0,
+            windows: vec![WindowSnapshot {
+                name: "w".into(),
+                name_pinned: false,
+                zoomed: false,
+                focused_leaf: 0,
+                layout: NodeSnapshot::Split {
+                    dir: SplitDirSnap::Vertical,
+                    ratio: 0.5,
+                    first: Box::new(leaf(&cwd_a)),
+                    second: Box::new(leaf(&cwd_b)),
+                },
+            }],
+        };
+
+        let (r, _rxs) = Session::restore(
+            snap,
+            80,
+            24,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+        )
+        .unwrap();
+
+        // Walk the restored window's leaves in tree order; leaf 0 must carry
+        // cwd_a, leaf 1 cwd_b — proving no cross-leaf swap.
+        let leaves = layout::all_panes(&r.windows[0].root);
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(
+            r.pane_cwd_for_test(leaves[0]).as_deref(),
+            Some(cwd_a.as_str())
+        );
+        assert_eq!(
+            r.pane_cwd_for_test(leaves[1]).as_deref(),
+            Some(cwd_b.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all("./.tmp_restore_a");
+        let _ = std::fs::remove_dir_all("./.tmp_restore_b");
+    }
+
+    // Test helpers.
+    fn set_all_cwd(node: &mut crate::persist::NodeSnapshot, cwd: &str) {
+        match node {
+            crate::persist::NodeSnapshot::Leaf(p) => {
+                p.cwd = cwd.into();
+                p.agent = crate::persist::AgentResume::None;
+            }
+            crate::persist::NodeSnapshot::Split { first, second, .. } => {
+                set_all_cwd(first, cwd);
+                set_all_cwd(second, cwd);
+            }
+        }
+    }
+    fn node_shape(node: &crate::persist::NodeSnapshot) -> String {
+        match node {
+            crate::persist::NodeSnapshot::Leaf(_) => "L".into(),
+            crate::persist::NodeSnapshot::Split {
+                first, second, dir, ..
+            } => {
+                format!("({:?} {} {})", dir, node_shape(first), node_shape(second))
+            }
+        }
     }
 }

@@ -12,6 +12,7 @@ pub mod input;
 pub mod layout;
 pub mod menu;
 pub mod pane;
+pub mod persist;
 pub mod procinfo;
 pub mod protocol;
 pub mod server;

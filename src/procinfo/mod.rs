@@ -205,12 +205,195 @@ pub fn pid_cwd(_pid: i32) -> Option<std::path::PathBuf> {
     None
 }
 
+use std::path::PathBuf;
+
+/// If `path` is an agent transcript of `kind`, return its session uuid.
+/// Claude: `**/.claude/projects/**/<uuid>.jsonl` (filename stem is the uuid).
+/// Codex:  `**/.codex/sessions/**/rollout-*-<uuid>.jsonl` (trailing uuid).
+pub fn transcript_id_for(path: &str, kind: crate::detect::Agent) -> Option<String> {
+    if !path.ends_with(".jsonl") {
+        return None;
+    }
+    let stem = std::path::Path::new(path).file_stem()?.to_str()?;
+    match kind {
+        crate::detect::Agent::Claude => {
+            if !path.contains("/.claude/projects/") {
+                return None;
+            }
+            crate::persist::is_canonical_uuid(stem).then(|| stem.to_string())
+        }
+        crate::detect::Agent::Codex => {
+            if !path.contains("/.codex/sessions/") || !stem.starts_with("rollout-") {
+                return None;
+            }
+            // The uuid is the trailing 5 hyphen-groups of the stem.
+            let tail: Vec<&str> = stem.rsplit('-').take(5).collect();
+            if tail.len() < 5 {
+                return None;
+            }
+            let uuid: String = tail.into_iter().rev().collect::<Vec<_>>().join("-");
+            crate::persist::is_canonical_uuid(&uuid).then_some(uuid)
+        }
+    }
+}
+
+/// Resolve `$HOME` for locating agent transcript dirs (env-driven so the daemon
+/// honors the user's real home; `agent_transcript_in` takes it as a param for tests).
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Claude derives its project-dir name from the cwd by replacing every `/` and `.`
+/// with `-` (e.g. `/a/b/.c` -> `-a-b--c`). Verified against real
+/// `~/.claude/projects/` directory names.
+fn claude_project_dirname(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Newest `*.jsonl` (by mtime) directly inside `dir`, if any.
+fn newest_jsonl(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(m) = e.metadata().and_then(|md| md.modified()) else {
+            continue;
+        };
+        if newest.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+            newest = Some((m, p));
+        }
+    }
+    newest.map(|(_, p)| p)
+}
+
+/// Discover the LIVE transcript for an agent running in `cwd`, returning
+/// `(full path, session uuid)`. Agents open-append-CLOSE their transcripts — they
+/// do NOT hold the fd open — so we locate the file by directory + recency, not by
+/// enumerating open file descriptors. (Verified empirically: a live `claude` never
+/// holds its `.jsonl` open.) This is how `claude --resume` itself scopes by cwd.
+pub fn agent_transcript(cwd: &str, kind: crate::detect::Agent) -> Option<(PathBuf, String)> {
+    agent_transcript_in(&home_dir()?, cwd, kind)
+}
+
+/// Home-injected core of `agent_transcript` (testable without mutating `$HOME`).
+fn agent_transcript_in(
+    home: &std::path::Path,
+    cwd: &str,
+    kind: crate::detect::Agent,
+) -> Option<(PathBuf, String)> {
+    match kind {
+        // Claude: `~/.claude/projects/<munged-cwd>/` → newest `<uuid>.jsonl`.
+        crate::detect::Agent::Claude => {
+            let dir = home
+                .join(".claude/projects")
+                .join(claude_project_dirname(cwd));
+            let path = newest_jsonl(&dir)?;
+            let id = transcript_id_for(&path.to_string_lossy(), kind)?;
+            Some((path, id))
+        }
+        // Codex sessions are date-foldered, not cwd-foldered: find the most-recent
+        // `rollout-*.jsonl` whose first-line `payload.cwd` matches `cwd`.
+        crate::detect::Agent::Codex => codex_transcript_for_cwd(home, cwd),
+    }
+}
+
+/// Most-recent codex rollout whose recorded cwd equals `cwd`. Bounded scan: the
+/// newest ~64 rollout files by mtime.
+fn codex_transcript_for_cwd(home: &std::path::Path, cwd: &str) -> Option<(PathBuf, String)> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    collect_rollouts(&home.join(".codex/sessions"), 0, &mut files);
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    files.into_iter().take(64).find_map(|(_, path)| {
+        let (c, id) = codex_head_cwd_id(&path)?;
+        (c == cwd).then_some((path, id))
+    })
+}
+
+/// Recurse at most `YYYY/MM/DD` (3 levels) collecting `rollout-*.jsonl` + mtimes.
+fn collect_rollouts(
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(std::time::SystemTime, PathBuf)>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            if depth < 3 {
+                collect_rollouts(&e.path(), depth + 1, out);
+            }
+        } else if let Some(name) = e.path().file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                if let Ok(m) = e.metadata().and_then(|md| md.modified()) {
+                    out.push((m, e.path()));
+                }
+            }
+        }
+    }
+}
+
+/// Pull `(payload.cwd, payload.id)` from a codex rollout's first JSONL line.
+fn codex_head_cwd_id(path: &std::path::Path) -> Option<(String, String)> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(f).read_line(&mut line).ok()?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let p = v.get("payload")?;
+    let cwd = p.get("cwd")?.as_str()?.to_string();
+    let id = p.get("id")?.as_str()?.to_string();
+    crate::persist::is_canonical_uuid(&id).then_some((cwd, id))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{friendly_name, parse_procargs2};
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn transcript_id_extracts_claude_uuid_from_path() {
+        let p = "/home/u/.claude/projects/-home-u-proj/abcdef01-2345-6789-abcd-ef0123456789.jsonl";
+        assert_eq!(
+            transcript_id_for(p, crate::detect::Agent::Claude),
+            Some("abcdef01-2345-6789-abcd-ef0123456789".to_string())
+        );
+        // Wrong agent shape → None.
+        assert_eq!(transcript_id_for(p, crate::detect::Agent::Codex), None);
+    }
+
+    #[test]
+    fn transcript_id_extracts_codex_uuid_from_rollout_path() {
+        let p = "/home/u/.codex/sessions/2026/03/28/rollout-2026-03-28T03-24-32-019d30c1-5e55-74f1-84bc-e8a8c3b3024c.jsonl";
+        assert_eq!(
+            transcript_id_for(p, crate::detect::Agent::Codex),
+            Some("019d30c1-5e55-74f1-84bc-e8a8c3b3024c".to_string())
+        );
+        assert_eq!(transcript_id_for(p, crate::detect::Agent::Claude), None);
+    }
+
+    #[test]
+    fn transcript_id_rejects_non_transcript_paths() {
+        assert_eq!(
+            transcript_id_for("/dev/null", crate::detect::Agent::Claude),
+            None
+        );
+        assert_eq!(
+            transcript_id_for(
+                "/home/u/.claude/projects/x/notes.txt",
+                crate::detect::Agent::Claude
+            ),
+            None
+        );
     }
 
     #[test]
@@ -293,6 +476,72 @@ mod tests {
         buf.extend_from_slice(b"app.js\0");
         let argv = parse_procargs2(&buf).unwrap();
         assert_eq!(argv, vec!["node".to_string(), "app.js".to_string()]);
+    }
+
+    #[test]
+    fn agent_transcript_finds_newest_claude_jsonl_by_cwd_without_open_fd() {
+        // Claude open-appends-closes its transcript (no held-open fd), so discovery is
+        // by cwd → munged project dir → newest *.jsonl. Stage two transcripts with
+        // different mtimes; the NEWER one wins, and NOTHING is held open here.
+        let home = tempfile::tempdir().unwrap();
+        let cwd = "/work/proj.x"; // note the dot — must munge to a dash
+        let dir = home.path().join(".claude/projects/-work-proj-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("11111111-1111-1111-1111-111111111111.jsonl");
+        let newer = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
+        std::fs::write(&older, b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&newer, b"x").unwrap();
+        let got = agent_transcript_in(home.path(), cwd, crate::detect::Agent::Claude)
+            .expect("must discover the newest claude transcript for this cwd");
+        assert_eq!(got.1, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(
+            std::fs::canonicalize(&got.0).unwrap(),
+            std::fs::canonicalize(&newer).unwrap()
+        );
+        // Unknown cwd → no project dir → None.
+        assert_eq!(
+            agent_transcript_in(home.path(), "/nope", crate::detect::Agent::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_transcript_finds_codex_rollout_matching_cwd() {
+        // Codex sessions are date-foldered; match by the first line's payload.cwd.
+        let home = tempfile::tempdir().unwrap();
+        let cwd = "/work/codeproj";
+        let dir = home.path().join(".codex/sessions/2026/05/31");
+        std::fs::create_dir_all(&dir).unwrap();
+        let uuid = "019e7e69-6ead-74a0-92ed-50d94369ff5b";
+        let mine = dir.join(format!("rollout-2026-05-31T22-21-39-{uuid}.jsonl"));
+        std::fs::write(
+            &mine,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":uuid,"cwd":cwd}})
+            ),
+        )
+        .unwrap();
+        // A newer rollout for a DIFFERENT cwd must be ignored.
+        let other_uuid = "019e0000-6ead-74a0-92ed-50d94369ffff";
+        let other = dir.join(format!("rollout-2026-05-31T23-00-00-{other_uuid}.jsonl"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &other,
+            format!(
+                "{}\n",
+                serde_json::json!({"payload":{"id":other_uuid,"cwd":"/somewhere/else"}})
+            ),
+        )
+        .unwrap();
+        let got = agent_transcript_in(home.path(), cwd, crate::detect::Agent::Codex)
+            .expect("must find the codex rollout whose payload.cwd matches");
+        assert_eq!(got.1, uuid);
+        assert_eq!(
+            std::fs::canonicalize(&got.0).unwrap(),
+            std::fs::canonicalize(&mine).unwrap()
+        );
     }
 
     #[test]
