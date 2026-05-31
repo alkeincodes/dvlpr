@@ -2814,6 +2814,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_mode_y_without_selection_exits_without_emitting() {
+        // Pressing yank with no active selection (no prior `v`) must just exit
+        // copy mode and emit nothing — never a stray empty OSC 52 write.
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(!session.copy_mode_has_selection_for_test());
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'y'));
+        assert!(!session.copy_mode_active(), "y exits copy mode");
+        assert!(eff.emit.is_none(), "no selection => no OSC 52 emit");
+    }
+
+    #[tokio::test]
     async fn copy_mode_up_at_top_row_scrolls_viewport() {
         let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
         // Feed enough lines to build scrollback.
