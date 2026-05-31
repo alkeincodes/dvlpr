@@ -311,7 +311,7 @@ impl Session {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
         let (runtime, rx) = PaneRuntime::spawn(&self.command, &self.cwd, w, h, &self.session_name)?;
-        let screen = GhosttyScreen::new(w, h);
+        let screen = GhosttyScreen::new(w, h, 0);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         self.panes.insert(
@@ -345,7 +345,7 @@ impl Session {
         let w = rect.w.max(1);
         let h = rect.h.max(1);
         let (runtime, rx) = PaneRuntime::spawn(command, cwd, w, h, &self.session_name)?;
-        let screen = GhosttyScreen::new(w, h);
+        let screen = GhosttyScreen::new(w, h, 0);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         self.panes.insert(

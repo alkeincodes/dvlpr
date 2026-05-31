@@ -48,14 +48,14 @@ unsafe extern "C" fn write_pty_trampoline(
 }
 
 impl GhosttyScreen {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut term: sys::GhosttyTerminal = ptr::null_mut();
         let opts = sys::GhosttyTerminalOptions {
             cols,
             rows,
-            max_scrollback: 0,
+            max_scrollback,
         };
         // SAFETY: `term` is a valid out-pointer; `opts` is a plain POD struct;
         // a null allocator means "use the default allocator".
@@ -249,6 +249,35 @@ impl GhosttyScreen {
         }
     }
 
+    /// Number of scrollback rows currently retained (total rows minus the
+    /// visible viewport rows). 0 when no history or when scrollback is disabled.
+    pub fn scrollback_rows(&self) -> usize {
+        let mut n: usize = 0;
+        // SAFETY: `term` is valid; SCROLLBACK_ROWS documents output type `size_t*`.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS,
+                (&raw mut n).cast(),
+            );
+        }
+        n
+    }
+
+    /// Total rows in the active screen including scrollback.
+    pub fn total_rows(&self) -> usize {
+        let mut n: usize = 0;
+        // SAFETY: `term` is valid; TOTAL_ROWS documents output type `size_t*`.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_TOTAL_ROWS,
+                (&raw mut n).cast(),
+            );
+        }
+        n
+    }
+
     pub fn cursor(&self) -> (u16, u16) {
         let mut cx: u16 = 0;
         let mut cy: u16 = 0;
@@ -355,17 +384,17 @@ mod tests {
 
     #[test]
     fn new_reports_dimensions_and_drops_cleanly() {
-        let s = GhosttyScreen::new(80, 24);
+        let s = GhosttyScreen::new(80, 24, 0);
         assert_eq!(s.cols(), 80);
         assert_eq!(s.rows(), 24);
         for _ in 0..16 {
-            let _ = GhosttyScreen::new(40, 10);
+            let _ = GhosttyScreen::new(40, 10, 0);
         }
     }
 
     #[test]
     fn feed_text_lands_in_cells() {
-        let mut s = GhosttyScreen::new(10, 3);
+        let mut s = GhosttyScreen::new(10, 3, 0);
         s.feed(b"hi");
         assert_eq!(s.cell(0, 0), 'h');
         assert_eq!(s.cell(1, 0), 'i');
@@ -375,14 +404,14 @@ mod tests {
 
     #[test]
     fn out_of_bounds_cell_is_space() {
-        let mut s = GhosttyScreen::new(5, 2);
+        let mut s = GhosttyScreen::new(5, 2, 0);
         s.feed(b"x");
         assert_eq!(s.cell(99, 99), ' ');
     }
 
     #[test]
     fn styled_cell_carries_truecolor_fg_and_bold() {
-        let mut s = GhosttyScreen::new(10, 2);
+        let mut s = GhosttyScreen::new(10, 2, 0);
         // SGR: bold + 24-bit fg (10,20,30), then 'X'.
         s.feed(b"\x1b[1;38;2;10;20;30mX");
         let (ch, style) = s.styled_cell(0, 0);
@@ -393,7 +422,7 @@ mod tests {
 
     #[test]
     fn styled_cell_carries_palette_color() {
-        let mut s = GhosttyScreen::new(10, 2);
+        let mut s = GhosttyScreen::new(10, 2, 0);
         // SGR: 256-color palette index 4 as fg, then 'Z'.
         s.feed(b"\x1b[38;5;4mZ");
         let (ch, style) = s.styled_cell(0, 0);
@@ -403,7 +432,7 @@ mod tests {
 
     #[test]
     fn styled_cell_for_plain_text_is_default_styled() {
-        let mut s = GhosttyScreen::new(10, 2);
+        let mut s = GhosttyScreen::new(10, 2, 0);
         s.feed(b"y");
         let (ch, style) = s.styled_cell(0, 0);
         assert_eq!(ch, 'y');
@@ -412,20 +441,20 @@ mod tests {
 
     #[test]
     fn styled_cell_out_of_bounds_is_default() {
-        let s = GhosttyScreen::new(5, 2);
+        let s = GhosttyScreen::new(5, 2, 0);
         assert_eq!(s.styled_cell(99, 99), (' ', CellStyle::default()));
     }
 
     #[test]
     fn cursor_advances_with_input() {
-        let mut s = GhosttyScreen::new(10, 3);
+        let mut s = GhosttyScreen::new(10, 3, 0);
         s.feed(b"hi");
         assert_eq!(s.cursor(), (2, 0));
     }
 
     #[test]
     fn cursor_moves_to_next_row_after_crlf() {
-        let mut s = GhosttyScreen::new(10, 3);
+        let mut s = GhosttyScreen::new(10, 3, 0);
         s.feed(b"ab\r\ncd");
         assert_eq!(s.cell(0, 1), 'c');
         assert_eq!(s.cell(1, 1), 'd');
@@ -439,7 +468,7 @@ mod tests {
 
     #[test]
     fn render_ansi_matches_phase1_full_frame_format() {
-        let mut s = GhosttyScreen::new(3, 2);
+        let mut s = GhosttyScreen::new(3, 2, 0);
         s.feed(b"ab\r\ncd");
         let out = String::from_utf8(s.render_ansi()).unwrap();
         assert!(out.starts_with("\x1b[2J\x1b[H"));
@@ -453,14 +482,14 @@ mod tests {
 
     #[test]
     fn plain_text_produces_no_pty_writes() {
-        let mut s = GhosttyScreen::new(10, 3);
+        let mut s = GhosttyScreen::new(10, 3, 0);
         s.feed(b"hi");
         assert!(s.take_pty_writes().is_empty());
     }
 
     #[test]
     fn cursor_position_report_query_is_answered_via_pty_writes() {
-        let mut s = GhosttyScreen::new(80, 24);
+        let mut s = GhosttyScreen::new(80, 24, 0);
         // DSR — Cursor Position Report: ESC [ 6 n  → terminal replies ESC [ row ; col R.
         s.feed(b"\x1b[6n");
         let reply = s.take_pty_writes();
@@ -481,7 +510,7 @@ mod tests {
 
     #[test]
     fn resize_with_in_band_size_reports_enabled_produces_a_pty_write() {
-        let mut s = GhosttyScreen::new(80, 24);
+        let mut s = GhosttyScreen::new(80, 24, 0);
         // Enable in-band size reporting (DEC private mode 2048). With this on,
         // libghostty-vt emits a size report through the write-pty callback on the
         // NEXT resize. This is the load-bearing reason the server drains after resize.
@@ -501,7 +530,7 @@ mod tests {
 
     #[test]
     fn resize_updates_dimensions_and_keeps_rendering() {
-        let mut s = GhosttyScreen::new(10, 4);
+        let mut s = GhosttyScreen::new(10, 4, 0);
         s.feed(b"hello");
         s.resize(4, 2);
         assert_eq!(s.cols(), 4);
@@ -520,7 +549,7 @@ mod tests {
         // update started echoing focus toggles, pane-app focus chatter would leak
         // upstream to the host terminal — exactly the "dvlpr owns host focus"
         // guarantee this test pins.
-        let mut s = GhosttyScreen::new(80, 24);
+        let mut s = GhosttyScreen::new(80, 24, 0);
         s.feed(b"\x1b[?1004h");
         assert!(
             s.take_pty_writes().is_empty(),
@@ -535,7 +564,7 @@ mod tests {
 
     #[test]
     fn tail_text_returns_last_n_rows_in_order() {
-        let mut s = GhosttyScreen::new(20, 5);
+        let mut s = GhosttyScreen::new(20, 5, 0);
         s.feed(b"row1\r\nrow2\r\nrow3\r\nrow4\r\nrow5");
         let tail = s.tail_text(3);
         assert!(tail.contains("row3"), "tail: {tail:?}");
@@ -547,7 +576,7 @@ mod tests {
 
     #[test]
     fn tail_text_clamps_to_screen_height() {
-        let mut s = GhosttyScreen::new(20, 3);
+        let mut s = GhosttyScreen::new(20, 3, 0);
         s.feed(b"a\r\nb\r\nc");
         let tail = s.tail_text(10);
         assert!(tail.contains("a"), "tail: {tail:?}");
@@ -557,14 +586,14 @@ mod tests {
 
     #[test]
     fn tail_text_zero_rows_returns_empty() {
-        let mut s = GhosttyScreen::new(20, 5);
+        let mut s = GhosttyScreen::new(20, 5, 0);
         s.feed(b"hello");
         assert_eq!(s.tail_text(0), "");
     }
 
     #[test]
     fn tail_text_trims_trailing_blanks_per_row() {
-        let mut s = GhosttyScreen::new(20, 2);
+        let mut s = GhosttyScreen::new(20, 2, 0);
         s.feed(b"hi");
         let tail = s.tail_text(2);
         for line in tail.lines() {
@@ -574,13 +603,13 @@ mod tests {
 
     #[test]
     fn title_returns_none_when_no_osc_title_received() {
-        let s = GhosttyScreen::new(20, 5);
+        let s = GhosttyScreen::new(20, 5, 0);
         assert_eq!(s.title(), None);
     }
 
     #[test]
     fn title_returns_cloned_string_after_osc_0_sequence() {
-        let mut s = GhosttyScreen::new(20, 5);
+        let mut s = GhosttyScreen::new(20, 5, 0);
         // OSC 0 ; my-title BEL  — sets both icon name and window title.
         s.feed(b"\x1b]0;my-title\x07");
         assert_eq!(s.title().as_deref(), Some("my-title"));
@@ -588,9 +617,28 @@ mod tests {
 
     #[test]
     fn title_returns_cloned_string_after_osc_2_sequence() {
-        let mut s = GhosttyScreen::new(20, 5);
+        let mut s = GhosttyScreen::new(20, 5, 0);
         // OSC 2 ; window-title BEL — sets only the window title.
         s.feed(b"\x1b]2;window-title\x07");
         assert_eq!(s.title().as_deref(), Some("window-title"));
+    }
+
+    #[test]
+    fn new_with_scrollback_accepts_more_than_rows_of_output() {
+        let mut s = GhosttyScreen::new(10, 3, 100);
+        for i in 0..20 {
+            s.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert!(s.scrollback_rows() > 0, "feeding > rows must accumulate scrollback");
+        assert!(s.total_rows() >= s.rows() as usize);
+    }
+
+    #[test]
+    fn zero_scrollback_keeps_no_history() {
+        let mut s = GhosttyScreen::new(10, 3, 0);
+        for i in 0..20 {
+            s.feed(format!("l{i}\r\n").as_bytes());
+        }
+        assert_eq!(s.scrollback_rows(), 0);
     }
 }
