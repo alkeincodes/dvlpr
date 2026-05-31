@@ -190,18 +190,42 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let runtime_cfg: Config = config.keymap.unwrap_or_else(Config::load);
     // Extract the Copy-able theme before moving runtime_cfg into `keymap` below.
     let initial_theme = runtime_cfg.theme;
-    let (mut session, first_pane, first_rx) = Session::new(
-        config.session.clone(),
-        config.command.clone(),
-        config.cwd.clone(),
-        80,
-        24,
-        initial_theme,
-        runtime_cfg.prefix,
-        runtime_cfg.keys,
-        runtime_cfg.sidebar.width,
-    )?;
-    spawn_pane_forwarder(first_pane, first_rx, ev_tx.clone());
+
+    let restore_snap = (std::env::var("DVLPR_RESTORE").as_deref() == Ok("1"))
+        .then(|| crate::persist::load(&crate::persist::snapshot_path(&config.session)))
+        .flatten();
+
+    let (mut session, initial_rxs): (
+        Session,
+        Vec<(PaneId, mpsc::UnboundedReceiver<PaneOutput>)>,
+    ) = if let Some(snap) = restore_snap {
+        let (s, rxs) = Session::restore(
+            snap,
+            80,
+            24,
+            initial_theme,
+            runtime_cfg.prefix,
+            runtime_cfg.keys.clone(),
+        )?;
+        (s, rxs)
+    } else {
+        let (s, first_pane, first_rx) = Session::new(
+            config.session.clone(),
+            config.command.clone(),
+            config.cwd.clone(),
+            80,
+            24,
+            initial_theme,
+            runtime_cfg.prefix,
+            runtime_cfg.keys.clone(),
+            runtime_cfg.sidebar.width,
+        )?;
+        (s, vec![(first_pane, first_rx)])
+    };
+    // Wire a forwarder per spawned pane (replaces the single first-pane wiring).
+    for (pane_id, rx) in initial_rxs {
+        spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+    }
 
     let keymap = runtime_cfg;
 
@@ -234,6 +258,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut autoname_tick = tokio::time::interval(Duration::from_secs(1));
     let mut agent_tick = tokio::time::interval(Duration::from_millis(500));
     agent_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
+    snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let snapshot_file = crate::persist::snapshot_path(&config.session);
     let sound_debouncer = crate::sound::SoundDebouncer::new();
 
     let reason: String = loop {
@@ -375,6 +402,17 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     dirty = true;
                 }
             }
+            _ = snapshot_tick.tick() => {
+                let volatile_changed = session.refresh_restore_meta(
+                    crate::procinfo::pid_cwd,
+                    crate::procinfo::agent_transcript,
+                );
+                if session.take_snapshot_dirty() || volatile_changed {
+                    if let Err(e) = crate::persist::write_atomic(&snapshot_file, &session.snapshot()) {
+                        tracing::warn!("snapshot write failed: {e}");
+                    }
+                }
+            }
             _ = agent_tick.tick() => {
                 let outcome = session.refresh_agent_states(crate::procinfo::process_name);
                 let meta_changed = session.refresh_agent_meta(crate::procinfo::pid_cwd);
@@ -407,6 +445,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         runtime.close();
     }
     let _ = std::fs::remove_file(&config.socket_path);
+    crate::persist::delete(&crate::persist::snapshot_path(&config.session));
     Ok(())
 }
 
