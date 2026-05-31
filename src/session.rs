@@ -1344,6 +1344,9 @@ impl Session {
                     }
                 };
             }
+            // Real handling lands in Task 8 (enter copy mode); a no-op arm here
+            // keeps the match exhaustive so the crate compiles after Task 1.
+            Command::EnterCopyMode => {}
         }
         self.reconcile_menu();
         eff

@@ -29,7 +29,8 @@ pub enum Command {
     ToggleZoom,          // C-b 0: fullscreen the focused pane (toggle)
     ToggleSidebar,       // default C-b s: show/hide agent-awareness sidebar
     Detach,
-    ShowHelp, // C-b ?: open/close the help overlay (toggle)
+    ShowHelp,      // C-b ?: open/close the help overlay (toggle)
+    EnterCopyMode, // C-b [: freeze the focused pane and enter scrollback copy mode
 }
 
 /// The four named special keys the keymap supports (v1).
@@ -168,6 +169,7 @@ pub struct KeyMap {
     pub detach: KeySpec,
     pub help: KeySpec,
     pub toggle_sidebar: KeySpec,
+    pub copy_mode: KeySpec,
 }
 
 impl Default for KeyMap {
@@ -182,6 +184,7 @@ impl Default for KeyMap {
             detach: KeySpec::Char('d'),
             help: KeySpec::Char('?'),
             toggle_sidebar: KeySpec::Char('s'),
+            copy_mode: KeySpec::Char('['),
         }
     }
 }
@@ -193,6 +196,10 @@ impl Default for KeyMap {
 /// malformed-prefix fallback in `from_toml_str` consume this.
 const DEFAULT_PREFIX: KeySpec = KeySpec::Ctrl('b');
 
+/// Default per-pane scrollback history limit (rows). Matches tmux's history-limit
+/// default. `0` disables copy-mode scrolling (copy mode becomes a no-op).
+const DEFAULT_SCROLLBACK: usize = 2000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub prefix: KeySpec,
@@ -200,6 +207,7 @@ pub struct Config {
     pub theme: crate::theme::Theme,
     pub sidebar: SidebarConfig,
     pub sound: SoundConfig,
+    pub scrollback: usize,
 }
 
 impl Default for Config {
@@ -210,6 +218,7 @@ impl Default for Config {
             theme: crate::theme::Theme::default(),
             sidebar: SidebarConfig::default(),
             sound: SoundConfig::default(),
+            scrollback: DEFAULT_SCROLLBACK,
         }
     }
 }
@@ -227,6 +236,7 @@ struct RawConfig {
     sidebar: RawSidebar,
     #[serde(default)]
     sound: RawSound,
+    scrollback: Option<usize>,
 }
 
 #[derive(Default, Deserialize)]
@@ -258,6 +268,8 @@ struct RawKeys {
     help: Option<String>,
     #[serde(rename = "toggle-sidebar")]
     toggle_sidebar: Option<String>,
+    #[serde(rename = "copy-mode")]
+    copy_mode: Option<String>,
 }
 
 /// Raw `[theme]` table. Only `flavor` exists in v1; missing/unknown falls back
@@ -391,10 +403,12 @@ impl Config {
                     "toggle-sidebar",
                     d.toggle_sidebar,
                 ),
+                copy_mode: spec_or_default(&raw.keys.copy_mode, "copy-mode", d.copy_mode),
             },
             theme,
             sidebar: sidebar_from_raw(&raw.sidebar),
             sound: sound_from_raw(&raw.sound),
+            scrollback: raw.scrollback.unwrap_or(DEFAULT_SCROLLBACK),
         }
     }
 
@@ -420,6 +434,8 @@ impl Config {
             Some(Command::ShowHelp)
         } else if k.toggle_sidebar.matches(key) {
             Some(Command::ToggleSidebar)
+        } else if k.copy_mode.matches(key) {
+            Some(Command::EnterCopyMode)
         } else {
             None
         }
@@ -471,6 +487,7 @@ mod tests {
         assert_eq!(c.keys.detach, KeySpec::Char('d'));
         assert_eq!(c.keys.help, KeySpec::Char('?'));
         assert_eq!(c.keys.toggle_sidebar, KeySpec::Char('s'));
+        assert_eq!(c.keys.copy_mode, KeySpec::Char('['));
     }
 
     #[test]
@@ -752,5 +769,41 @@ flavor = "one-dark"
         let cfg = Config::from_toml_str("[keys]\ntoggle-sidebar = \"v\"\n");
         assert_eq!(cfg.resolve(&Key::Char(b'v')), Some(Command::ToggleSidebar));
         assert_eq!(cfg.resolve(&Key::Char(b's')), None);
+    }
+
+    #[test]
+    fn default_scrollback_is_2000() {
+        assert_eq!(Config::default().scrollback, 2000);
+    }
+
+    #[test]
+    fn default_copy_mode_key_is_open_bracket() {
+        assert_eq!(Config::default().keys.copy_mode, KeySpec::Char('['));
+    }
+
+    #[test]
+    fn resolve_maps_open_bracket_to_enter_copy_mode() {
+        let c = Config::default();
+        assert_eq!(c.resolve(&Key::Char(b'[')), Some(Command::EnterCopyMode));
+    }
+
+    #[test]
+    fn toml_parses_scrollback_and_copy_mode_key() {
+        let c = Config::from_toml_str("scrollback = 5000\n[keys]\ncopy-mode = \"v\"\n");
+        assert_eq!(c.scrollback, 5000);
+        assert_eq!(c.keys.copy_mode, KeySpec::Char('v'));
+        assert_eq!(c.resolve(&Key::Char(b'v')), Some(Command::EnterCopyMode));
+    }
+
+    #[test]
+    fn malformed_copy_mode_key_falls_back_to_bracket() {
+        let c = Config::from_toml_str("[keys]\ncopy-mode = \"Nonsense\"\n");
+        assert_eq!(c.keys.copy_mode, KeySpec::Char('['));
+    }
+
+    #[test]
+    fn missing_scrollback_keeps_default() {
+        let c = Config::from_toml_str("prefix = \"C-a\"\n");
+        assert_eq!(c.scrollback, 2000);
     }
 }
