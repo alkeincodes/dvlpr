@@ -361,7 +361,6 @@ impl Session {
         }
     }
 
-
     /// Post-parser keyboard intercept. Returns `true` if the event was
     /// consumed (caller skips its normal dispatch). Returns `None` when the
     /// event was NOT consumed by the menu (caller continues normal dispatch).
@@ -1482,6 +1481,70 @@ impl Session {
         changed
     }
 
+    /// Refresh per-pane restore metadata: cwd for EVERY pane, plus a lazy
+    /// agent-transcript capture keyed on the foreground pid. Returns true if any
+    /// pane's cwd or agent_resume changed (→ caller marks the snapshot dirty).
+    /// Resolvers are injected for testability (prod: `procinfo::pid_cwd` and
+    /// `procinfo::agent_transcript`).
+    pub fn refresh_restore_meta(
+        &mut self,
+        resolve_cwd: impl Fn(i32) -> Option<std::path::PathBuf>,
+        resolve_transcript: impl Fn(i32, detect::Agent) -> Option<(std::path::PathBuf, String)>,
+    ) -> bool {
+        let mut changed = false;
+        // Collect (id, fg_pid, agent_kind) first to avoid borrow conflicts.
+        let work: Vec<(PaneId, Option<i32>, Option<detect::Agent>)> = self
+            .panes
+            .iter()
+            .map(|(id, p)| (*id, p.runtime.foreground_pid(), p.agent))
+            .collect();
+        for (id, fg_pid, kind) in work {
+            let Some(pid) = fg_pid else { continue };
+            let Some(pane) = self.panes.get_mut(&id) else { continue };
+            // cwd: every pane.
+            if let Some(dir) = resolve_cwd(pid) {
+                let s = dir.to_string_lossy().to_string();
+                if pane.cwd.as_deref() != Some(s.as_str()) {
+                    pane.cwd = Some(s);
+                    changed = true;
+                }
+            }
+            // agent transcript: lazy, pid-keyed.
+            match kind {
+                Some(k) if pane.captured_for_pid != Some(pid) => {
+                    let resume = match resolve_transcript(pid, k) {
+                        Some((path, id)) => match k {
+                            detect::Agent::Claude => crate::persist::AgentResume::Claude {
+                                session_id: id,
+                                transcript: path.to_string_lossy().to_string(),
+                            },
+                            detect::Agent::Codex => crate::persist::AgentResume::Codex {
+                                session_id: id,
+                                transcript: path.to_string_lossy().to_string(),
+                            },
+                        },
+                        None => crate::persist::AgentResume::None,
+                    };
+                    if pane.agent_resume != resume {
+                        pane.agent_resume = resume;
+                        changed = true;
+                    }
+                    pane.captured_for_pid = Some(pid);
+                }
+                None => {
+                    // Pane is no longer an agent; clear any stale capture.
+                    if pane.agent_resume != crate::persist::AgentResume::None {
+                        pane.agent_resume = crate::persist::AgentResume::None;
+                        changed = true;
+                    }
+                    pane.captured_for_pid = None;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     /// Run one agent-detection pass over every pane (not just focused —
     /// background Claude panes count for the sidebar). Returns true if
     /// any pane's `agent_state` flipped this tick.
@@ -1760,6 +1823,10 @@ impl Session {
         layout::all_panes(&self.windows[idx].root)
     }
 
+    #[cfg(test)]
+    pub fn pane_cwd_for_test(&self, id: PaneId) -> Option<String> {
+        self.panes.get(&id).and_then(|p| p.cwd.clone())
+    }
 
     #[cfg(test)]
     pub fn focus_for_test(&mut self, id: PaneId) {
@@ -4404,5 +4471,17 @@ mod tests {
         }
         // Focus is the second leaf (index 1 in tree order).
         assert_eq!(snap.windows[0].focused_leaf, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_restore_meta_caches_cwd_for_non_agent_pane() {
+        let (mut s, id, _rx) = snapshot_test_session();
+        // Resolver stubs: cwd resolves to /work for any pid; no agent transcript.
+        let changed = s.refresh_restore_meta(
+            |_pid| Some(std::path::PathBuf::from("/work")),
+            |_pid, _kind| None,
+        );
+        assert!(changed);
+        assert_eq!(s.pane_cwd_for_test(id).as_deref(), Some("/work"));
     }
 }
