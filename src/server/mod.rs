@@ -771,30 +771,44 @@ fn apply_events(
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
-                let eff = if let Some(st) = clients.get_mut(&id) {
-                    session.handle_mouse(m, &mut st.drag)
-                } else {
-                    crate::session::CommandEffect::default()
-                };
-                for (pane_id, rx) in eff.spawned {
-                    spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
-                }
-                for runtime in eff.closed {
-                    runtime.close();
-                }
-                if eff.detach {
-                    if let Some(st) = remove_client(clients, foreground, session, dirty, id) {
-                        let _ = st.control.send(Control::Detach);
-                        let mut writer = st.writer;
-                        tokio::spawn(async move {
-                            if timeout(TEARDOWN_TIMEOUT, &mut writer).await.is_err() {
-                                writer.abort();
-                            }
-                        });
+                if session.copy_mode_active() {
+                    // Copy mode owns the mouse. Route directly to handle_copy_mode_mouse
+                    // so the server can capture any CopyEffect.emit (OSC 52) from future
+                    // yank-on-release. In v1 mouse never yanks, so emit is always None,
+                    // but the routing is wired correctly for future use.
+                    let eff = session.handle_copy_mode_mouse(m);
+                    if let Some(bytes) = eff.emit {
+                        if let Some(st) = clients.get(&id) {
+                            let _ = st.control.send(Control::Emit(bytes));
+                        }
                     }
-                }
-                if session.refresh_window_names(crate::procinfo::process_name) {
                     *dirty = true;
+                } else {
+                    let eff = if let Some(st) = clients.get_mut(&id) {
+                        session.handle_mouse(m, &mut st.drag)
+                    } else {
+                        crate::session::CommandEffect::default()
+                    };
+                    for (pane_id, rx) in eff.spawned {
+                        spawn_pane_forwarder(pane_id, rx, ev_tx.clone());
+                    }
+                    for runtime in eff.closed {
+                        runtime.close();
+                    }
+                    if eff.detach {
+                        if let Some(st) = remove_client(clients, foreground, session, dirty, id) {
+                            let _ = st.control.send(Control::Detach);
+                            let mut writer = st.writer;
+                            tokio::spawn(async move {
+                                if timeout(TEARDOWN_TIMEOUT, &mut writer).await.is_err() {
+                                    writer.abort();
+                                }
+                            });
+                        }
+                    }
+                    if session.refresh_window_names(crate::procinfo::process_name) {
+                        *dirty = true;
+                    }
                 }
             }
             InputEvent::Command(cmd) => {

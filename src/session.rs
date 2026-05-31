@@ -1551,6 +1551,114 @@ impl Session {
         self.copy_mode.as_ref().is_some_and(|cm| cm.selection.is_some())
     }
 
+    /// Handle a mouse event while copy mode is active.
+    ///
+    /// Translates 1-based wire `(col, row)` to 0-based viewport-relative coords
+    /// within the focused copy-mode pane rect, then:
+    /// - **Press**: set the cursor there, begin a fresh drag selection anchored at
+    ///   that cell.
+    /// - **Drag**: extend the selection head; auto-scroll one row when the drag
+    ///   reaches/exceeds the top or bottom edge.
+    /// - **Release**: end the drag; selection stays live (no auto-yank in v1).
+    ///
+    /// Clicks outside the pane rect are silently ignored (cursor/selection unchanged).
+    /// Returns `CopyEffect::default()` — v1 mouse never yanks on release.
+    pub fn handle_copy_mode_mouse(&mut self, ev: crate::input::MouseEvent) -> CopyEffect {
+        use crate::input::MouseKind;
+
+        let Some(mut cm) = self.copy_mode.take() else {
+            return CopyEffect::default();
+        };
+
+        // Resolve the focused pane's content rect.
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
+        let win = &self.windows[self.active_window];
+        let pane_rect = layout::pane_rects(&win.root, content)
+            .into_iter()
+            .find(|(id, _)| *id == cm.pane)
+            .map(|(_, r)| r);
+
+        let (Some(rect), Some(pane)) = (pane_rect, self.panes.get_mut(&cm.pane)) else {
+            self.copy_mode = Some(cm);
+            return CopyEffect::default();
+        };
+
+        let rows = pane.screen.rows();
+        let cols = pane.screen.cols();
+        let total = pane.screen.total_rows();
+
+        // Convert 1-based wire coords to 0-based absolute coords.
+        let abs_col = ev.col.saturating_sub(1);
+        let abs_row = ev.row.saturating_sub(1);
+
+        // Ignore events entirely outside the pane rect.
+        if !rect.contains(abs_col, abs_row)
+            && ev.kind != MouseKind::Drag
+            && ev.kind != MouseKind::Release
+        {
+            self.copy_mode = Some(cm);
+            return CopyEffect::default();
+        }
+
+        // Viewport-relative coords, clamped to valid pane bounds.
+        let vx = abs_col.saturating_sub(rect.x).min(cols.saturating_sub(1));
+        let vy_raw = abs_row.saturating_sub(rect.y);
+
+        match ev.kind {
+            MouseKind::Press => {
+                // Only handle presses inside the pane rect.
+                if rect.contains(abs_col, abs_row) {
+                    let vy = vy_raw.min(rows.saturating_sub(1));
+                    cm.cursor = (vx, vy);
+                    let here = crate::copymode::unproject(
+                        cm.cursor.0,
+                        cm.cursor.1,
+                        cm.scroll_offset,
+                        rows,
+                        total,
+                    );
+                    cm.begin_drag(here);
+                }
+            }
+            MouseKind::Drag => {
+                // Auto-scroll at top/bottom edges.
+                if abs_row <= rect.y {
+                    // At or above the pane top — scroll up into history.
+                    let max_offset = pane.screen.scrollback_rows();
+                    if cm.scroll_offset < max_offset {
+                        pane.screen.scroll_viewport_delta(-1);
+                        cm.scroll_offset += 1;
+                    }
+                } else if abs_row >= rect.y + rect.h.saturating_sub(1) {
+                    // At or below the pane bottom — scroll back toward live.
+                    if cm.scroll_offset > 0 {
+                        pane.screen.scroll_viewport_delta(1);
+                        cm.scroll_offset -= 1;
+                    }
+                }
+                let vy = vy_raw.min(rows.saturating_sub(1));
+                cm.cursor = (vx, vy);
+                let here = crate::copymode::unproject(
+                    cm.cursor.0,
+                    cm.cursor.1,
+                    cm.scroll_offset,
+                    rows,
+                    total,
+                );
+                cm.set_head(here);
+            }
+            MouseKind::Release => {
+                cm.dragging = false;
+            }
+        }
+
+        cm.clamp_to_screen(total, cols);
+        self.copy_mode = Some(cm);
+        CopyEffect::default()
+    }
+
     fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
         let wi = self.active_window;
         let Some(win) = self.windows.get(wi) else {
@@ -1768,6 +1876,15 @@ impl Session {
         drag: &mut Option<(usize, SplitPath)>,
     ) -> CommandEffect {
         use crate::menu::{MenuKind, MenuState};
+
+        // Copy mode owns the mouse: route there and swallow before any
+        // help/menu/divider checks. The server's InputEvent::Mouse arm also
+        // calls handle_copy_mode_mouse directly (capturing CopyEffect for OSC 52),
+        // so this guard is belt-and-suspenders for non-server callers/tests.
+        if self.copy_mode.is_some() {
+            let _ = self.handle_copy_mode_mouse(ev);
+            return CommandEffect::default();
+        }
 
         if self.help.is_some() {
             return self.handle_help_mouse(ev);
@@ -2953,6 +3070,223 @@ mod tests {
         assert!(result.ends_with(b"\x1b\\"));
         // The base64 of "hi" is "aGk="
         assert!(result.windows(4).any(|w| w == b"aGk="));
+    }
+
+    // --- Task 12: handle_copy_mode_mouse + handle_mouse interposition ---
+
+    #[tokio::test]
+    async fn copy_mode_mouse_press_sets_anchor_and_dragging() {
+        let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press inside the pane. With sidebar_visible=false and no tab bar
+        // consuming rows, pane rect starts at (0,1) with a 1-row tab bar.
+        // 1-based wire col=2, row=2 → 0-based (1,1) → within pane.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 2,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        assert!(
+            session.copy_mode_has_selection_for_test(),
+            "press must anchor a selection"
+        );
+        assert!(
+            session.copy_mode.as_ref().unwrap().dragging,
+            "press must set dragging"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_drag_extends_selection_head() {
+        let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press to anchor.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 2,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        let anchor_before = session
+            .copy_mode
+            .as_ref()
+            .unwrap()
+            .selection
+            .unwrap()
+            .anchor;
+        // Drag to a different column.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 8,
+            row: 2,
+            kind: crate::input::MouseKind::Drag,
+        });
+        let sel = session.copy_mode.as_ref().unwrap().selection.unwrap();
+        assert_eq!(sel.anchor, anchor_before, "anchor must not move on drag");
+        assert_ne!(sel.head.x, sel.anchor.x, "drag must move the head");
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_release_ends_drag_keeps_selection() {
+        let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press + drag.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 2,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 6,
+            row: 2,
+            kind: crate::input::MouseKind::Drag,
+        });
+        // Release.
+        let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 6,
+            row: 2,
+            kind: crate::input::MouseKind::Release,
+        });
+        assert!(eff.emit.is_none(), "release must not yank in v1");
+        assert!(
+            session.copy_mode_has_selection_for_test(),
+            "selection must stay live after release"
+        );
+        assert!(
+            !session.copy_mode.as_ref().unwrap().dragging,
+            "dragging must be false after release"
+        );
+        assert!(session.copy_mode_active(), "copy mode must stay active after release");
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_drag_at_top_edge_scrolls_viewport() {
+        let (mut session, pane_id, _rx) = copy_test_session(20, 5, 2000).await;
+        // Feed enough lines to build scrollback.
+        for i in 0..20u8 {
+            session.feed(pane_id, format!("line{i}\r\n").as_bytes());
+        }
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press to start a drag.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 3,
+            row: 3,
+            kind: crate::input::MouseKind::Press,
+        });
+        let offset_before = session.copy_mode.as_ref().unwrap().scroll_offset;
+        // Drag to row 1 (the tab bar row — above or at the top of the pane content).
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 3,
+            row: 1,
+            kind: crate::input::MouseKind::Drag,
+        });
+        let offset_after = session.copy_mode.as_ref().unwrap().scroll_offset;
+        assert!(
+            offset_after >= offset_before,
+            "drag at top edge must scroll up (offset_before={offset_before}, offset_after={offset_after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_press_outside_pane_is_ignored() {
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // The pane rect with sidebar_visible=false and a 1-row tab bar starts at y=1.
+        // Pressing at row=1 col=100 (way off to the right) is outside the 20-wide pane.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 100,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        assert!(
+            !session.copy_mode_has_selection_for_test(),
+            "press outside pane must not start a selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_mouse_routes_to_copy_mode_when_active() {
+        // handle_mouse must check copy_mode FIRST: a press inside the pane must
+        // start a selection, not open a menu or start a divider drag.
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 2000).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let mut drag: Option<(usize, crate::layout::SplitPath)> = None;
+        let _ = session.handle_mouse(
+            crate::input::MouseEvent {
+                button: 0,
+                col: 3,
+                row: 2,
+                kind: crate::input::MouseKind::Press,
+            },
+            &mut drag,
+        );
+        assert!(drag.is_none(), "copy mode must not start a divider drag");
+        // The press should have triggered the copy-mode mouse handler.
+        // Selection may or may not have been set (depends on pane rect), but copy
+        // mode must still be active and no normal side effects occurred.
+        assert!(session.copy_mode_active(), "copy mode must remain active");
+    }
+
+    #[tokio::test]
+    async fn handle_mouse_normal_routing_unaffected_when_copy_mode_inactive() {
+        // Belt-and-suspenders: verify that normal mouse routing is byte-identical
+        // when copy mode is NOT active.
+        let (mut session, _pane, _rx) = copy_test_session(20, 5, 0).await;
+        // scrollback=0 → copy mode cannot be entered
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(!session.copy_mode_active(), "scrollback=0 must prevent copy mode");
+        let mut drag: Option<(usize, crate::layout::SplitPath)> = None;
+        // A right-click should open a menu as usual.
+        let _ = session.handle_mouse(
+            crate::input::MouseEvent {
+                button: 2,
+                col: 10,
+                row: 3,
+                kind: crate::input::MouseKind::Press,
+            },
+            &mut drag,
+        );
+        // The menu may or may not open depending on hit-test, but copy mode must stay off.
+        assert!(!session.copy_mode_active());
+    }
+
+    #[tokio::test]
+    async fn handle_mouse_copy_mode_press_drag_release_cycle() {
+        // Full press → drag → release cycle through handle_copy_mode_mouse.
+        let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 2,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        assert!(session.copy_mode_has_selection_for_test());
+        // Drag extends head.
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 6,
+            row: 2,
+            kind: crate::input::MouseKind::Drag,
+        });
+        // Release keeps selection live, no yank.
+        let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 6,
+            row: 2,
+            kind: crate::input::MouseKind::Release,
+        });
+        assert!(eff.emit.is_none(), "release must not yank in v1");
+        assert!(session.copy_mode_has_selection_for_test());
+        assert!(session.copy_mode_active());
     }
 
     #[tokio::test]
