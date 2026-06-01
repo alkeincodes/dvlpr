@@ -173,7 +173,11 @@ enum Event {
         reply: oneshot::Sender<crate::protocol::CommandReply>,
     },
     /// A management client (or `kill`) asked the daemon to shut down.
-    Shutdown,
+    /// `keep_snapshot`: skip the teardown `persist::delete` and flush a final
+    /// snapshot first (used by `dvlpr update` restart-and-restore).
+    Shutdown {
+        keep_snapshot: bool,
+    },
 }
 
 /// Per-connected-client central-loop state. The writer task (spawned by the
@@ -309,6 +313,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let snapshot_file = crate::persist::snapshot_path(&config.session);
     let sound_debouncer = crate::sound::SoundDebouncer::new();
 
+    let mut keep_snapshot_on_exit = false;
     let reason: String = loop {
         tokio::select! {
             maybe_event = ev_rx.recv() => {
@@ -461,7 +466,22 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             copy_mode_owner = None;
                         }
                     }
-                    Event::Shutdown => break "killed".to_string(),
+                    Event::Shutdown { keep_snapshot } => {
+                        if keep_snapshot {
+                            session.refresh_restore_meta(
+                                crate::procinfo::pid_cwd,
+                                crate::procinfo::agent_transcripts,
+                                crate::procinfo::proc_start_time,
+                            );
+                            if let Err(e) =
+                                crate::persist::write_atomic(&snapshot_file, &session.snapshot())
+                            {
+                                tracing::warn!("final snapshot write failed: {e}");
+                            }
+                            keep_snapshot_on_exit = true;
+                        }
+                        break "killed".to_string();
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -577,7 +597,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         runtime.close();
     }
     let _ = std::fs::remove_file(&config.socket_path);
-    crate::persist::delete(&crate::persist::snapshot_path(&config.session));
+    if !keep_snapshot_on_exit {
+        crate::persist::delete(&crate::persist::snapshot_path(&config.session));
+    }
     Ok(())
 }
 
@@ -1286,8 +1308,8 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     let _ = write_msg(&mut write_half, &info).await;
                 }
             }
-            Intent::Kill { keep_snapshot: _ } => {
-                let _ = ev_tx.send(Event::Shutdown);
+            Intent::Kill { keep_snapshot } => {
+                let _ = ev_tx.send(Event::Shutdown { keep_snapshot });
             }
             Intent::Command => {
                 if let Ok(Some(ClientMsg::Command(cmd))) =
