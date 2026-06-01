@@ -1484,10 +1484,27 @@ impl Session {
                 return CopyEffect::default();
             }
             CopyAction::Yank => {
-                let emit = cm.selection.map(|sel| {
-                    let (a, b) = sel.normalized();
+                // Copy exactly the highlighted cells: clip the selection to the
+                // visible viewport (the same helper compose() paints from), map
+                // the clipped viewport endpoints back to SCREEN coords, and run
+                // selection_text on those. A selection scrolled entirely off-screen
+                // clips to None → no emit (consistent with "copy what you see").
+                let emit = cm.selection.and_then(|sel| {
+                    let (clip_start, clip_end) = crate::copymode::clip_selection(
+                        &sel,
+                        cm.scroll_offset,
+                        rows,
+                        cols,
+                        total,
+                    )?;
+                    let a = crate::copymode::unproject(
+                        clip_start.0, clip_start.1, cm.scroll_offset, rows, total,
+                    );
+                    let b = crate::copymode::unproject(
+                        clip_end.0, clip_end.1, cm.scroll_offset, rows, total,
+                    );
                     let text = pane.screen.selection_text(a.x, a.y, b.x, b.y);
-                    osc52(&text)
+                    Some(osc52(&text))
                 });
                 pane.screen.scroll_viewport_bottom();
                 // exited
@@ -1532,6 +1549,50 @@ impl Session {
     #[cfg(test)]
     pub fn copy_mode_has_selection_for_test(&self) -> bool {
         self.copy_mode.as_ref().is_some_and(|cm| cm.selection.is_some())
+    }
+
+    #[cfg(test)]
+    pub fn feed_focused_for_test(&mut self, bytes: &[u8]) {
+        let id = self.focused_pane();
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.screen.feed(bytes);
+        }
+    }
+
+    /// The text of the currently-highlighted (clipped) selection, computed via the
+    /// same clip+unproject+selection_text path as the Yank arm. `None` when copy
+    /// mode is inactive, there is no selection, or the selection is fully off-screen.
+    #[cfg(test)]
+    pub fn copy_mode_highlighted_text_for_test(&self) -> Option<String> {
+        let cm = self.copy_mode.as_ref()?;
+        let sel = cm.selection?;
+        let pane = self.panes.get(&cm.pane)?;
+        let rows = pane.screen.rows();
+        let cols = pane.screen.cols();
+        let total = pane.screen.total_rows();
+        let ((sx, sy), (ex, ey)) =
+            crate::copymode::clip_selection(&sel, cm.scroll_offset, rows, cols, total)?;
+        let a = crate::copymode::unproject(sx, sy, cm.scroll_offset, rows, total);
+        let b = crate::copymode::unproject(ex, ey, cm.scroll_offset, rows, total);
+        Some(pane.screen.selection_text(a.x, a.y, b.x, b.y))
+    }
+
+    /// True when the raw (unclipped) normalized selection extends beyond the visible
+    /// viewport (an endpoint above `top` or below `bottom`). The reproduce-then-fix
+    /// tests assert this as a PRECONDITION so they are valid fail-before cases: if the
+    /// selection were fully on-screen, the clip would be a no-op and the buggy raw-yank
+    /// would already equal the highlight.
+    #[cfg(test)]
+    pub fn copy_mode_selection_exceeds_viewport_for_test(&self) -> bool {
+        let Some(cm) = self.copy_mode.as_ref() else { return false };
+        let Some(sel) = cm.selection else { return false };
+        let Some(pane) = self.panes.get(&cm.pane) else { return false };
+        let rows = pane.screen.rows() as usize;
+        let total = pane.screen.total_rows();
+        let top = total.saturating_sub(rows).saturating_sub(cm.scroll_offset);
+        let bottom = top + rows.saturating_sub(1);
+        let (a, b) = sel.normalized();
+        a.y < top || b.y > bottom
     }
 
     /// Handle a mouse event while copy mode is active.
@@ -3270,6 +3331,87 @@ mod tests {
         assert!(eff.emit.is_none(), "release must not yank in v1");
         assert!(session.copy_mode_has_selection_for_test());
         assert!(session.copy_mode_active());
+    }
+
+    // --- Issue 1: WYSIWYG yank (copy == highlight) ---
+
+    /// Anchor a selection at the LIVE BOTTOM, then scroll UP so the anchor falls
+    /// below the visible viewport. The raw selection still covers the off-screen
+    /// rows (and their soft-wrap continuation); the highlight clips at the viewport
+    /// edge. The yank must match the highlight, not the raw selection.
+    #[tokio::test]
+    async fn keyboard_yank_copies_only_the_highlighted_clipped_cells() {
+        // 10 cols, 4 rows, scrollback on. A long unbroken token soft-wraps onto
+        // many physical rows that overflow into scrollback.
+        let (mut session, _pane, _rx) = copy_test_session(10, 4, 2000).await;
+        // ~90 chars in a 10-col pane → ~9 physical rows; with 3 content rows that
+        // leaves ~6 rows of scrollback, so scrolling up produces a clearly
+        // off-screen selection (robust precondition, not an off-by-one).
+        session.feed_focused_for_test(
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+        );
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Anchor at the live bottom, then `k` up: once the cursor reaches the top
+        // row, further `k` scrolls the viewport up (scroll_offset grows), leaving the
+        // anchor's SCREEN row BELOW the viewport's bottom row.
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'v'));
+        for _ in 0..8 {
+            let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'k'));
+        }
+        // PRECONDITION: the raw selection must actually extend past the viewport,
+        // else this is not a valid fail-before repro (clip would be a no-op).
+        assert!(
+            session.copy_mode_selection_exceeds_viewport_for_test(),
+            "setup must produce an off-screen selection end"
+        );
+        let highlighted = session.copy_mode_highlighted_text_for_test().unwrap();
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'y'));
+        assert_eq!(
+            eff.emit,
+            Some(osc52(&highlighted)),
+            "yank must copy exactly the highlighted clipped cells, not the off-screen continuation"
+        );
+        assert!(!session.copy_mode_active(), "yank exits copy mode");
+    }
+
+    /// Same property via the MOUSE path: press at the bottom, then drag UP at the
+    /// top edge so the auto-scroll pushes the press-anchor below the viewport.
+    #[tokio::test]
+    async fn mouse_drag_yank_copies_only_highlighted_cells() {
+        let (mut session, _pane, _rx) = copy_test_session(10, 4, 2000).await;
+        // ~90 chars in a 10-col pane → ~9 physical rows; with 3 content rows that
+        // leaves ~6 rows of scrollback, so scrolling up produces a clearly
+        // off-screen selection (robust precondition, not an off-by-one).
+        session.feed_focused_for_test(
+            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+        );
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Press on the bottom CONTENT row (anchor), then repeatedly Drag at the TOP
+        // edge (row 1): handle_copy_mode_mouse auto-scrolls up at the top edge, so the
+        // bottom anchor scrolls off-screen below the viewport.
+        // NOTE: wire rows are 1-based; the viewport's bottom row is the status/tab bar,
+        // so for a copy_test_session(10, 4, ..) the pane content is 3 rows (wire 1..=3)
+        // and the bottom PANE row is wire `row: 3` (wire `row: 4` is the status bar and
+        // is ignored by handle_copy_mode_mouse as outside the pane rect).
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0, col: 1, row: 3, kind: crate::input::MouseKind::Press,
+        });
+        for _ in 0..8 {
+            let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+                button: 0, col: 1, row: 1, kind: crate::input::MouseKind::Drag,
+            });
+        }
+        assert!(
+            session.copy_mode_selection_exceeds_viewport_for_test(),
+            "setup must produce an off-screen selection end"
+        );
+        let highlighted = session.copy_mode_highlighted_text_for_test().unwrap();
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'y'));
+        assert_eq!(
+            eff.emit,
+            Some(osc52(&highlighted)),
+            "mouse-drag yank must equal the highlight, not the off-screen continuation"
+        );
     }
 
     #[tokio::test]
