@@ -208,6 +208,9 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub sound: SoundConfig,
     pub scrollback: usize,
+    /// When true (default), a left-drag in a pane whose foreground app is not
+    /// using the mouse auto-enters copy mode (tmux-style). `false` disables it.
+    pub mouse_copy: bool,
 }
 
 impl Default for Config {
@@ -219,6 +222,7 @@ impl Default for Config {
             sidebar: SidebarConfig::default(),
             sound: SoundConfig::default(),
             scrollback: DEFAULT_SCROLLBACK,
+            mouse_copy: true,
         }
     }
 }
@@ -237,6 +241,8 @@ struct RawConfig {
     #[serde(default)]
     sound: RawSound,
     scrollback: Option<usize>,
+    #[serde(rename = "mouse-copy")]
+    mouse_copy: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -409,6 +415,7 @@ impl Config {
             sidebar: sidebar_from_raw(&raw.sidebar),
             sound: sound_from_raw(&raw.sound),
             scrollback: raw.scrollback.unwrap_or(DEFAULT_SCROLLBACK),
+            mouse_copy: raw.mouse_copy.unwrap_or(true),
         }
     }
 
@@ -805,5 +812,22 @@ flavor = "one-dark"
     fn missing_scrollback_keeps_default() {
         let c = Config::from_toml_str("prefix = \"C-a\"\n");
         assert_eq!(c.scrollback, 2000);
+    }
+
+    #[test]
+    fn default_mouse_copy_is_true() {
+        assert!(Config::default().mouse_copy);
+    }
+
+    #[test]
+    fn toml_parses_mouse_copy_false() {
+        let c = Config::from_toml_str("mouse-copy = false\n");
+        assert!(!c.mouse_copy);
+    }
+
+    #[test]
+    fn missing_mouse_copy_keeps_default_true() {
+        let c = Config::from_toml_str("prefix = \"C-a\"\n");
+        assert!(c.mouse_copy);
     }
 }
