@@ -15,6 +15,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+pub mod restart;
+pub use restart::{restart_running_sessions, RestartPref};
+
 /// The GitHub Releases API response shape we depend on. Only the fields we
 /// actually read are listed — `serde_json` ignores the rest.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
