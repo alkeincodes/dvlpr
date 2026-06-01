@@ -13,6 +13,16 @@ use std::ptr;
 use crate::compositor::{CellStyle, Color};
 use crate::ghostty::sys;
 
+/// Which terminal screen buffer the pane is currently rendering into. Full-screen
+/// TUIs (claude, vim, less, htop) switch to `Alternate` via DECSET 1049; the
+/// engine hardcodes alt-screen scrollback to zero, so `wheel` events must take
+/// a different path (forward as input to the app) on alt-screen panes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActiveScreen {
+    Primary,
+    Alternate,
+}
+
 pub struct GhosttyScreen {
     term: sys::GhosttyTerminal,
     cols: u16,
@@ -336,6 +346,29 @@ impl GhosttyScreen {
             );
         }
         tracking
+    }
+
+    /// Which screen buffer is currently active (primary vs alternate). Alt is
+    /// entered via DECSET 1049 by full-screen TUIs; the engine retains zero
+    /// scrollback for it, so wheel events on alt panes with no mouse mode
+    /// enabled have nowhere to scroll to.
+    pub fn active_screen(&self) -> ActiveScreen {
+        let mut s: sys::GhosttyTerminalScreen =
+            sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+        // SAFETY: `term` is valid; ACTIVE_SCREEN documents output type
+        // `GhosttyTerminalScreen *`.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                (&raw mut s).cast(),
+            );
+        }
+        if s == sys::GhosttyTerminalScreen_GHOSTTY_TERMINAL_SCREEN_ALTERNATE {
+            ActiveScreen::Alternate
+        } else {
+            ActiveScreen::Primary
+        }
     }
 
     /// Raw scrollbar state from the engine as `(total, offset, len)`:

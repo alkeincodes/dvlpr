@@ -2086,32 +2086,110 @@ impl Session {
         CommandEffect::default()
     }
 
-    /// Rows scrolled per mouse-wheel notch.
+    /// Rows scrolled per mouse-wheel notch on the engine-viewport path.
     const WHEEL_STEP: isize = 3;
 
-    /// Scroll the pane under the cursor in response to a mouse-wheel event.
-    /// Modeless: drives the engine viewport directly (the engine clamps at both
-    /// ends and re-attaches to live output when scrolled back to the bottom).
-    /// No-op over non-pane regions or while an overlay is open. Never changes
-    /// focus. The compositor already renders the VIEWPORT tag, so the scrolled
-    /// view appears with no extra render work.
-    pub fn wheel(&mut self, ev: crate::input::MouseEvent) -> CommandEffect {
+    /// Handle a mouse-wheel event on the pane under the cursor.
+    ///
+    /// Decision tree, modelled on tmux's `WheelUpPane` binding +
+    /// `input_key_get_mouse` (`input-keys.c:711-793`):
+    ///
+    /// 1. **App has any mouse mode enabled** (`MOUSE_TRACKING` data slot
+    ///    covers DECSET 9 / 1000 / 1002 / 1003): forward the wheel as SGR
+    ///    mouse-press encoding (`ESC [ < 64;col;row M` for up, `65` for
+    ///    down) at pane-local 1-based coords. This is what Claude Code 2.x,
+    ///    vim with mouse, htop, btop, etc. all consume to drive their own
+    ///    scroll. Works on either screen buffer — the app has signalled it
+    ///    wants the events.
+    /// 2. **No mouse mode, app is on the alternate screen**: do nothing.
+    ///    The engine retains zero scrollback for alt buffers, and the app
+    ///    has not asked for mouse events — synthesising arrow keys here
+    ///    would inject `\e[A` / `\e[B` into the app's input field (Claude
+    ///    Code binds these to input-history navigation, NOT scroll), which
+    ///    is actively worse than a no-op. tmux drops the event in this
+    ///    case too (`input-keys.c:805`).
+    /// 3. **No mouse mode, app is on the primary screen**: drive the engine
+    ///    viewport. The compositor renders the VIEWPORT tag, so scrolled
+    ///    rows from the engine's scrollback (capped by `config.scrollback`)
+    ///    appear with no extra render work.
+    ///
+    /// Always a no-op over non-pane regions, on non-wheel kinds, or while
+    /// an overlay is open. Never changes focus. Return value is for tests;
+    /// production callers may discard it.
+    pub fn wheel(&mut self, ev: crate::input::MouseEvent) -> WheelOutcome {
         use crate::input::MouseKind;
         // Overlays own the screen; never scroll a pane behind one.
         if self.menu.is_some() || self.help.is_some() || self.dialog.is_some() {
-            return CommandEffect::default();
+            return WheelOutcome::NoOp;
         }
         let layout::Hit::Pane(id) = self.hit(ev.col, ev.row) else {
-            return CommandEffect::default();
+            return WheelOutcome::NoOp;
         };
-        if let Some(pane) = self.panes.get_mut(&id) {
-            match ev.kind {
-                MouseKind::ScrollUp => pane.screen.scroll_viewport_delta(-Self::WHEEL_STEP),
-                MouseKind::ScrollDown => pane.screen.scroll_viewport_delta(Self::WHEEL_STEP),
-                _ => {}
+        let is_up = match ev.kind {
+            MouseKind::ScrollUp => true,
+            MouseKind::ScrollDown => false,
+            _ => return WheelOutcome::NoOp,
+        };
+        // Resolve the pane rect so we can map viewport-relative wire (col,row)
+        // to pane-local 1-based coords for SGR encoding. Mirrors the
+        // zoomed-vs-tiled split in `compose`/`handle_copy_mode_mouse`.
+        let content =
+            layout::compute_regions(self.viewport(), self.sidebar_visible, self.sidebar_width)
+                .content_area;
+        let win = &self.windows[self.active_window];
+        let pane_rect = if win.zoomed && win.focused == id {
+            content
+        } else {
+            match layout::pane_rects(&win.root, content)
+                .into_iter()
+                .find(|(pid, _)| *pid == id)
+                .map(|(_, r)| r)
+            {
+                Some(r) => r,
+                None => return WheelOutcome::NoOp,
+            }
+        };
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return WheelOutcome::NoOp;
+        };
+        let mouse_on = pane.screen.mouse_tracking();
+        let alt = pane.screen.active_screen() == crate::ghostty::screen::ActiveScreen::Alternate;
+        let outcome = if mouse_on {
+            // ev.col/row are 1-based viewport; pane_rect.x/y are 0-based
+            // viewport. Pane-local 1-based = viewport_1based - rect_0based.
+            let pane_col = ev.col.saturating_sub(pane_rect.x).max(1);
+            let pane_row = ev.row.saturating_sub(pane_rect.y).max(1);
+            let bytes = sgr_mouse_wheel(is_up, pane_col, pane_row);
+            pane.runtime.write_input(&bytes);
+            WheelOutcome::Forwarded(bytes)
+        } else if alt {
+            WheelOutcome::NoOp
+        } else {
+            let delta = if is_up {
+                -Self::WHEEL_STEP
+            } else {
+                Self::WHEEL_STEP
+            };
+            pane.screen.scroll_viewport_delta(delta);
+            WheelOutcome::Viewport
+        };
+        // Debug instrumentation: when `/tmp/dvlpr-wheel.enable` exists, append
+        // every wheel event's resolved state + branch + bytes to
+        // /tmp/dvlpr-wheel.log. Off by default; zero overhead when absent.
+        if std::path::Path::new("/tmp/dvlpr-wheel.enable").exists() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/dvlpr-wheel.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "pane={id:?} is_up={is_up} mouse_tracking={mouse_on} alt_screen={alt} outcome={outcome:?}",
+                );
             }
         }
-        CommandEffect::default()
+        outcome
     }
 
     pub(crate) fn hit(&self, col: u16, row: u16) -> layout::Hit {
@@ -2820,6 +2898,32 @@ impl Session {
     pub fn menu_highlighted_for_test(&self) -> Option<usize> {
         self.menu.as_ref().map(|m| m.highlighted)
     }
+}
+
+/// Encode a mouse-wheel event in SGR (DECSET 1006) format the way tmux's
+/// `input_key_get_mouse` emits it: `ESC [ < <sgr_b> ; <col> ; <row> M` with
+/// `sgr_b = 64` for wheel-up, `65` for wheel-down, and 1-based pane-local
+/// coords. Wheel has no release event in this format; the `M` is correct.
+/// Pure.
+fn sgr_mouse_wheel(is_up: bool, pane_col_1based: u16, pane_row_1based: u16) -> Vec<u8> {
+    let sgr_b: u16 = if is_up { 64 } else { 65 };
+    format!("\x1b[<{};{};{}M", sgr_b, pane_col_1based, pane_row_1based).into_bytes()
+}
+
+/// What a wheel event actually did. Returned by `Session::wheel`; the server
+/// caller discards it (`let _ = ...`), tests assert on it. Carrying the wire
+/// bytes back on `Forwarded` lets tests verify the encoding without poking
+/// at the PTY master.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WheelOutcome {
+    /// Engine viewport was scrolled (primary screen has real scrollback).
+    Viewport,
+    /// Wheel was forwarded to the pane PTY as arrow-key bytes (alternate
+    /// screen — engine has no scrollback there, so the app drives its own
+    /// scroll). `bytes` is exactly what was written to the PTY.
+    Forwarded(Vec<u8>),
+    /// Overlay open, non-pane region, or non-wheel kind — nothing happened.
+    NoOp,
 }
 
 /// Apply a movement to the copy-mode cursor, scrolling the pane's viewport when
@@ -7168,6 +7272,105 @@ mod tests {
     }
 
     // --- Task 3: Session::wheel ---
+
+    #[test]
+    fn sgr_mouse_wheel_up_button_64() {
+        // Tmux's input-keys.c:756-758: `ESC [ < <sgr_b> ; <col> ; <row> M`,
+        // sgr_b=64 wheel-up, coords 1-based.
+        assert_eq!(super::sgr_mouse_wheel(true, 5, 5), b"\x1b[<64;5;5M");
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_down_button_65() {
+        assert_eq!(super::sgr_mouse_wheel(false, 5, 5), b"\x1b[<65;5;5M");
+    }
+
+    #[test]
+    fn sgr_mouse_wheel_carries_pane_local_coords() {
+        // Wire (col,row) is viewport-relative; encoding must use pane-local
+        // 1-based — wheel events past a column- or row-split land at the
+        // pane origin, not the viewport origin.
+        assert_eq!(super::sgr_mouse_wheel(true, 1, 1), b"\x1b[<64;1;1M");
+        assert_eq!(super::sgr_mouse_wheel(false, 80, 24), b"\x1b[<65;80;24M");
+    }
+
+    #[tokio::test]
+    async fn wheel_alt_screen_no_mouse_mode_is_noop_not_arrow_injection() {
+        // Repro of the regression my first fix shipped: alt-screen with no
+        // mouse mode used to forward arrow keys. Claude Code 2.x binds
+        // Up/Down to input-history navigation, so arrow injection was
+        // actively worse than nothing. Tmux drops the event here too
+        // (input-keys.c:805). Stay silent until the app asks for mouse.
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        feed.extend_from_slice(b"\x1b[?1049h");
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let outcome = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(outcome, super::WheelOutcome::NoOp);
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 0);
+    }
+
+    #[tokio::test]
+    async fn wheel_with_mouse_tracking_emits_sgr_pressed() {
+        // Claude Code 2.x enables DECSET 1000 + 1006 once interactive.
+        // Wheel events must be forwarded as SGR mouse-press bytes (b=64
+        // up, 65 down) at pane-local 1-based coords, just like tmux's
+        // input_key_get_mouse path. Same rule on either screen buffer
+        // — the app has explicitly opted into mouse events.
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        // Switch to alt-screen and turn on normal mouse tracking + SGR.
+        feed.extend_from_slice(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let (mut session, _pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let outcome = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(
+            outcome,
+            super::WheelOutcome::Forwarded(b"\x1b[<64;5;5M".to_vec())
+        );
+        let outcome = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollDown,
+        });
+        assert_eq!(
+            outcome,
+            super::WheelOutcome::Forwarded(b"\x1b[<65;5;5M".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn wheel_on_primary_screen_still_scrolls_viewport() {
+        // Sanity: no mouse mode, no alt-screen → drive the engine viewport,
+        // same as before. `config.scrollback = 10000` still matters here.
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let outcome = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(outcome, super::WheelOutcome::Viewport);
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 3);
+    }
 
     #[tokio::test]
     async fn wheel_scrolls_pane_and_returns_to_live() {
