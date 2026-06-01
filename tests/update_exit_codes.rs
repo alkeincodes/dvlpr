@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use dvlpr::update::{error_to_exit, run_with, Fetch};
+use dvlpr::update::{error_to_exit, run_with, Fetch, UpdateOutcome};
 
 struct PermDeniedFetcher;
 impl Fetch for PermDeniedFetcher {
@@ -85,7 +85,7 @@ fn run_with_returns_ok_without_download_when_already_latest() {
 
 #[test]
 fn error_to_exit_maps_kinds_to_documented_codes() {
-    assert_eq!(error_to_exit(Ok(())), 0);
+    assert_eq!(error_to_exit(Ok(UpdateOutcome::AlreadyLatest)), 0);
     assert_eq!(
         error_to_exit(Err(io::Error::new(io::ErrorKind::PermissionDenied, "x"))),
         2

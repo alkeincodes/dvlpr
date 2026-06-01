@@ -42,8 +42,8 @@ async fn main() {
             Ok(())
         }
         Cmd::Update => {
-            let code = dvlpr::update::run();
-            std::process::exit(code);
+            let outcome = dvlpr::update::run_swap();
+            std::process::exit(dvlpr::update::error_to_exit(outcome));
         }
         Cmd::Control(args) => {
             std::process::exit(dvlpr::control::run(&args).await);

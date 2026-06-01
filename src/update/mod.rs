@@ -29,6 +29,15 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
+/// Result of a swap attempt. `install_exe` is the canonical path the binary
+/// occupies (post-swap for `Applied`, unchanged for `AlreadyLatest`) — the
+/// restart orchestration respawns daemons from this explicit path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Applied { install_exe: PathBuf },
+    AlreadyLatest,
+}
+
 /// Indirection over network I/O. Production uses `CurlFetcher`; tests pass
 /// a stub that returns canned bytes.
 pub trait Fetch {
@@ -293,9 +302,9 @@ pub fn install_self<F: Fetch>(
 /// Side-effect: prints the error message to stderr prefixed with
 /// `dvlpr update: ` for non-zero exits. Stays out of stdout so a caller
 /// scripting around `dvlpr update` can pipe stdout cleanly.
-pub fn error_to_exit(result: io::Result<()>) -> i32 {
+pub fn error_to_exit(result: io::Result<UpdateOutcome>) -> i32 {
     match result {
-        Ok(()) => 0,
+        Ok(_) => 0,
         Err(e) => {
             eprintln!("dvlpr update: {e}");
             if e.kind() == io::ErrorKind::PermissionDenied {
@@ -309,12 +318,12 @@ pub fn error_to_exit(result: io::Result<()>) -> i32 {
 
 /// Lower-seam orchestration — takes injected dependencies so tests can
 /// exercise the writability/permission-denied path without a real exe
-/// to write to. `run()` (below) wires this up with production defaults.
+/// to write to. `run_swap()` (below) wires this up with production defaults.
 pub fn run_with<F: Fetch>(
     fetcher: &F,
     writable: impl Fn(&Path) -> bool,
     repo: &str,
-) -> io::Result<()> {
+) -> io::Result<UpdateOutcome> {
     // 1. Fetch + parse latest release JSON.
     let release = fetch_latest_release(fetcher, repo)?;
 
@@ -326,7 +335,7 @@ pub fn run_with<F: Fetch>(
             "dvlpr {}.{}.{} — already on the latest release ({}).",
             current.0, current.1, current.2, release.tag_name
         );
-        return Ok(());
+        return Ok(UpdateOutcome::AlreadyLatest);
     }
 
     // 3. Pick the asset pair for this host triple.
@@ -367,21 +376,42 @@ pub fn run_with<F: Fetch>(
         "Updated dvlpr {}.{}.{} → {}.{}.{}.",
         current.0, current.1, current.2, remote.0, remote.1, remote.2
     );
-    println!("Running sessions keep the old binary until you `dvlpr stop -t <name>` and reattach.");
-    Ok(())
+    Ok(UpdateOutcome::Applied {
+        install_exe: current_exe,
+    })
 }
 
-/// Production entry point: wires `run_with` to `CurlFetcher`,
-/// `parent_writable`, and the compile-time `release_repo()`. Returns
-/// an exit code suitable for `std::process::exit`.
-pub fn run() -> i32 {
-    let result = run_with(&CurlFetcher, parent_writable, release_repo());
-    error_to_exit(result)
+/// Production entry point for the swap step: wires `run_with` to `CurlFetcher`,
+/// `parent_writable`, and the compile-time `release_repo()`.
+pub fn run_swap() -> io::Result<UpdateOutcome> {
+    run_with(&CurlFetcher, parent_writable, release_repo())
+}
+
+/// Is stdin a terminal? (Wrapper so the restart orchestrator stays testable.)
+pub fn stdin_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_reports_already_latest_when_remote_not_newer() {
+        struct StubFetcher;
+        impl Fetch for StubFetcher {
+            fn fetch_to(&self, _: &str, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn fetch_string(&self, _: &str) -> io::Result<String> {
+                let (a, b, c) = current_version();
+                Ok(format!(r#"{{"tag_name":"v{a}.{b}.{c}","assets":[]}}"#))
+            }
+        }
+        let outcome = run_with(&StubFetcher, |_| true, "fake/repo").unwrap();
+        assert_eq!(outcome, UpdateOutcome::AlreadyLatest);
+    }
 
     #[test]
     fn parse_remote_version_round_trips_common_tags() {
