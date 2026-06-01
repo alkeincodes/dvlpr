@@ -320,6 +320,22 @@ impl GhosttyScreen {
         n
     }
 
+    /// Whether the pane's foreground app currently has ANY mouse tracking mode
+    /// active (X10, normal, button-event, or any-event). Used to suppress
+    /// drag-to-enter copy mode so a mouse-aware TUI keeps receiving its mouse.
+    pub fn mouse_tracking(&self) -> bool {
+        let mut tracking: bool = false;
+        // SAFETY: `term` is valid; MOUSE_TRACKING documents output type `bool *`.
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                (&raw mut tracking).cast(),
+            );
+        }
+        tracking
+    }
+
     /// Scroll the viewport to the live bottom (active area). Idempotent.
     pub fn scroll_viewport_bottom(&mut self) {
         // SAFETY: `term` is valid; BOTTOM ignores the value union.
@@ -886,5 +902,19 @@ mod tests {
             s.feed(format!("l{i}\r\n").as_bytes());
         }
         assert_eq!(s.scrollback_rows(), 0);
+    }
+
+    #[test]
+    fn mouse_tracking_reflects_decset_enable_and_disable() {
+        let mut s = GhosttyScreen::new(80, 24, 0);
+        assert!(!s.mouse_tracking(), "fresh terminal has no mouse tracking");
+        // DECSET 1002 (button-event tracking) enables a mouse-tracking mode.
+        s.feed(b"\x1b[?1002h");
+        assert!(s.mouse_tracking(), "?1002h must enable mouse tracking");
+        s.feed(b"\x1b[?1002l");
+        assert!(!s.mouse_tracking(), "?1002l must disable mouse tracking");
+        // DECSET 1000 (normal tracking) likewise reads as active.
+        s.feed(b"\x1b[?1000h");
+        assert!(s.mouse_tracking(), "?1000h must enable mouse tracking");
     }
 }
