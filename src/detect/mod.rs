@@ -138,10 +138,13 @@ fn has_selection_prompt(tail: &str) -> bool {
 /// Match Claude's working hint anywhere on screen EXCEPT inside the user's
 /// own input box.
 ///
-/// Two signals trip the Working state:
-/// - the interrupt hint (`esc to interrupt` / `ctrl+c to interrupt`)
+/// Three signals trip the Working state:
+/// - the interrupt hint (`esc to interrupt` / `ctrl+c to interrupt`) — the
+///   pre-2.x spinner footer
+/// - the Claude Code 2.x spinner footer `· ↓ <N>...tokens` (throughput
+///   counter that replaced `esc to interrupt`) — see `has_token_throughput`
 /// - a spinner verb framed with an ellipsis (`Combobulating…`, `Working…`,
-///   `Pondering...`), drawn from Claude Code's own verb pool.
+///   `Pondering...`), drawn from Claude Code's own verb pool
 ///
 /// Real layout: the input box sits ABOVE the spinner, so the working hint
 /// lives BELOW the box's bottom border. We can't anchor "above the first
@@ -159,8 +162,26 @@ fn is_claude_working(tail: &str, input_box: Option<&InputBox>) -> bool {
         if lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt") {
             return true;
         }
+        if has_token_throughput(line) {
+            return true;
+        }
         has_spinner_verb_line(line)
     })
+}
+
+/// True if `line` carries Claude Code 2.x's spinner-line token-throughput
+/// footer `· ↓ <N>[.<N>]k tokens`. Anchored on the literal `· ↓ ` delimiter
+/// (middle dot + down arrow) followed by a digit and the word `tokens` —
+/// this exact triple does not appear in prose, only in the spinner row.
+fn has_token_throughput(line: &str) -> bool {
+    let Some(idx) = line.find("· ↓ ") else {
+        return false;
+    };
+    let after = &line[idx + "· ↓ ".len()..];
+    if !after.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    after.contains("tokens")
 }
 
 /// True if `line` contains a Claude spinner verb framed with an ellipsis
@@ -335,6 +356,45 @@ mod tests {
                     ─────────────────────────\n\
                     ✻ Generating… (5s · esc to interrupt)\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_working_new_format_token_throughput_footer() {
+        // Claude Code 2.x dropped "esc to interrupt" from the spinner line
+        // and replaced it with token throughput `↓ <N>k tokens`. The `…`
+        // now anchors the end of the task description, NOT the verb, so
+        // `has_spinner_verb_line` (which only matches `<Verb>…`) misses
+        // entirely. The `· ↓ <digit>...tokens` footer is the structural
+        // signal we anchor on instead — unique to Claude's spinner.
+        let tail = "...previous response...\n\
+                    ─────────────────────────\n\
+                    ❯\u{a0}\n\
+                    ─────────────────────────\n\
+                    ✻ Fixing create-path policy bypass… (6m 12s · ↓ 20.6k tokens)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
+    }
+
+    #[test]
+    fn classify_claude_token_throughput_marker_inside_input_box_is_idle() {
+        // Same guard as the `esc to interrupt` case: a user typing the
+        // throughput footer literally into their input box must NOT
+        // false-positive Working.
+        let tail = "────────\n❯ (6m 12s · ↓ 20.6k tokens)\n────────\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_completion_footer_past_tense_is_idle() {
+        // Companion to the new-format Working test: after Claude finishes
+        // a turn, the line flips to past tense WITHOUT the `… (· ↓ tokens)`
+        // throughput tail. `Brewed for Ns · ...` is the completion footer
+        // and must classify as Idle even though `Brewing` is a verb.
+        let tail = "Some response text.\n\
+                    ✻ Brewed for 4m 18s\n\
+                    ─────────────────────────\n\
+                    ❯\u{a0}\n\
+                    ─────────────────────────\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
     }
 
     #[test]
