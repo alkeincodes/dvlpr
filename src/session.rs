@@ -1218,6 +1218,7 @@ impl Session {
             self.copy_mode.as_ref().and_then(|cm| {
                 let pane = self.panes.get(&cm.pane)?;
                 let rows = pane.screen.rows();
+                let cols = pane.screen.cols();
                 let total = pane.screen.total_rows();
                 let content = layout::compute_regions(
                     self.viewport(),
@@ -1233,26 +1234,8 @@ impl Session {
                         .find(|(id, _)| *id == cm.pane)
                         .map(|(_, r)| r)?
                 };
-                // Clip the selection to the visible viewport. Compute the
-                // visible SCREEN-row span; drop the highlight if the selection
-                // lies entirely above or below it.
                 let selection = cm.selection.and_then(|sel| {
-                    let (a, b) = sel.normalized();
-                    let top = total
-                        .saturating_sub(rows as usize)
-                        .saturating_sub(cm.scroll_offset);
-                    let bottom = top + (rows as usize).saturating_sub(1);
-                    if b.y < top || a.y > bottom {
-                        return None; // entirely off-screen
-                    }
-                    let pa = crate::copymode::project(a, cm.scroll_offset, rows, total)
-                        .unwrap_or((0, 0));
-                    let pb =
-                        crate::copymode::project(b, cm.scroll_offset, rows, total).unwrap_or((
-                            pane_rect.w.saturating_sub(1),
-                            rows.saturating_sub(1),
-                        ));
-                    Some((pa, pb))
+                    crate::copymode::clip_selection(&sel, cm.scroll_offset, rows, cols, total)
                 });
                 let status = copy_status.as_deref().unwrap_or("");
                 Some(crate::compositor::CopyModeOverlay {

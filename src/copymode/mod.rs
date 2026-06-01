@@ -202,6 +202,38 @@ pub fn unproject(
     AbsPoint { x: col, y: top + row as usize }
 }
 
+/// Clip a selection to the visible viewport and project it to viewport-relative
+/// `(col, row)` endpoints. Returns `None` if the selection is entirely off-screen
+/// (above or below the visible rows).
+///
+/// The single source of truth shared by rendering (`Session::compose`) and yank
+/// (`Session::handle_copy_mode_key`) so the copied text equals the highlighted
+/// cells exactly. When an endpoint is above the viewport it clamps to the
+/// top-left `(0, 0)`; when below, it clamps to the bottom-right last visible cell
+/// `(viewport_cols - 1, viewport_rows - 1)` — matching the inverse highlight which
+/// runs to the last column/row of the pane.
+pub fn clip_selection(
+    sel: &Selection,
+    scroll_offset: usize,
+    viewport_rows: u16,
+    viewport_cols: u16,
+    total_rows: usize,
+) -> Option<((u16, u16), (u16, u16))> {
+    let (a, b) = sel.normalized();
+    let vp = viewport_rows as usize;
+    let top = total_rows.saturating_sub(vp).saturating_sub(scroll_offset);
+    let bottom = top + vp.saturating_sub(1);
+    if b.y < top || a.y > bottom {
+        return None; // entirely off-screen
+    }
+    let pa = project(a, scroll_offset, viewport_rows, total_rows).unwrap_or((0, 0));
+    let pb = project(b, scroll_offset, viewport_rows, total_rows).unwrap_or((
+        viewport_cols.saturating_sub(1),
+        viewport_rows.saturating_sub(1),
+    ));
+    Some((pa, pb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +287,54 @@ mod tests {
         let abs = unproject(2, 4, 0, 10, 100);
         assert_eq!(abs, AbsPoint { x: 2, y: 94 });
         assert_eq!(project(abs, 0, 10, 100), Some((2, 4)));
+    }
+
+    #[test]
+    fn clip_selection_fully_visible_is_unchanged() {
+        // total=100, viewport 10 rows/20 cols, unscrolled → top = 90.
+        let sel = Selection {
+            anchor: AbsPoint { x: 2, y: 92 },
+            head: AbsPoint { x: 7, y: 95 },
+        };
+        assert_eq!(clip_selection(&sel, 0, 10, 20, 100), Some(((2, 2), (7, 5))));
+    }
+
+    #[test]
+    fn clip_selection_clamps_partial_top_and_bottom_to_viewport_edges() {
+        // top = 90, bottom = 99. anchor above (y=80), head below (y=150).
+        let sel = Selection {
+            anchor: AbsPoint { x: 5, y: 80 },
+            head: AbsPoint { x: 9, y: 150 },
+        };
+        // start clamps to top-left (0,0); end clamps to last visible cell
+        // (viewport_cols-1, viewport_rows-1) = (19, 9).
+        assert_eq!(clip_selection(&sel, 0, 10, 20, 100), Some(((0, 0), (19, 9))));
+    }
+
+    #[test]
+    fn clip_selection_partial_top_only_keeps_visible_end() {
+        // anchor above viewport (y=80 < top=90), head visible at y=93.
+        let sel = Selection {
+            anchor: AbsPoint { x: 5, y: 80 },
+            head: AbsPoint { x: 4, y: 93 },
+        };
+        assert_eq!(clip_selection(&sel, 0, 10, 20, 100), Some(((0, 0), (4, 3))));
+    }
+
+    #[test]
+    fn clip_selection_fully_offscreen_is_none() {
+        // Whole selection above the viewport (top=90).
+        let sel = Selection {
+            anchor: AbsPoint { x: 0, y: 10 },
+            head: AbsPoint { x: 4, y: 20 },
+        };
+        assert_eq!(clip_selection(&sel, 0, 10, 20, 100), None);
+        // Whole selection below the viewport.
+        let sel2 = Selection {
+            anchor: AbsPoint { x: 0, y: 200 },
+            head: AbsPoint { x: 4, y: 210 },
+        };
+        assert_eq!(clip_selection(&sel2, 0, 10, 20, 100), None);
     }
 
     #[test]
