@@ -1735,6 +1735,15 @@ impl Session {
                     // cm dropped (not put back) → copy mode exits.
                     return CopyEffect { emit };
                 }
+                if cm.mouse_origin {
+                    // A mouse-driven session lives only while the button is held.
+                    // Releasing it with no selection (a click, or a drag that
+                    // returned to the anchor) exits copy mode — nothing to copy.
+                    pane.screen.scroll_viewport_bottom();
+                    // cm dropped → copy mode exits.
+                    return CopyEffect::default();
+                }
+                // Keyboard session: a stray release just ends any in-progress drag.
                 cm.dragging = false;
             }
             MouseKind::ScrollUp => {
@@ -1774,6 +1783,12 @@ impl Session {
         self.enter_copy_mode();
         if self.copy_mode_pane() != Some(pane) {
             return; // entry refused (scrollback==0, etc.)
+        }
+        // Mark this as a mouse-driven session: releasing the button exits copy
+        // mode (see the Release arm of handle_copy_mode_mouse), unlike a keyboard
+        // `prefix [` session which a stray mouse release must not tear down.
+        if let Some(cm) = self.copy_mode.as_mut() {
+            cm.mouse_origin = true;
         }
         // Seed at the press cell, then extend to the drag cell, reusing the
         // existing press/drag coordinate translation + clamping.
@@ -3622,6 +3637,41 @@ mod tests {
         assert!(
             session.copy_mode_has_selection_for_test(),
             "drag must seed a live selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_origin_release_without_selection_exits_copy_mode() {
+        // A mouse-driven session (drag-to-enter) lives only while the button is
+        // held. If the drag collapses back to the anchor so there is no net
+        // selection, the release must EXIT copy mode — the user let go of the
+        // click. (Contrast: a keyboard `prefix [` session is NOT torn down by a
+        // stray release — see copy_mode_mouse_click_without_drag_does_not_yank_or_exit.)
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 2000).await;
+        session.feed_focused_for_test(b"hello world");
+        session.begin_drag_select(pane, (1, 1), (6, 1));
+        assert!(session.copy_mode_active(), "drag must enter copy mode");
+        assert!(
+            session.copy_mode.as_ref().unwrap().mouse_origin,
+            "drag-to-enter must mark the session mouse-originated"
+        );
+        // Drag the head back onto the anchor cell → head == anchor (no selection).
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 1,
+            row: 1,
+            kind: crate::input::MouseKind::Drag,
+        });
+        let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 1,
+            row: 1,
+            kind: crate::input::MouseKind::Release,
+        });
+        assert!(eff.emit.is_none(), "no selection → nothing to copy");
+        assert!(
+            !session.copy_mode_active(),
+            "releasing a mouse-driven session with no selection must exit copy mode"
         );
     }
 

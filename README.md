@@ -512,6 +512,11 @@ Drag-to-enter is suppressed when the pane's foreground app is itself using the
 mouse (e.g. vim, htop), so those apps keep their mouse. A plain click (press +
 release without dragging) does not enter copy mode or copy anything.
 
+A mouse-driven copy session lives only while the button is held: releasing it
+always ends the session. If you dragged out a selection it is copied; if the
+drag collapsed back to nothing, copy mode simply exits. (A keyboard `prefix [`
+session is unaffected — a stray mouse release won't tear it down.)
+
 The copy lands in your system clipboard only if your terminal honors OSC 52
 clipboard writes (see *OSC 52 clipboard support* below) — that's the same
 requirement as the `y` yank.

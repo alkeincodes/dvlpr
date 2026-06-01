@@ -106,6 +106,11 @@ pub fn resolve_copy_key(k: &CopyKey) -> CopyAction {
 
 /// Copy-mode state: the frozen pane, viewport-relative cursor, scroll offset,
 /// optional selection, and whether a mouse drag is in progress.
+///
+/// `mouse_origin` records that this session was started by a mouse drag (vs the
+/// keyboard `prefix [`). A mouse-driven session lives only while the button is
+/// held: releasing it exits copy mode even with no selection. A keyboard session
+/// ignores stray mouse releases so vi-style navigation is not torn down.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyModeState {
     pub pane: PaneId,
@@ -113,6 +118,7 @@ pub struct CopyModeState {
     pub scroll_offset: usize,
     pub selection: Option<Selection>,
     pub dragging: bool,
+    pub mouse_origin: bool,
 }
 
 impl CopyModeState {
@@ -123,6 +129,7 @@ impl CopyModeState {
             scroll_offset: 0,
             selection: None,
             dragging: false,
+            mouse_origin: false,
         }
     }
 
