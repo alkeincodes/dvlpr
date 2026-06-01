@@ -1438,7 +1438,14 @@ impl Session {
         self.menu = None;
         self.help = None;
         self.dialog = None;
-        self.copy_mode = Some(crate::copymode::CopyModeState::enter(pane, cursor));
+        // Seed the copy-mode scroll offset from the engine's actual viewport
+        // position so a wheel-scrolled pane keeps its place when copy mode takes
+        // over. 0 when the pane was at the live bottom.
+        let mut state = crate::copymode::CopyModeState::enter(pane, cursor);
+        if let Some(p) = self.panes.get(&pane) {
+            state.scroll_offset = p.screen.viewport_offset();
+        }
+        self.copy_mode = Some(state);
     }
 
     /// Exit copy mode: restore the frozen pane's viewport to the live bottom and
@@ -1553,6 +1560,11 @@ impl Session {
     #[cfg(test)]
     pub fn copy_mode_cursor_for_test(&self) -> Option<(u16, u16)> {
         self.copy_mode.as_ref().map(|cm| cm.cursor)
+    }
+
+    #[cfg(test)]
+    pub fn copy_mode_scroll_offset_for_test(&self) -> Option<usize> {
+        self.copy_mode.as_ref().map(|cm| cm.scroll_offset)
     }
 
     #[cfg(test)]
@@ -1712,7 +1724,21 @@ impl Session {
             MouseKind::Release => {
                 cm.dragging = false;
             }
-            MouseKind::ScrollUp | MouseKind::ScrollDown => {}
+            MouseKind::ScrollUp => {
+                let max_offset = pane.screen.scrollback_rows();
+                let n = (Self::WHEEL_STEP as usize).min(max_offset.saturating_sub(cm.scroll_offset));
+                if n > 0 {
+                    pane.screen.scroll_viewport_delta(-(n as isize));
+                    cm.scroll_offset += n;
+                }
+            }
+            MouseKind::ScrollDown => {
+                let n = (Self::WHEEL_STEP as usize).min(cm.scroll_offset);
+                if n > 0 {
+                    pane.screen.scroll_viewport_delta(n as isize);
+                    cm.scroll_offset -= n;
+                }
+            }
         }
 
         cm.clamp_to_screen(total, cols);
@@ -7042,5 +7068,42 @@ mod tests {
                 format!("({:?} {} {})", dir, node_shape(first), node_shape(second))
             }
         }
+    }
+
+    #[tokio::test]
+    async fn enter_copy_mode_adopts_wheel_scroll_offset() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let up = MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp };
+        session.wheel(up);
+        session.wheel(up);
+        let engine_offset = session.pane_viewport_offset_for_test(pane);
+        assert_eq!(engine_offset, 6);
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(6));
+    }
+
+    #[tokio::test]
+    async fn wheel_in_copy_mode_scrolls_copy_offset() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, _pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(0));
+        let _ = session.handle_copy_mode_mouse(MouseEvent {
+            button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(3));
+        let _ = session.handle_copy_mode_mouse(MouseEvent {
+            button: 0, col: 5, row: 5, kind: MouseKind::ScrollDown,
+        });
+        assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(0));
     }
 }
