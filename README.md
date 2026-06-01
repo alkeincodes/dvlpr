@@ -463,6 +463,15 @@ yank it to the clipboard.
 | `C-b` / `PageUp` | Scroll up one full page |
 | `C-f` / `PageDown` | Scroll down one full page |
 
+### Mouse-wheel scrolling
+
+Rolling the mouse wheel over a pane scrolls that pane through its scrollback in
+place — no `prefix [` and no foreground promotion, so you can skim a background
+pane's history while another pane stays focused. The view holds its position
+while new output keeps streaming in; scroll back down to the bottom to return
+to live. In copy mode the wheel moves the copy offset instead, and entering
+copy mode adopts whatever offset you had wheeled to.
+
 ### Selecting and yanking
 
 | Key | Action |
@@ -599,7 +608,7 @@ The protocol is bincode over a Unix socket. The first message is
 `Attach { cols, rows }`, `Status` (used by `dvlpr ls`), or `Kill` (used by
 `dvlpr stop`). `Status` and `Kill` are answered without spawning a session
 (no geometry / foreground side effects). `PROTOCOL_VERSION` is currently
-`4`.
+`5`.
 
 ### libghostty-vt FFI
 
