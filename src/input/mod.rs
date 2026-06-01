@@ -421,7 +421,12 @@ fn parse_sgr(buf: &[u8]) -> Option<MouseEvent> {
         } else {
             MouseKind::ScrollDown
         };
-        return Some(MouseEvent { button: 0, col: x, row: y, kind });
+        return Some(MouseEvent {
+            button: 0,
+            col: x,
+            row: y,
+            kind,
+        });
     }
     let kind = if b & 32 != 0 {
         MouseKind::Drag
@@ -572,7 +577,10 @@ mod tests {
         assert_eq!(p.feed(&cfg, &[0x1b], false), vec![]); // ESC alone, buffered
         assert!(p.pending_escape());
         // Timer fires: standalone Escape goes to the pane.
-        assert_eq!(p.flush_escape_timeout(false), vec![InputEvent::Pane(vec![0x1b])]);
+        assert_eq!(
+            p.flush_escape_timeout(false),
+            vec![InputEvent::Pane(vec![0x1b])]
+        );
         assert!(!p.pending_escape());
     }
 
@@ -620,8 +628,8 @@ mod tests {
         let cfg = Config::default();
         let mut p = InputParser::new();
         assert_eq!(p.feed(&cfg, b"\x1b[<0;5", false), vec![]); // partial, buffered
-                                                        // A committed mouse sequence is NOT pending_escape: it waits for completion
-                                                        // without a timer, so a fragmented report is never flushed to the pane.
+                                                               // A committed mouse sequence is NOT pending_escape: it waits for completion
+                                                               // without a timer, so a fragmented report is never flushed to the pane.
         assert!(!p.pending_escape());
         assert_eq!(
             p.feed(&cfg, b";7M", false),
@@ -893,23 +901,44 @@ mod tests {
     #[test]
     fn copy_mode_ctrl_b_does_not_arm_prefix_and_surfaces_as_copykey() {
         use crate::copymode::CopyKey;
-        assert_eq!(parse_copy(&[0x02]), vec![InputEvent::CopyKey(CopyKey::Ctrl(0x02))]);
+        assert_eq!(
+            parse_copy(&[0x02]),
+            vec![InputEvent::CopyKey(CopyKey::Ctrl(0x02))]
+        );
     }
 
     #[test]
     fn copy_mode_plain_char_is_a_copykey_not_pane_bytes() {
         use crate::copymode::CopyKey;
-        assert_eq!(parse_copy(b"j"), vec![InputEvent::CopyKey(CopyKey::Char(b'j'))]);
+        assert_eq!(
+            parse_copy(b"j"),
+            vec![InputEvent::CopyKey(CopyKey::Char(b'j'))]
+        );
     }
 
     #[test]
     fn copy_mode_arrow_and_pageup_decode() {
         use crate::copymode::CopyKey;
-        assert_eq!(parse_copy(b"\x1b[A"), vec![InputEvent::CopyKey(CopyKey::Up)]);
-        assert_eq!(parse_copy(b"\x1b[5~"), vec![InputEvent::CopyKey(CopyKey::PageUp)]);
-        assert_eq!(parse_copy(b"\x1b[6~"), vec![InputEvent::CopyKey(CopyKey::PageDown)]);
-        assert_eq!(parse_copy(b"\x1b[H"), vec![InputEvent::CopyKey(CopyKey::Home)]);
-        assert_eq!(parse_copy(b"\x1b[F"), vec![InputEvent::CopyKey(CopyKey::End)]);
+        assert_eq!(
+            parse_copy(b"\x1b[A"),
+            vec![InputEvent::CopyKey(CopyKey::Up)]
+        );
+        assert_eq!(
+            parse_copy(b"\x1b[5~"),
+            vec![InputEvent::CopyKey(CopyKey::PageUp)]
+        );
+        assert_eq!(
+            parse_copy(b"\x1b[6~"),
+            vec![InputEvent::CopyKey(CopyKey::PageDown)]
+        );
+        assert_eq!(
+            parse_copy(b"\x1b[H"),
+            vec![InputEvent::CopyKey(CopyKey::Home)]
+        );
+        assert_eq!(
+            parse_copy(b"\x1b[F"),
+            vec![InputEvent::CopyKey(CopyKey::End)]
+        );
     }
 
     #[test]
@@ -931,7 +960,10 @@ mod tests {
         // ESC as the final byte: parser parks in NEsc, emitting nothing yet.
         assert!(p.feed(&cfg, b"\x1b", true).is_empty());
         // The timer fires: in copy mode this must be an Exit CopyKey, NOT Pane(ESC).
-        assert_eq!(p.flush_escape_timeout(true), vec![InputEvent::CopyKey(CopyKey::Ctrl(0x1b))]);
+        assert_eq!(
+            p.flush_escape_timeout(true),
+            vec![InputEvent::CopyKey(CopyKey::Ctrl(0x1b))]
+        );
     }
 
     #[test]

@@ -214,7 +214,7 @@ fn assign_transcripts(
     candidates: Vec<(std::path::PathBuf, String, std::time::SystemTime)>,
 ) -> Vec<(PaneId, std::path::PathBuf, String)> {
     panes.sort_by_key(|(_, t)| *t); // oldest start first
-    // Index candidates newest-birth first so the first eligible match is the newest.
+                                    // Index candidates newest-birth first so the first eligible match is the newest.
     let mut order: Vec<usize> = (0..candidates.len()).collect();
     order.sort_by(|&a, &b| candidates[b].2.cmp(&candidates[a].2));
     let mut claimed = vec![false; candidates.len()];
@@ -1506,18 +1506,21 @@ impl Session {
                 // selection_text on those. A selection scrolled entirely off-screen
                 // clips to None → no emit (consistent with "copy what you see").
                 let emit = cm.selection.and_then(|sel| {
-                    let (clip_start, clip_end) = crate::copymode::clip_selection(
-                        &sel,
+                    let (clip_start, clip_end) =
+                        crate::copymode::clip_selection(&sel, cm.scroll_offset, rows, cols, total)?;
+                    let a = crate::copymode::unproject(
+                        clip_start.0,
+                        clip_start.1,
                         cm.scroll_offset,
                         rows,
-                        cols,
                         total,
-                    )?;
-                    let a = crate::copymode::unproject(
-                        clip_start.0, clip_start.1, cm.scroll_offset, rows, total,
                     );
                     let b = crate::copymode::unproject(
-                        clip_end.0, clip_end.1, cm.scroll_offset, rows, total,
+                        clip_end.0,
+                        clip_end.1,
+                        cm.scroll_offset,
+                        rows,
+                        total,
                     );
                     let text = pane.screen.selection_text(a.x, a.y, b.x, b.y);
                     Some(osc52(&text))
@@ -1537,7 +1540,16 @@ impl Session {
                 cm.toggle_select(here);
             }
             CopyAction::Move(m) => {
-                apply_motion(&mut cm, m, cols, rows, half, scrollback, total, &mut pane.screen);
+                apply_motion(
+                    &mut cm,
+                    m,
+                    cols,
+                    rows,
+                    half,
+                    scrollback,
+                    total,
+                    &mut pane.screen,
+                );
                 // If a selection is active, extend its head to the new cursor.
                 if cm.selection.is_some() {
                     let here = crate::copymode::unproject(
@@ -1569,7 +1581,9 @@ impl Session {
 
     #[cfg(test)]
     pub fn copy_mode_has_selection_for_test(&self) -> bool {
-        self.copy_mode.as_ref().is_some_and(|cm| cm.selection.is_some())
+        self.copy_mode
+            .as_ref()
+            .is_some_and(|cm| cm.selection.is_some())
     }
 
     #[cfg(test)]
@@ -1605,9 +1619,15 @@ impl Session {
     /// would already equal the highlight.
     #[cfg(test)]
     pub fn copy_mode_selection_exceeds_viewport_for_test(&self) -> bool {
-        let Some(cm) = self.copy_mode.as_ref() else { return false };
-        let Some(sel) = cm.selection else { return false };
-        let Some(pane) = self.panes.get(&cm.pane) else { return false };
+        let Some(cm) = self.copy_mode.as_ref() else {
+            return false;
+        };
+        let Some(sel) = cm.selection else {
+            return false;
+        };
+        let Some(pane) = self.panes.get(&cm.pane) else {
+            return false;
+        };
         let rows = pane.screen.rows() as usize;
         let total = pane.screen.total_rows();
         let top = total.saturating_sub(rows).saturating_sub(cm.scroll_offset);
@@ -1622,6 +1642,7 @@ impl Session {
             .get(&pane)
             .map(|p| p.screen.viewport_offset())
             .unwrap_or(0)
+    }
 
     /// Handle a mouse event while copy mode is active.
     ///
@@ -1726,7 +1747,8 @@ impl Session {
             }
             MouseKind::ScrollUp => {
                 let max_offset = pane.screen.scrollback_rows();
-                let n = (Self::WHEEL_STEP as usize).min(max_offset.saturating_sub(cm.scroll_offset));
+                let n =
+                    (Self::WHEEL_STEP as usize).min(max_offset.saturating_sub(cm.scroll_offset));
                 if n > 0 {
                     pane.screen.scroll_viewport_delta(-(n as isize));
                     cm.scroll_offset += n;
@@ -1753,12 +1775,7 @@ impl Session {
     ///
     /// The caller is responsible for the gate (mouse_copy on, copy mode inactive,
     /// pane not mouse-tracking, hit == Hit::Pane); this only performs the entry.
-    pub fn begin_drag_select(
-        &mut self,
-        pane: PaneId,
-        anchor: (u16, u16),
-        head: (u16, u16),
-    ) {
+    pub fn begin_drag_select(&mut self, pane: PaneId, anchor: (u16, u16), head: (u16, u16)) {
         // enter_copy_mode freezes the *focused* pane; focus the target first so the
         // copy-mode pane matches the dragged pane.
         self.focus(pane);
@@ -2368,7 +2385,8 @@ impl Session {
         resolve_transcripts: impl Fn(
             &str,
             detect::Agent,
-        ) -> Vec<(std::path::PathBuf, String, std::time::SystemTime)>,
+        )
+            -> Vec<(std::path::PathBuf, String, std::time::SystemTime)>,
         resolve_start: impl Fn(i32) -> Option<std::time::SystemTime>,
     ) -> bool {
         let mut changed = false;
@@ -2910,8 +2928,7 @@ fn osc52(text: &str) -> Vec<u8> {
 
 /// Minimal standard-alphabet base64 (no crate dependency).
 fn base64_encode_into(input: &[u8], out: &mut Vec<u8>) {
-    const T: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -3118,8 +3135,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_mode_y_yanks_and_exits_with_osc52_bytes() {
-        let (mut session, pane, mut _rx) =
-            test_session_feeding(20, 5, 2000, b"hello world").await;
+        let (mut session, pane, mut _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
         let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'v'));
         let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'$'));
@@ -3197,7 +3213,10 @@ mod tests {
         }
         let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'j'));
         let cm = session.copy_mode.as_ref().unwrap();
-        assert_eq!(cm.scroll_offset, 0, "j at live bottom must not change offset");
+        assert_eq!(
+            cm.scroll_offset, 0,
+            "j at live bottom must not change offset"
+        );
         assert_eq!(cm.cursor.1, 4, "cursor stays at last row");
     }
 
@@ -3312,7 +3331,10 @@ mod tests {
             !session.copy_mode.as_ref().unwrap().dragging,
             "dragging must be false after release"
         );
-        assert!(session.copy_mode_active(), "copy mode must stay active after release");
+        assert!(
+            session.copy_mode_active(),
+            "copy mode must stay active after release"
+        );
     }
 
     #[tokio::test]
@@ -3393,7 +3415,10 @@ mod tests {
         let (mut session, _pane, _rx) = copy_test_session(20, 5, 0).await;
         // scrollback=0 → copy mode cannot be entered
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
-        assert!(!session.copy_mode_active(), "scrollback=0 must prevent copy mode");
+        assert!(
+            !session.copy_mode_active(),
+            "scrollback=0 must prevent copy mode"
+        );
         let mut drag: Option<(usize, crate::layout::SplitPath)> = None;
         // A right-click should open a menu as usual.
         let _ = session.handle_mouse(
@@ -3502,11 +3527,17 @@ mod tests {
         // and the bottom PANE row is wire `row: 3` (wire `row: 4` is the status bar and
         // is ignored by handle_copy_mode_mouse as outside the pane rect).
         let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
-            button: 0, col: 1, row: 3, kind: crate::input::MouseKind::Press,
+            button: 0,
+            col: 1,
+            row: 3,
+            kind: crate::input::MouseKind::Press,
         });
         for _ in 0..8 {
             let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
-                button: 0, col: 1, row: 1, kind: crate::input::MouseKind::Drag,
+                button: 0,
+                col: 1,
+                row: 1,
+                kind: crate::input::MouseKind::Drag,
             });
         }
         assert!(
@@ -3543,7 +3574,10 @@ mod tests {
     async fn begin_drag_select_is_noop_when_scrollback_zero() {
         let (mut session, pane, _rx) = copy_test_session(40, 12, 0).await;
         session.begin_drag_select(pane, (1, 1), (6, 1));
-        assert!(!session.copy_mode_active(), "scrollback==0 disables copy mode");
+        assert!(
+            !session.copy_mode_active(),
+            "scrollback==0 disables copy mode"
+        );
     }
 
     #[tokio::test]
@@ -6428,7 +6462,10 @@ mod tests {
         };
         let s0 = sid(ids[0]);
         let s1 = sid(ids[1]);
-        assert_ne!(s0, s1, "two same-cwd agents must capture DISTINCT session ids");
+        assert_ne!(
+            s0, s1,
+            "two same-cwd agents must capture DISTINCT session ids"
+        );
         let got: std::collections::HashSet<String> = [s0, s1].into_iter().collect();
         let want: std::collections::HashSet<String> = [
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
@@ -6436,7 +6473,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        assert_eq!(got, want, "each pane must hold one of the two real sessions");
+        assert_eq!(
+            got, want,
+            "each pane must hold one of the two real sessions"
+        );
     }
 
     // Fix 1: unzoom_active must persist the unzoom itself (mark snapshot dirty)
@@ -6864,8 +6904,14 @@ mod tests {
 
         // Place the selection on the last 2 SCREEN rows (live bottom).
         {
-            let anchor = crate::copymode::AbsPoint { x: 0, y: total.saturating_sub(2) };
-            let head   = crate::copymode::AbsPoint { x: cols - 1, y: total.saturating_sub(1) };
+            let anchor = crate::copymode::AbsPoint {
+                x: 0,
+                y: total.saturating_sub(2),
+            };
+            let head = crate::copymode::AbsPoint {
+                x: cols - 1,
+                y: total.saturating_sub(1),
+            };
             let cm = session.copy_mode.as_mut().unwrap();
             cm.selection = Some(crate::copymode::Selection { anchor, head });
         }
@@ -6940,10 +6986,16 @@ mod tests {
 
         // Selection: SCREEN rows (total-5)..(total-1) i.e. bottom 5 rows.
         let sel_start_y = total.saturating_sub(pane_rows_actual); // = total-5 = 15
-        let sel_end_y   = total.saturating_sub(1); // = 19
+        let sel_end_y = total.saturating_sub(1); // = 19
         {
-            let anchor = crate::copymode::AbsPoint { x: 0, y: sel_start_y };
-            let head   = crate::copymode::AbsPoint { x: cols - 1, y: sel_end_y };
+            let anchor = crate::copymode::AbsPoint {
+                x: 0,
+                y: sel_start_y,
+            };
+            let head = crate::copymode::AbsPoint {
+                x: cols - 1,
+                y: sel_end_y,
+            };
             let cm = session.copy_mode.as_mut().unwrap();
             cm.selection = Some(crate::copymode::Selection { anchor, head });
         }
@@ -6992,7 +7044,12 @@ mod tests {
             feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
         }
         let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
-        let at = |kind| MouseEvent { button: 0, col: 5, row: 5, kind };
+        let at = |kind| MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind,
+        };
         session.wheel(at(MouseKind::ScrollUp));
         assert_eq!(session.pane_viewport_offset_for_test(pane), 3);
         session.wheel(at(MouseKind::ScrollUp));
@@ -7012,12 +7069,30 @@ mod tests {
         }
         let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
         // Over the tab/status row (bottom bar) — no pane hit.
-        session.wheel(MouseEvent { button: 0, col: 5, row: 12, kind: MouseKind::ScrollUp });
-        assert_eq!(session.pane_viewport_offset_for_test(pane), 0, "non-pane wheel is a no-op");
+        session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 12,
+            kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(
+            session.pane_viewport_offset_for_test(pane),
+            0,
+            "non-pane wheel is a no-op"
+        );
         // With an overlay open, wheel is a no-op even over the pane.
         session.set_help_for_test(Some(crate::help::HelpState::default()));
-        session.wheel(MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp });
-        assert_eq!(session.pane_viewport_offset_for_test(pane), 0, "overlay blocks wheel");
+        session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        assert_eq!(
+            session.pane_viewport_offset_for_test(pane),
+            0,
+            "overlay blocks wheel"
+        );
     }
 
     #[tokio::test]
@@ -7028,7 +7103,12 @@ mod tests {
             feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
         }
         let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
-        let up = MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp };
+        let up = MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        };
         session.wheel(up);
         session.wheel(up); // up 6 rows from the live bottom
         assert_eq!(session.pane_viewport_offset_for_test(pane), 6);
@@ -7078,7 +7158,12 @@ mod tests {
             feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
         }
         let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
-        let up = MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp };
+        let up = MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        };
         session.wheel(up);
         session.wheel(up);
         let engine_offset = session.pane_viewport_offset_for_test(pane);
@@ -7098,11 +7183,17 @@ mod tests {
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
         assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(0));
         let _ = session.handle_copy_mode_mouse(MouseEvent {
-            button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp,
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
         });
         assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(3));
         let _ = session.handle_copy_mode_mouse(MouseEvent {
-            button: 0, col: 5, row: 5, kind: MouseKind::ScrollDown,
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollDown,
         });
         assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(0));
     }

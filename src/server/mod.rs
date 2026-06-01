@@ -639,9 +639,27 @@ fn remove_client(
     removed
 }
 
+/// Whether an input batch should promote its client to foreground. Wheel-only
+/// batches must NOT promote: scrolling never steals foreground or resizes the
+/// shared session. (`any` over an empty slice is `false`, so empty batches also
+/// do not promote.)
+fn events_should_promote(events: &[InputEvent]) -> bool {
+    events.iter().any(|e| {
+        !matches!(
+            e,
+            InputEvent::Mouse(m)
+                if matches!(
+                    m.kind,
+                    crate::input::MouseKind::ScrollUp | crate::input::MouseKind::ScrollDown
+                )
+        )
+    })
+}
+
 /// Commit decoded input events for client `id`: promote the sender if the parse yielded
-/// any events (interaction), resizing the session when the foreground changes, then route
-/// the events into the session. Used by BOTH `ClientInput` and the tick-time ESC flush.
+/// a promoting event (see `events_should_promote` — wheel-only batches do NOT promote),
+/// resizing the session when the foreground changes, then route the events into the
+/// session. Used by BOTH `ClientInput` and the tick-time ESC flush.
 ///
 /// `copy_mode_owner`: mutable reference so drag-to-enter can set the owner mid-pass.
 /// `mouse_copy`: from `keymap.mouse_copy`; gates the drag-to-enter feature.
@@ -658,13 +676,23 @@ fn commit_input(
     copy_mode_owner: &mut Option<ClientId>,
     mouse_copy: bool,
 ) {
-    if !events.is_empty() && promote(clients, foreground, activity_seq, id) {
+    if events_should_promote(&events) && promote(clients, foreground, activity_seq, id) {
         if let Some(st) = clients.get(&id) {
             session.resize(st.size.0, st.size.1);
         }
         *dirty = true;
     }
-    apply_events(session, clients, foreground, ev_tx, id, events, dirty, copy_mode_owner, mouse_copy);
+    apply_events(
+        session,
+        clients,
+        foreground,
+        ev_tx,
+        id,
+        events,
+        dirty,
+        copy_mode_owner,
+        mouse_copy,
+    );
 }
 
 /// Apply the parts of a `CommandEffect` that are identical for every caller:
@@ -878,11 +906,30 @@ fn apply_events(
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
+                use crate::input::MouseKind;
+                if matches!(m.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
+                    // Wheel scroll. Owner-pinned like other copy-mode mouse; a
+                    // non-owner's wheel is dropped while copy mode is active.
+                    if session.copy_mode_active() && *copy_mode_owner == Some(id) {
+                        let _ = session.handle_copy_mode_mouse(m);
+                        *dirty = true;
+                    } else if session.copy_mode_active() {
+                        // Non-owner wheel while copy mode is active: drop it.
+                    } else {
+                        let _ = session.wheel(m);
+                        *dirty = true;
+                    }
+                    continue;
+                }
                 if session.copy_mode_active() && *copy_mode_owner == Some(id) {
                     // Only the copy-mode owner's mouse events drive copy mode.
                     let eff = session.handle_copy_mode_mouse(m);
                     if let Some(bytes) = eff.emit {
-                        debug_assert_eq!(*copy_mode_owner, Some(id), "OSC 52 must go to copy-mode owner only");
+                        debug_assert_eq!(
+                            *copy_mode_owner,
+                            Some(id),
+                            "OSC 52 must go to copy-mode owner only"
+                        );
                         if let Some(st) = clients.get(&id) {
                             let _ = st.control.send(Control::Emit(bytes));
                         }
@@ -891,7 +938,6 @@ fn apply_events(
                 } else if session.copy_mode_active() {
                     // Copy mode active but this client is NOT the owner: drop.
                 } else {
-                    use crate::input::MouseKind;
                     // Drag-to-enter (tmux-style). The Press records a pending
                     // anchor; the first Drag auto-enters copy mode owned by this
                     // client; a Release with no drag clears it (it was a click).
@@ -925,8 +971,7 @@ fn apply_events(
                             // fall through to normal handling (pane focus / drag).
                         }
                         MouseKind::Drag => {
-                            let pending =
-                                clients.get(&id).and_then(|st| st.pending_copy_press);
+                            let pending = clients.get(&id).and_then(|st| st.pending_copy_press);
                             if let Some((pane, ac, ar)) = pending {
                                 // Re-check the gate at drag time: if the app turned
                                 // ON mouse tracking between press and drag, abort.
@@ -1327,6 +1372,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wheel_only_batches_do_not_promote() {
+        use crate::input::{InputEvent, MouseEvent, MouseKind};
+        let wheel = |kind| {
+            InputEvent::Mouse(MouseEvent {
+                button: 0,
+                col: 1,
+                row: 1,
+                kind,
+            })
+        };
+        assert!(!events_should_promote(&[]));
+        assert!(!events_should_promote(&[wheel(MouseKind::ScrollUp)]));
+        assert!(!events_should_promote(&[
+            wheel(MouseKind::ScrollUp),
+            wheel(MouseKind::ScrollDown)
+        ]));
+        assert!(events_should_promote(&[InputEvent::Pane(vec![b'a'])]));
+        assert!(events_should_promote(&[
+            wheel(MouseKind::ScrollUp),
+            InputEvent::Pane(vec![b'a'])
+        ]));
+        assert!(events_should_promote(&[InputEvent::Mouse(MouseEvent {
+            button: 0,
+            col: 1,
+            row: 1,
+            kind: MouseKind::Press,
+        })]));
+    }
+
+    #[test]
     fn for_session_rejects_an_invalid_name() {
         // Validation runs first, so no runtime dir or socket is created.
         assert!(ServerConfig::for_session("bad/name").is_err());
@@ -1389,7 +1464,7 @@ mod tests {
     #[test]
     fn desired_capture_is_menu_or_foreground_copy_client() {
         // menu open → all clients capture; copy mode → only the foreground copy client.
-        assert!(desired_mouse_capture(/*menu*/ true,  /*is_copy_fg*/ false));
+        assert!(desired_mouse_capture(/*menu*/ true, /*is_copy_fg*/ false));
         assert!(desired_mouse_capture(false, true));
         assert!(!desired_mouse_capture(false, false));
         assert!(desired_mouse_capture(true, true));
@@ -1423,13 +1498,28 @@ mod tests {
         // copy mode already active → no.
         assert!(!drag_to_enter_should_arm(true, true, &Hit::Pane(1), false));
         // mouse_copy off → no.
-        assert!(!drag_to_enter_should_arm(false, false, &Hit::Pane(1), false));
+        assert!(!drag_to_enter_should_arm(
+            false,
+            false,
+            &Hit::Pane(1),
+            false
+        ));
         // pane is mouse-tracking → no.
         assert!(!drag_to_enter_should_arm(true, false, &Hit::Pane(1), true));
         // non-pane hits → no.
-        assert!(!drag_to_enter_should_arm(true, false, &Hit::Divider(vec![]), false));
+        assert!(!drag_to_enter_should_arm(
+            true,
+            false,
+            &Hit::Divider(vec![]),
+            false
+        ));
         assert!(!drag_to_enter_should_arm(true, false, &Hit::Tab(0), false));
-        assert!(!drag_to_enter_should_arm(true, false, &Hit::NewWindowButton, false));
+        assert!(!drag_to_enter_should_arm(
+            true,
+            false,
+            &Hit::NewWindowButton,
+            false
+        ));
         assert!(!drag_to_enter_should_arm(true, false, &Hit::None, false));
     }
 
@@ -1474,7 +1564,10 @@ mod tests {
         // The copy-mode pane exits (PaneOutput::Exited path in the server loop).
         let _ = session.pane_exited(pane_id);
         // pane_exited clears copy mode inside Session; copy_mode_active() is now false.
-        assert!(!session.copy_mode_active(), "pane_exited must deactivate copy mode");
+        assert!(
+            !session.copy_mode_active(),
+            "pane_exited must deactivate copy mode"
+        );
 
         // THE FIX: the server loop now runs this reconcile immediately after pane_exited.
         if !session.copy_mode_active() {
@@ -1538,7 +1631,10 @@ mod tests {
         // Control CLI sends WindowNext (ControlCommand path in the server loop).
         // apply_command(NextWindow) calls exit_copy_mode internally.
         let _ = session.apply_command(crate::config::Command::NextWindow);
-        assert!(!session.copy_mode_active(), "NextWindow must deactivate copy mode");
+        assert!(
+            !session.copy_mode_active(),
+            "NextWindow must deactivate copy mode"
+        );
 
         // THE FIX: the server loop now runs this reconcile immediately after
         // apply_control_command returns.

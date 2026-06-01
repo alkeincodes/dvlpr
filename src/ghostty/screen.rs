@@ -190,7 +190,9 @@ impl GhosttyScreen {
             {
                 return ' ';
             }
-            char::from_u32(cp).filter(|c| !c.is_control()).unwrap_or(' ')
+            char::from_u32(cp)
+                .filter(|c| !c.is_control())
+                .unwrap_or(' ')
         }
     }
 
@@ -427,7 +429,10 @@ impl GhosttyScreen {
             let start_point = sys::GhosttyPoint {
                 tag: sys::GhosttyPointTag_GHOSTTY_POINT_TAG_SCREEN,
                 value: sys::GhosttyPointValue {
-                    coordinate: sys::GhosttyPointCoordinate { x: start_x, y: start_y },
+                    coordinate: sys::GhosttyPointCoordinate {
+                        x: start_x,
+                        y: start_y,
+                    },
                 },
             };
             if sys::ghostty_terminal_grid_ref(self.term, start_point, &mut start_ref) != 0 {
@@ -467,7 +472,8 @@ impl GhosttyScreen {
             };
 
             let mut formatter: sys::GhosttyFormatter = ptr::null_mut();
-            if sys::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.term, opts) != 0
+            if sys::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, self.term, opts)
+                != 0
                 || formatter.is_null()
             {
                 return String::new();
@@ -865,10 +871,16 @@ mod tests {
         // should now read scrolled-back content (not the live bottom).
         s.scroll_viewport_delta(-5);
         let top: String = (0..s.cols()).map(|x| s.cell(x, 0)).collect();
-        assert!(top.trim_end().starts_with("row"), "viewport top after scroll: {top:?}");
+        assert!(
+            top.trim_end().starts_with("row"),
+            "viewport top after scroll: {top:?}"
+        );
         s.scroll_viewport_bottom();
         let bottom_top: String = (0..s.cols()).map(|x| s.cell(x, 0)).collect();
-        assert_ne!(top, bottom_top, "scrolling must change what the viewport top shows");
+        assert_ne!(
+            top, bottom_top,
+            "scrolling must change what the viewport top shows"
+        );
     }
 
     #[test]
@@ -879,10 +891,13 @@ mod tests {
         for i in 0..10 {
             s.feed(format!("r{i}\r\n").as_bytes());
         }
-        s.feed(b"LIVE9");        // last line at the live bottom
+        s.feed(b"LIVE9"); // last line at the live bottom
         s.scroll_viewport_delta(-8); // scroll far up into history
         let tail = s.tail_text(2);
-        assert!(tail.contains("LIVE9"), "tail must read live bottom, got {tail:?}");
+        assert!(
+            tail.contains("LIVE9"),
+            "tail must read live bottom, got {tail:?}"
+        );
     }
 
     #[test]
@@ -902,7 +917,10 @@ mod tests {
         s.feed(b"abcdefgh");
         // Select the whole wrapped logical line (rows 0..=1).
         let txt = s.selection_text(0, 0, 4, 1);
-        assert!(txt.contains("abcdefgh"), "soft-wrap should unwrap to one line: {txt:?}");
+        assert!(
+            txt.contains("abcdefgh"),
+            "soft-wrap should unwrap to one line: {txt:?}"
+        );
     }
 
     #[test]
@@ -917,7 +935,11 @@ mod tests {
         for i in 0..20 {
             s.feed(format!("line{i}\r\n").as_bytes());
         }
-        assert_eq!(s.viewport_offset(), 0, "fresh viewport is at the live bottom");
+        assert_eq!(
+            s.viewport_offset(),
+            0,
+            "fresh viewport is at the live bottom"
+        );
         s.scroll_viewport_delta(-5);
         assert_eq!(s.viewport_offset(), 5, "scrolled up 5 rows from bottom");
         s.scroll_viewport_delta(5);
@@ -930,7 +952,10 @@ mod tests {
         for i in 0..20 {
             s.feed(format!("line{i}\r\n").as_bytes());
         }
-        assert!(s.scrollback_rows() > 0, "feeding > rows must accumulate scrollback");
+        assert!(
+            s.scrollback_rows() > 0,
+            "feeding > rows must accumulate scrollback"
+        );
         assert!(s.total_rows() >= s.rows() as usize);
     }
 

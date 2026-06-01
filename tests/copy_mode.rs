@@ -22,11 +22,7 @@ type Writer = tokio::net::unix::OwnedWriteHalf;
 // ---------------------------------------------------------------------------
 
 fn temp_socket(test: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "dvlpr-cm-{}-{}",
-        test,
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("dvlpr-cm-{}-{}", test, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("default.sock")
 }
@@ -325,7 +321,11 @@ async fn mouse_drag_highlights_selection() {
 
     // SGR mouse PRESS at (col 3, row 2): ESC [ < 0 ; 3 ; 2 M
     // Bytes: 0x1b 0x5b 0x3c 0x30 0x3b 0x33 0x3b 0x32 0x4d
-    send_input(&mut w, &[0x1b, b'[', b'<', b'0', b';', b'3', b';', b'2', b'M']).await;
+    send_input(
+        &mut w,
+        &[0x1b, b'[', b'<', b'0', b';', b'3', b';', b'2', b'M'],
+    )
+    .await;
     // SGR mouse DRAG at (col 8, row 2): ESC [ < 32 ; 8 ; 2 M
     // Bytes: 0x1b 0x5b 0x3c 0x33 0x32 0x3b 0x38 0x3b 0x32 0x4d
     send_input(
@@ -390,8 +390,7 @@ async fn two_clients_only_foreground_gets_osc52_and_mouse_capture() {
     //
     // Strategy: use collect_bytes_until to wait for ?1003h in A's stream
     // (which is emitted when copy-mode becomes active on A's writer).
-    let (a_got_mouse_cap_early, mut a_accum) =
-        collect_bytes_until(&mut ar, 5, mouse_cap).await;
+    let (a_got_mouse_cap_early, mut a_accum) = collect_bytes_until(&mut ar, 5, mouse_cap).await;
 
     // If we didn't see ?1003h yet (e.g. timing), we might still need to yank first.
     // Either way, proceed: send select + yank, then collect until OSC52.
@@ -418,8 +417,8 @@ async fn two_clients_only_foreground_gets_osc52_and_mouse_capture() {
     );
 
     // A must have received mouse-capture enable (either in early phase or combined).
-    let a_has_mouse_cap = a_got_mouse_cap_early
-        || a_accum.windows(mouse_cap.len()).any(|w| w == mouse_cap);
+    let a_has_mouse_cap =
+        a_got_mouse_cap_early || a_accum.windows(mouse_cap.len()).any(|w| w == mouse_cap);
     assert!(
         a_has_mouse_cap,
         "client A must receive ESC[?1003h (mouse capture enable) while it is the \
@@ -772,6 +771,47 @@ async fn divider_drag_does_not_enter_copy_mode() {
     assert!(
         !seen.contains("[copy]"),
         "a divider drag must NOT enter copy mode; got {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: modeless mouse-wheel scroll (no copy mode entered)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mouse_wheel_scrolls_history_and_returns_to_live() {
+    let sock = temp_socket("wheel");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    let (mut r, mut w) = handshake(&sock, 40, 12).await;
+    assert!(
+        until_frame(&mut r, 10, |f| f.contains("line50")).await,
+        "shell script must have produced line50 first"
+    );
+    let _ = collect_bytes(&mut r, 1).await;
+
+    // Wheel up many notches over the pane (col 5, row 5): ESC [ < 64 ; 5 ; 5 M.
+    // No copy mode is entered (modeless); history must surface in the frame.
+    for _ in 0..8 {
+        send_input(&mut w, b"\x1b[<64;5;5M").await;
+    }
+    let surfaced = until_frame(&mut r, 5, |f| {
+        (1..=28).any(|i| f.contains(&format!("line{}", i)))
+    })
+    .await;
+    assert!(
+        surfaced,
+        "wheel-up must surface scrollback history without copy mode"
+    );
+
+    // Wheel down past the bottom returns to live (line50 visible again).
+    for _ in 0..12 {
+        send_input(&mut w, b"\x1b[<65;5;5M").await;
+    }
+    assert!(
+        until_frame(&mut r, 5, |f| f.contains("line50")).await,
+        "wheel-down must return to the live bottom"
     );
 }
 
