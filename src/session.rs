@@ -1462,6 +1462,15 @@ impl Session {
         self.copy_mode.as_ref().map(|cm| cm.pane)
     }
 
+    /// Whether the given pane's foreground app currently has mouse tracking
+    /// active. Read by the server's drag-to-enter gate. Unknown pane → false.
+    pub fn pane_mouse_tracking(&self, pane: PaneId) -> bool {
+        self.panes
+            .get(&pane)
+            .map(|p| p.screen.mouse_tracking())
+            .unwrap_or(false)
+    }
+
     /// Apply a decoded copy-mode key. Returns a `CopyEffect` (OSC 52 bytes on yank).
     pub fn handle_copy_mode_key(&mut self, key: crate::copymode::CopyKey) -> CopyEffect {
         use crate::copymode::{resolve_copy_key, CopyAction};
@@ -1701,6 +1710,42 @@ impl Session {
         cm.clamp_to_screen(total, cols);
         self.copy_mode = Some(cm);
         CopyEffect::default()
+    }
+
+    /// Auto-enter copy mode for `pane` and begin a mouse-drag selection anchored
+    /// at `anchor` (1-based wire `(col,row)`), extending the head to `head`.
+    /// Used by the server's drag-to-enter path. No-op if copy mode cannot be
+    /// entered (e.g. `scrollback == 0`) or `pane` is not the focused pane.
+    ///
+    /// The caller is responsible for the gate (mouse_copy on, copy mode inactive,
+    /// pane not mouse-tracking, hit == Hit::Pane); this only performs the entry.
+    pub fn begin_drag_select(
+        &mut self,
+        pane: PaneId,
+        anchor: (u16, u16),
+        head: (u16, u16),
+    ) {
+        // enter_copy_mode freezes the *focused* pane; focus the target first so the
+        // copy-mode pane matches the dragged pane.
+        self.focus(pane);
+        self.enter_copy_mode();
+        if self.copy_mode_pane() != Some(pane) {
+            return; // entry refused (scrollback==0, etc.)
+        }
+        // Seed at the press cell, then extend to the drag cell, reusing the
+        // existing press/drag coordinate translation + clamping.
+        let _ = self.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: anchor.0,
+            row: anchor.1,
+            kind: crate::input::MouseKind::Press,
+        });
+        let _ = self.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: head.0,
+            row: head.1,
+            kind: crate::input::MouseKind::Drag,
+        });
     }
 
     fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
@@ -3412,6 +3457,38 @@ mod tests {
             Some(osc52(&highlighted)),
             "mouse-drag yank must equal the highlight, not the off-screen continuation"
         );
+    }
+
+    // --- Issue 2: drag-to-enter session entry points ---
+
+    #[tokio::test]
+    async fn begin_drag_select_enters_copy_mode_and_seeds_selection() {
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 2000).await;
+        session.feed_focused_for_test(b"hello world");
+        assert!(!session.copy_mode_active());
+        // Press cell (col 1,row 1) → drag to (col 6,row 1), 1-based wire coords.
+        session.begin_drag_select(pane, (1, 1), (6, 1));
+        assert!(session.copy_mode_active(), "drag must enter copy mode");
+        assert_eq!(session.copy_mode_pane(), Some(pane));
+        assert!(
+            session.copy_mode_has_selection_for_test(),
+            "drag must seed a live selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_drag_select_is_noop_when_scrollback_zero() {
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 0).await;
+        session.begin_drag_select(pane, (1, 1), (6, 1));
+        assert!(!session.copy_mode_active(), "scrollback==0 disables copy mode");
+    }
+
+    #[tokio::test]
+    async fn pane_mouse_tracking_false_then_true_after_decset() {
+        let (mut session, pane, _rx) = copy_test_session(40, 12, 2000).await;
+        assert!(!session.pane_mouse_tracking(pane));
+        session.feed_focused_for_test(b"\x1b[?1002h");
+        assert!(session.pane_mouse_tracking(pane));
     }
 
     #[tokio::test]
