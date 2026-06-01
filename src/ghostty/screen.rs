@@ -336,6 +336,32 @@ impl GhosttyScreen {
         tracking
     }
 
+    /// Raw scrollbar state from the engine as `(total, offset, len)`:
+    /// total scrollable rows, the viewport top's offset from the screen top,
+    /// and the visible row count. Mirrors `GhosttyTerminalScrollbar`.
+    fn scrollbar(&self) -> (usize, usize, usize) {
+        // SAFETY: `term` is valid; SCROLLBAR documents output type
+        // `GhosttyTerminalScrollbar *`; the struct is zero-initialised first.
+        let mut sb: sys::GhosttyTerminalScrollbar = unsafe { mem::zeroed() };
+        unsafe {
+            sys::ghostty_terminal_get(
+                self.term,
+                sys::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                (&raw mut sb).cast(),
+            );
+        }
+        (sb.total as usize, sb.offset as usize, sb.len as usize)
+    }
+
+    /// Rows the viewport is scrolled up from the live bottom (0 = at the live
+    /// bottom). Derived from engine state, so it never goes stale while output
+    /// streams under a pinned viewport. Inverse of copy mode's `project()` top
+    /// formula (`top = total - viewport_rows - scroll_offset`).
+    pub fn viewport_offset(&self) -> usize {
+        let (total, offset, len) = self.scrollbar();
+        total.saturating_sub(len).saturating_sub(offset)
+    }
+
     /// Scroll the viewport to the live bottom (active area). Idempotent.
     pub fn scroll_viewport_bottom(&mut self) {
         // SAFETY: `term` is valid; BOTTOM ignores the value union.
@@ -883,6 +909,19 @@ mod tests {
     fn selection_text_empty_for_inverted_or_oob_range_is_safe() {
         let s = GhosttyScreen::new(5, 2, 0);
         let _ = s.selection_text(0, 0, 4, 0); // must not panic
+    }
+
+    #[test]
+    fn viewport_offset_tracks_scroll_position() {
+        let mut s = GhosttyScreen::new(10, 3, 100);
+        for i in 0..20 {
+            s.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(s.viewport_offset(), 0, "fresh viewport is at the live bottom");
+        s.scroll_viewport_delta(-5);
+        assert_eq!(s.viewport_offset(), 5, "scrolled up 5 rows from bottom");
+        s.scroll_viewport_delta(5);
+        assert_eq!(s.viewport_offset(), 0, "scrolled back to the live bottom");
     }
 
     #[test]
