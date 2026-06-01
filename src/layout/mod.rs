@@ -134,7 +134,7 @@ pub fn content_area(viewport: Rect, window_count: usize) -> Rect {
 }
 
 /// Default sidebar width in columns (runtime-configurable via `[sidebar] width`).
-pub const SIDEBAR_WIDTH_DEFAULT: u16 = 26;
+pub const SIDEBAR_WIDTH_DEFAULT: u16 = 33;
 /// Minimum allowed sidebar width (clamped in `Config::from_toml_str`).
 pub const SIDEBAR_WIDTH_MIN: u16 = 18;
 /// Maximum allowed sidebar width (clamped in `Config::from_toml_str`).
@@ -1385,8 +1385,8 @@ mod tests {
             w: 80,
             h: 24,
         };
-        // Use the default width (26). Old test used SIDEBAR_COLS (16); update to match
-        // the new default so the test pins the new contract.
+        // Use the default width (33). The test pins the contract via the
+        // SIDEBAR_WIDTH_DEFAULT constant so it tracks the configured default.
         let r = compute_regions(vp, true, SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(r.content_area.w, 80 - SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(r.content_area.h, 23);
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[test]
     fn compute_regions_suppresses_sidebar_below_threshold() {
-        // New threshold: SIDEBAR_WIDTH_DEFAULT (26) + SIDEBAR_MIN_CONTENT_COLS (20) = 46.
+        // Threshold: SIDEBAR_WIDTH_DEFAULT (33) + SIDEBAR_MIN_CONTENT_COLS (20) = 53.
         // A viewport of width 45 is below the threshold and must suppress the sidebar.
         let vp = Rect {
             x: 0,
@@ -1631,7 +1631,7 @@ mod tests {
     fn sidebar_width_constants_match_spec_defaults() {
         assert_eq!(SIDEBAR_WIDTH_MIN, 18);
         assert_eq!(SIDEBAR_WIDTH_MAX, 36);
-        assert_eq!(SIDEBAR_WIDTH_DEFAULT, 26);
+        assert_eq!(SIDEBAR_WIDTH_DEFAULT, 33);
     }
 
     #[test]

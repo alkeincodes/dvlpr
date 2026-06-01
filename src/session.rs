@@ -4579,7 +4579,7 @@ mod tests {
         let initial_cols = session.panes.get(&pane_id).unwrap().screen.cols();
         session.toggle_sidebar();
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        // Sidebar default is SIDEBAR_WIDTH_DEFAULT (26), not the old SIDEBAR_COLS (16).
+        // Sidebar default is SIDEBAR_WIDTH_DEFAULT (33).
         assert_eq!(after_cols, initial_cols - layout::SIDEBAR_WIDTH_DEFAULT);
         session.toggle_sidebar();
         assert_eq!(
@@ -4594,7 +4594,7 @@ mod tests {
         let _eff = session.apply_command(crate::config::Command::ToggleSidebar);
         assert!(session.sidebar_visible);
         let after_cols = session.panes.get(&pane_id).unwrap().screen.cols();
-        // initial cols from helper is 80; sidebar shrinks by SIDEBAR_WIDTH_DEFAULT (26).
+        // initial cols from helper is 80; sidebar shrinks by SIDEBAR_WIDTH_DEFAULT (33).
         assert_eq!(after_cols, 80 - layout::SIDEBAR_WIDTH_DEFAULT);
     }
 
@@ -4605,7 +4605,7 @@ mod tests {
         session.feed(pane_id, b"esc to interrupt\n");
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
 
-        // Sidebar width is SIDEBAR_WIDTH_DEFAULT (26); starts at 0-based col 54 (1-based 55..80).
+        // Sidebar width is SIDEBAR_WIDTH_DEFAULT (33); starts at 0-based col 47 (1-based 48..80).
         // New layout: first entry at sidebar row 3 (0-based) = row 4 1-based (header=0, divider=1, blank=2).
         // h=2 so rows 4 and 5 (1-based) are both clickable. Col 70 is inside the sidebar.
         let hit = session.hit(70, 4);

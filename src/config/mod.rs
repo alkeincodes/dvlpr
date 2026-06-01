@@ -694,9 +694,9 @@ flavor = "one-dark"
     }
 
     #[test]
-    fn config_default_sidebar_width_is_26() {
+    fn config_default_sidebar_width_is_33() {
         let cfg = Config::default();
-        assert_eq!(cfg.sidebar.width, 26);
+        assert_eq!(cfg.sidebar.width, 33);
     }
 
     #[test]
