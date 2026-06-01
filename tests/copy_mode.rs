@@ -644,6 +644,138 @@ async fn non_owner_mouse_does_not_drive_copy_mode() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: left-drag with no prior `prefix [` auto-enters copy mode (mouse-copy)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn left_drag_auto_enters_copy_mode_and_yanks() {
+    let sock = temp_socket("drag-enter");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    let (mut r, mut w) = handshake(&sock, 40, 12).await;
+
+    // Let the shell settle (it emits line1..line50 then `cat`). The pane is NOT
+    // mouse-tracking, so drag-to-enter is armed.
+    assert!(
+        until_frame(&mut r, 10, |f| f.contains("line50")).await,
+        "shell must finish output before we drag"
+    );
+    let _ = collect_bytes(&mut r, 1).await;
+
+    // SGR left PRESS at (col 3, row 2): ESC [ < 0 ; 3 ; 2 M
+    send_input(&mut w, b"\x1b[<0;3;2M").await;
+    // SGR left DRAG at (col 12, row 2): button 0 + motion bit (32) = 32.
+    send_input(&mut w, b"\x1b[<32;12;2M").await;
+
+    // The drag (not a prior `prefix [`) must have entered copy mode AND painted a
+    // selection. Accumulate bytes into ONE buffer and check BOTH markers against it
+    // — do NOT use two separate `until_frame` calls: the single frame that carries
+    // both `[copy]` and the `;7m` inverse run would be consumed by the first call,
+    // timing out the second. `collect_bytes` drains for the window and returns all
+    // bytes seen.
+    let accum = collect_bytes(&mut r, 5).await;
+    let seen = String::from_utf8_lossy(&accum);
+    assert!(
+        seen.contains("[copy]"),
+        "left-drag must auto-enter copy mode ([copy] status); got {seen:?}"
+    );
+    assert!(
+        seen.contains(";7m"),
+        "drag must paint an inverse selection run (;7m); got {seen:?}"
+    );
+
+    // Yank with 'y' → OSC 52, then copy mode exits.
+    send_input(&mut w, b"y").await;
+    let osc52: &[u8] = &[0x1b, b']', b'5', b'2', b';', b'c', b';'];
+    let (found, _accum) = collect_bytes_until(&mut r, 5, osc52).await;
+    assert!(found, "yank after drag-to-enter must emit OSC 52");
+}
+
+// ---------------------------------------------------------------------------
+// Test: a left click (Press + Release, no Drag) does NOT enter copy mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn click_does_not_enter_copy_mode() {
+    let sock = temp_socket("click-no-enter");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    let (mut r, mut w) = handshake(&sock, 40, 12).await;
+
+    // Let the shell settle.
+    assert!(
+        until_frame(&mut r, 10, |f| f.contains("line50")).await,
+        "shell must finish output before we click"
+    );
+    let _ = collect_bytes(&mut r, 1).await;
+
+    // SGR left PRESS at (col 3, row 2): ESC [ < 0 ; 3 ; 2 M
+    send_input(&mut w, b"\x1b[<0;3;2M").await;
+    // SGR left RELEASE at the same position: ESC [ < 0 ; 3 ; 2 m  (lowercase m = release)
+    send_input(&mut w, b"\x1b[<0;3;2m").await;
+
+    // A bounded drain: no `[copy]` must appear; a click must NOT enter copy mode.
+    let accum = collect_bytes(&mut r, 2).await;
+    let seen = String::from_utf8_lossy(&accum);
+    assert!(
+        !seen.contains("[copy]"),
+        "a click (Press+Release, no Drag) must NOT enter copy mode; got {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: a left-drag on a divider does NOT enter copy mode (resizes instead)
+// ---------------------------------------------------------------------------
+//
+// Create a vertical split (prefix + ArrowRight = the default split-vertical binding),
+// then send a Press at the divider column (col 20 in a 40-col viewport with ratio 0.5)
+// followed by a Drag. Copy mode must NOT be entered — the drag resizes the pane.
+// Column arithmetic: avail = 40-1 = 39, first_w = floor(0.5*39) = 19;
+// divider occupies x=19 (0-based) = col 20 (1-based SGR wire).
+
+#[tokio::test]
+async fn divider_drag_does_not_enter_copy_mode() {
+    let sock = temp_socket("divider-no-copy");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    let (mut r, mut w) = handshake(&sock, 40, 12).await;
+
+    // Let the shell settle before doing the split.
+    assert!(
+        until_frame(&mut r, 10, |f| f.contains("line50")).await,
+        "shell must finish output before we create a split"
+    );
+    let _ = collect_bytes(&mut r, 1).await;
+
+    // Create a vertical split: prefix (Ctrl-B = 0x02) + ArrowRight (ESC [ C).
+    // The default `split-vertical` binding maps prefix + Right to SplitVertical.
+    send_input(&mut w, &[0x02]).await;
+    send_input(&mut w, b"\x1b[C").await;
+
+    // Wait for the new pane to appear (the layout changes, a new frame arrives).
+    // We just wait for any frame to confirm the split happened; the divider is
+    // now at col 20.
+    let _ = collect_bytes(&mut r, 2).await;
+
+    // SGR left PRESS at (col 20, row 2): the divider column.
+    send_input(&mut w, b"\x1b[<0;20;2M").await;
+    // SGR left DRAG to (col 25, row 2): moves the divider right.
+    send_input(&mut w, b"\x1b[<32;25;2M").await;
+
+    // Drain the frames produced by the divider drag. The `[copy]` status must
+    // NOT appear — the drag resized the pane, not entered copy mode.
+    let accum = collect_bytes(&mut r, 3).await;
+    let seen = String::from_utf8_lossy(&accum);
+    assert!(
+        !seen.contains("[copy]"),
+        "a divider drag must NOT enter copy mode; got {seen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 8: owner disconnect exits copy mode; remaining client can re-enter
 // ---------------------------------------------------------------------------
 //

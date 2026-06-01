@@ -474,12 +474,35 @@ yank it to the clipboard.
 The bottom row of the pane shows `[copy] <offset>/<scrollback>` while copy
 mode is active.
 
+### Drag to copy
+
+A left-click-drag inside a pane auto-enters copy mode and begins the
+selection — no `prefix [` needed (tmux-style). This is suppressed when the
+pane's foreground app is itself using the mouse (e.g. vim, htop), so those
+apps keep their mouse. A plain click (press + release without dragging) does
+not enter copy mode.
+
+Disable drag-to-enter entirely with:
+
+```toml
+mouse-copy = false
+```
+
+### What you copy is what you see
+
+Yank copies exactly the highlighted cells. If a selection extends past the
+visible viewport, only the visible (highlighted) portion is copied;
+soft-wrapped lines are rejoined within that visible range.
+
 ### Configuration
 
 ```toml
 # Number of scrollback rows retained per pane. Default: 2000.
 # Set to 0 to disable copy mode scrolling entirely.
 scrollback = 2000
+
+# Set to false to disable drag-to-enter copy mode. Default: true.
+mouse-copy = true
 
 [keys]
 # Key to enter copy mode after the prefix. Default: "[".
