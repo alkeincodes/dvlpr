@@ -113,9 +113,26 @@ atomically replaces the binary in place. Exit codes:
 | `1`  | Failure — network error, SHA-256 mismatch, no asset for this host |
 | `2`  | Install directory not writable — `rerun as: sudo dvlpr update` |
 
-**Running sessions keep the old binary in memory until you `dvlpr stop -t <name>`
-and reattach** (Linux/macOS hold the executable's inode open). To pick up
-the new binary, stop the session or close its last pane, then start fresh.
+After a successful update, `dvlpr update` offers to **restart your running
+sessions** so they pick up the new binary, restoring each session's full layout
+(windows, panes, working directories, and claude/codex conversations):
+
+| Flag | Behavior |
+|------|----------|
+| *(none)* | Prompt `Restart N running session(s) (…) to apply the update? [Y/n]` (default Yes; auto-No when non-interactive) |
+| `--restart` | Restart without prompting (also works non-interactively) |
+| `--no-restart` | Swap the binary only — leave running sessions on the old binary |
+
+Sessions attached in another terminal, and the session you're running `dvlpr
+update` from, are skipped (listed with a reason) so an active terminal is never
+yanked out from under you. Stop those manually (`pkill -f 'dvlpr server'`) and
+start them fresh to update them.
+
+**Caveats.** Restart-and-restore takes effect from the *next* update onward (the
+update that introduces it is driven by the prior binary). A session left running
+from an older dvlpr is skipped as incompatible. Only the layout + cwd + agent
+conversations are restored — other long-running processes (dev servers, editors)
+come back as a shell in their directory.
 
 ### Symlinks
 
