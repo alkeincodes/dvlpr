@@ -41,6 +41,22 @@ fn desired_mouse_capture(menu_open: bool, is_copy_fg: bool) -> bool {
     menu_open || is_copy_fg
 }
 
+/// Whether a left-button Press should arm a pending drag-to-enter anchor:
+/// drag-to-enter is enabled, copy mode is not already active, the hit is a pane
+/// (NEVER a divider/tab/sidebar/new-window/none), and that pane is not currently
+/// mouse-tracking (so we don't steal mouse from a mouse-aware TUI).
+fn drag_to_enter_should_arm(
+    mouse_copy: bool,
+    copy_mode_active: bool,
+    hit: &crate::layout::Hit,
+    pane_mouse_tracking: bool,
+) -> bool {
+    mouse_copy
+        && !copy_mode_active
+        && matches!(hit, crate::layout::Hit::Pane(_))
+        && !pane_mouse_tracking
+}
+
 /// Compute the `?1003h` / `?1003l` prefix bytes for a single per-writer
 /// edge transition. Extracted so the writer's body stays a thin
 /// orchestration shell and the edge logic is unit-testable in isolation.
@@ -176,6 +192,10 @@ struct ClientState {
     last_activity: u64,
     /// This client's last-known terminal size (cols, rows), clamped to >= 1 per axis.
     size: (u16, u16),
+    /// A left-press that may become a drag-to-enter: `(pane, col, row)` (1-based
+    /// wire coords) set on a qualifying Press, consumed on the first Drag (→ enter
+    /// copy mode) or cleared on Release (→ it was a click).
+    pending_copy_press: Option<(PaneId, u16, u16)>,
 }
 
 /// Classic ESCDELAY: how long a lone trailing ESC waits for a continuation byte
@@ -326,6 +346,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                                 escape_deadline: None,
                                 last_activity: 0,
                                 size: (cols, rows),
+                                pending_copy_press: None,
                             },
                         );
                         // The newcomer is the freshest activity: it becomes foreground.
@@ -360,7 +381,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         // reconcile (set/clear) based on the new session state.
                         commit_input(
                             &mut session, &mut clients, &mut foreground, &mut activity_seq,
-                            &ev_tx, &mut dirty, id, events, copy_mode_owner,
+                            &ev_tx, &mut dirty, id, events, &mut copy_mode_owner, keymap.mouse_copy,
                         );
                         // Reconcile copy_mode_owner after applying events:
                         // - If copy mode is now active and no owner is set, the client
@@ -457,7 +478,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     // on timeout promotes the sender to foreground before reaching the pane.
                     commit_input(
                         &mut session, &mut clients, &mut foreground, &mut activity_seq,
-                        &ev_tx, &mut dirty, id, events, copy_mode_owner,
+                        &ev_tx, &mut dirty, id, events, &mut copy_mode_owner, keymap.mouse_copy,
                     );
                     // Reconcile owner: the tick ESC flush may cause the owner to exit
                     // copy mode (ESC = exit key in copy mode). Clear unconditionally if
@@ -610,7 +631,8 @@ fn remove_client(
 /// any events (interaction), resizing the session when the foreground changes, then route
 /// the events into the session. Used by BOTH `ClientInput` and the tick-time ESC flush.
 ///
-/// `copy_mode_owner`: passed through to `apply_events` to gate mouse and CopyKey routing.
+/// `copy_mode_owner`: mutable reference so drag-to-enter can set the owner mid-pass.
+/// `mouse_copy`: from `keymap.mouse_copy`; gates the drag-to-enter feature.
 #[allow(clippy::too_many_arguments)]
 fn commit_input(
     session: &mut Session,
@@ -621,7 +643,8 @@ fn commit_input(
     dirty: &mut bool,
     id: ClientId,
     events: Vec<InputEvent>,
-    copy_mode_owner: Option<ClientId>,
+    copy_mode_owner: &mut Option<ClientId>,
+    mouse_copy: bool,
 ) {
     if !events.is_empty() && promote(clients, foreground, activity_seq, id) {
         if let Some(st) = clients.get(&id) {
@@ -629,7 +652,7 @@ fn commit_input(
         }
         *dirty = true;
     }
-    apply_events(session, clients, foreground, ev_tx, id, events, dirty, copy_mode_owner);
+    apply_events(session, clients, foreground, ev_tx, id, events, dirty, copy_mode_owner, mouse_copy);
 }
 
 /// Apply the parts of a `CommandEffect` that are identical for every caller:
@@ -749,10 +772,9 @@ fn apply_control_command(
 /// side effects (attach forwarders for new panes, async-close removed runtimes,
 /// detach the issuing client).
 ///
-/// `copy_mode_owner`: the current copy-mode owner (from the central loop state).
-/// Used to gate mouse routing: only the owner's mouse events go to
-/// `handle_copy_mode_mouse`; a non-owner's mouse falls through to normal
-/// `handle_mouse` regardless of global `session.copy_mode_active()`.
+/// `copy_mode_owner`: mutable reference to the central-loop owner. The drag-to-enter
+/// path sets it mid-pass so subsequent drags in the same batch route to the owner branch.
+/// `mouse_copy`: from `keymap.mouse_copy`; gates the drag-to-enter feature.
 #[allow(clippy::too_many_arguments)]
 fn apply_events(
     session: &mut Session,
@@ -762,7 +784,8 @@ fn apply_events(
     id: ClientId,
     events: Vec<InputEvent>,
     dirty: &mut bool,
-    copy_mode_owner: Option<ClientId>,
+    copy_mode_owner: &mut Option<ClientId>,
+    mouse_copy: bool,
 ) {
     for ev in events {
         if let Some(eff) = session.try_consume_help_event(&ev) {
@@ -843,24 +866,86 @@ fn apply_events(
         match ev {
             InputEvent::Pane(bytes) => session.input(&bytes),
             InputEvent::Mouse(m) => {
-                if session.copy_mode_active() && copy_mode_owner == Some(id) {
+                if session.copy_mode_active() && *copy_mode_owner == Some(id) {
                     // Only the copy-mode owner's mouse events drive copy mode.
                     let eff = session.handle_copy_mode_mouse(m);
                     if let Some(bytes) = eff.emit {
-                        // debug_assert: OSC 52 must only reach the owner.
-                        debug_assert_eq!(copy_mode_owner, Some(id), "OSC 52 must go to copy-mode owner only");
+                        debug_assert_eq!(*copy_mode_owner, Some(id), "OSC 52 must go to copy-mode owner only");
                         if let Some(st) = clients.get(&id) {
                             let _ = st.control.send(Control::Emit(bytes));
                         }
                     }
                     *dirty = true;
                 } else if session.copy_mode_active() {
-                    // Copy mode is active but this client is NOT the owner.
-                    // Drop the mouse event entirely: forwarding it to handle_mouse
-                    // would hit handle_mouse's belt-and-suspenders copy-mode guard
-                    // (added for non-server callers) and mutate the owner's
-                    // selection. Non-owner mouse is ignored while copy mode is active.
+                    // Copy mode active but this client is NOT the owner: drop.
                 } else {
+                    use crate::input::MouseKind;
+                    // Drag-to-enter (tmux-style). The Press records a pending
+                    // anchor; the first Drag auto-enters copy mode owned by this
+                    // client; a Release with no drag clears it (it was a click).
+                    match m.kind {
+                        MouseKind::Press if m.button == 0 => {
+                            let hit = session.hit(m.col, m.row);
+                            // Match on `&hit` so `hit` is NOT moved — it is matched
+                            // again below to extract the pane id.
+                            let tracking = matches!(
+                                &hit,
+                                crate::layout::Hit::Pane(p) if session.pane_mouse_tracking(*p)
+                            );
+                            let arm = drag_to_enter_should_arm(
+                                mouse_copy,
+                                session.copy_mode_active(),
+                                &hit,
+                                tracking,
+                            );
+                            if let Some(st) = clients.get_mut(&id) {
+                                st.pending_copy_press = if arm {
+                                    if let crate::layout::Hit::Pane(p) = hit {
+                                        Some((p, m.col, m.row))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                            }
+                            // Recording the anchor does NOT consume the Press:
+                            // fall through to normal handling (pane focus / drag).
+                        }
+                        MouseKind::Drag => {
+                            let pending =
+                                clients.get(&id).and_then(|st| st.pending_copy_press);
+                            if let Some((pane, ac, ar)) = pending {
+                                // Re-check the gate at drag time: if the app turned
+                                // ON mouse tracking between press and drag, abort.
+                                let still_ok = mouse_copy
+                                    && !session.copy_mode_active()
+                                    && !session.pane_mouse_tracking(pane);
+                                // Clear the anchor either way (single-shot).
+                                if let Some(st) = clients.get_mut(&id) {
+                                    st.pending_copy_press = None;
+                                }
+                                if still_ok {
+                                    session.begin_drag_select(pane, (ac, ar), (m.col, m.row));
+                                    // Set the owner WITHIN this pass so any following
+                                    // drags in the same batch route to the owner
+                                    // branch above instead of being dropped.
+                                    *copy_mode_owner = Some(id);
+                                    *dirty = true;
+                                    continue;
+                                }
+                            }
+                            // Not a drag-to-enter: normal handling (divider resize).
+                        }
+                        MouseKind::Release => {
+                            if let Some(st) = clients.get_mut(&id) {
+                                st.pending_copy_press = None;
+                            }
+                            // Fall through to normal Release handling (*drag = None).
+                        }
+                        _ => {}
+                    }
+                    // Normal (non-copy) mouse handling: focus, divider resize, menus.
                     let eff = if let Some(st) = clients.get_mut(&id) {
                         session.handle_mouse(m, &mut st.drag)
                     } else {
@@ -925,7 +1010,7 @@ fn apply_events(
                 // CopyKey events are only produced for the owner (the parser copy-bit
                 // is gated on `copy_mode_owner == Some(id)` in ClientInput and the
                 // tick ESC flush). So `id` here is always the owner.
-                debug_assert_eq!(copy_mode_owner, Some(id), "CopyKey routed to non-owner");
+                debug_assert_eq!(*copy_mode_owner, Some(id), "CopyKey routed to non-owner");
                 let eff = session.handle_copy_mode_key(k);
                 if let Some(bytes) = eff.emit {
                     // OSC 52 goes only to the issuing client, which is the owner.
@@ -1316,5 +1401,23 @@ mod tests {
     #[test]
     fn one_oh_three_edge_prefix_emits_empty_when_unchanged_true() {
         assert_eq!(one_oh_three_edge_prefix(true, true), b"");
+    }
+
+    #[test]
+    fn drag_to_enter_gate_records_only_for_pane_hit_non_tracking() {
+        use crate::layout::Hit;
+        // (mouse_copy, copy_active, hit, tracking) → should record anchor?
+        assert!(drag_to_enter_should_arm(true, false, &Hit::Pane(1), false));
+        // copy mode already active → no.
+        assert!(!drag_to_enter_should_arm(true, true, &Hit::Pane(1), false));
+        // mouse_copy off → no.
+        assert!(!drag_to_enter_should_arm(false, false, &Hit::Pane(1), false));
+        // pane is mouse-tracking → no.
+        assert!(!drag_to_enter_should_arm(true, false, &Hit::Pane(1), true));
+        // non-pane hits → no.
+        assert!(!drag_to_enter_should_arm(true, false, &Hit::Divider(vec![]), false));
+        assert!(!drag_to_enter_should_arm(true, false, &Hit::Tab(0), false));
+        assert!(!drag_to_enter_should_arm(true, false, &Hit::NewWindowButton, false));
+        assert!(!drag_to_enter_should_arm(true, false, &Hit::None, false));
     }
 }
