@@ -2683,7 +2683,15 @@ impl Session {
             }
 
             let new_label = match agent {
-                crate::detect::Agent::Claude => crate::agent_meta::claude::session_label(&cwd),
+                // Prefer the OSC 0/2 title the agent sets (what tmux reads and
+                // what a Claude `/rename` emits) — it is authoritative and
+                // per-pane. Fall back to scraping the session's JSONL only when
+                // no title is set. Codex has no JSONL to scrape.
+                crate::detect::Agent::Claude => pane
+                    .screen
+                    .title()
+                    .filter(|t| !t.trim().is_empty())
+                    .or_else(|| crate::agent_meta::claude::session_label(&cwd)),
                 crate::detect::Agent::Codex => pane.screen.title(),
             };
             if new_label != pane.session_label {
@@ -5600,6 +5608,34 @@ mod tests {
         let entries = session.agent_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn refresh_agent_meta_uses_osc_title_for_claude_label() {
+        let (mut session, pid, _rx) = build_session_with_one_pane().await;
+        // Classify the pane as Claude so refresh_agent_meta has work to do.
+        session.feed(pid, b"esc to interrupt\n");
+        let _ = session.refresh_agent_states(|_| Some("claude".to_string()));
+
+        // Claude sets its `/rename` title via an OSC 2 sequence — the same
+        // mechanism tmux reads. Feed one into the pane's screen.
+        session.feed(pid, b"\x1b]2;Session Resurrection\x07");
+
+        // Resolve the pane's cwd to a tempdir with no `~/.claude/projects`
+        // entry, so the JSONL scrape yields None — proving the label comes
+        // from the OSC title, not the transcript.
+        let tmp = tempfile::tempdir().unwrap();
+        let target_cwd = std::fs::canonicalize(tmp.path()).unwrap();
+        let changed = session.refresh_agent_meta(move |_pid| Some(target_cwd.clone()));
+        assert!(changed);
+
+        let entries = session.agent_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].session_label.as_deref(),
+            Some("Session Resurrection"),
+            "Claude sidebar label must come from the OSC title, not a uuid-tail fallback"
+        );
     }
 
     #[tokio::test]

@@ -106,7 +106,8 @@ fn scan_custom_title(text: &str) -> Option<String> {
             Err(_) => continue,
         };
         if v.get("type").and_then(|t| t.as_str()) == Some("custom-title") {
-            if let Some(title) = v.get("title").and_then(|t| t.as_str()) {
+            // Claude writes the `/rename` value under `customTitle`, not `title`.
+            if let Some(title) = v.get("customTitle").and_then(|t| t.as_str()) {
                 let trimmed = title.trim();
                 if !trimmed.is_empty() {
                     return Some(trimmed.to_string());
@@ -237,12 +238,36 @@ mod tests {
                 "abc12345.jsonl",
                 concat!(
                     "{\"type\":\"user\",\"message\":{\"content\":\"hello world\"}}\n",
-                    "{\"type\":\"custom-title\",\"title\":\"My Renamed Session\"}\n",
+                    "{\"type\":\"custom-title\",\"customTitle\":\"My Renamed Session\",\"sessionId\":\"abc12345\"}\n",
                 ),
             );
             assert_eq!(
                 session_label_with_home(project, home).as_deref(),
                 Some("My Renamed Session")
+            );
+        });
+    }
+
+    #[test]
+    fn session_label_ignores_legacy_title_key_and_uses_custom_title() {
+        // Regression guard: Claude emits the rename under `customTitle`. A bare
+        // `title` key is NOT a rename event, so it must not win; the real
+        // `customTitle` does.
+        with_home(|home| {
+            let project = Path::new("/tmp/project-field");
+            make_fixture(
+                home,
+                project,
+                "feedface.jsonl",
+                concat!(
+                    "{\"type\":\"custom-title\",\"title\":\"Wrong Key\",\"sessionId\":\"feedface\"}\n",
+                    "{\"type\":\"user\",\"message\":{\"content\":\"a typed prompt\"}}\n",
+                    "{\"type\":\"custom-title\",\"customTitle\":\"Right Key\",\"sessionId\":\"feedface\"}\n",
+                ),
+            );
+            assert_eq!(
+                session_label_with_home(project, home).as_deref(),
+                Some("Right Key")
             );
         });
     }
@@ -339,14 +364,14 @@ mod tests {
                 home,
                 project,
                 "11111111.jsonl",
-                "{\"type\":\"custom-title\",\"title\":\"OLD\"}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"OLD\",\"sessionId\":\"11111111\"}\n",
             );
             std::thread::sleep(Duration::from_millis(20));
             make_fixture(
                 home,
                 project,
                 "22222222.jsonl",
-                "{\"type\":\"custom-title\",\"title\":\"NEW\"}\n",
+                "{\"type\":\"custom-title\",\"customTitle\":\"NEW\",\"sessionId\":\"22222222\"}\n",
             );
             assert_eq!(
                 session_label_with_home(project, home).as_deref(),
