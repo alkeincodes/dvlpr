@@ -2535,48 +2535,36 @@ pub fn eraseDisplay(
         },
 
         .complete => {
-            // If we're on the primary screen and our last non-empty row is
-            // a prompt, then we do a scroll_complete instead. This is a
-            // heuristic to get the generally desirable behavior that ^L
-            // at a prompt scrolls the screen contents prior to clearing.
-            // Most shells send `ESC [ H ESC [ 2 J` so we can't just check
-            // our current cursor position. See #905
-            if (self.screens.active_key == .primary) at_prompt: {
-                // Go from the bottom of the active up and see if we're
-                // at a prompt.
-                const active_br = self.screens.active.pages.getBottomRight(
-                    .active,
-                ) orelse break :at_prompt;
-                var it = active_br.rowIterator(
-                    .left_up,
-                    self.screens.active.pages.getTopLeft(.active),
-                );
-                while (it.next()) |p| {
-                    const row = p.rowAndCell().row;
-                    switch (row.semantic_prompt) {
-                        // If we're at a prompt or input area, then we are at a prompt.
-                        .prompt,
-                        .prompt_continuation,
-                        => break,
-
-                        // If we have command output, then we're most certainly not
-                        // at a prompt.
-                        .none => break :at_prompt,
-                    }
-                } else break :at_prompt;
-
+            // DVLPR PATCH: on primary screen, ALWAYS push the active area
+            // into the scrollback before clearing — matching tmux's and
+            // iTerm2's default semantics. The upstream heuristic only
+            // preserves when a `semantic_prompt` marker (OSC 133) is set,
+            // which misses every app that doesn't use shell integration:
+            // Claude Code, Codex, most TUIs that paint to primary screen
+            // with `ESC [ 2 J` redraws. Without this, their scrollback
+            // appears frozen at whatever was there before the app started.
+            // `scrollClear` no-ops cleanly when the active area is already
+            // empty, so this is safe for normal shell `clear` too.
+            if (self.screens.active_key == .primary) {
                 self.screens.active.scrollClear() catch {
-                    // If we fail, we just fall back to doing a normal clear
-                    // so we don't worry about the error.
+                    // Fall through to plain clearRows on allocator failure
+                    // so we still erase the visible area.
+                    self.screens.active.clearRows(
+                        .{ .active = .{} },
+                        null,
+                        protected,
+                    );
                 };
+            } else {
+                // Alt screen: keep upstream behavior — plain clear, no
+                // scrollback preservation (alt buffer has max_scrollback=0
+                // by engine design at Terminal.zig:2994).
+                self.screens.active.clearRows(
+                    .{ .active = .{} },
+                    null,
+                    protected,
+                );
             }
-
-            // All active area
-            self.screens.active.clearRows(
-                .{ .active = .{} },
-                null,
-                protected,
-            );
 
             // Unsets pending wrap state
             self.screens.active.cursor.pending_wrap = false;
