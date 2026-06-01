@@ -41,8 +41,11 @@ async fn main() {
             );
             Ok(())
         }
-        Cmd::Update => {
+        Cmd::Update { restart } => {
             let outcome = dvlpr::update::run_swap();
+            if let Ok(dvlpr::update::UpdateOutcome::Applied { install_exe }) = &outcome {
+                dvlpr::update::restart_running_sessions(install_exe, restart).await;
+            }
             std::process::exit(dvlpr::update::error_to_exit(outcome));
         }
         Cmd::Control(args) => {
@@ -90,8 +93,9 @@ enum Cmd {
     Help,
     /// `dvlpr --version` / `-V` — prints `dvlpr <CARGO_PKG_VERSION> (<DVLPR_TARGET>)`.
     Version,
-    /// `dvlpr update` — fetch the latest GH release and replace this binary.
-    Update,
+    /// `dvlpr update [--restart|--no-restart]` — fetch the latest GH release,
+    /// replace this binary, then (by default) prompt to restart running sessions.
+    Update { restart: dvlpr::update::RestartPref },
     /// `dvlpr <window|pane|sidebar> …` or `dvlpr @name …` — a control command.
     /// The raw args (after the binary name) are parsed by `control::run`.
     Control(Vec<String>),
@@ -175,10 +179,30 @@ fn parse_args(args: &[String]) -> Cmd {
             },
             _ => Cmd::Usage("usage: dvlpr ssh <destination> [session]".into()),
         },
-        Some("update") => match args.len() {
-            1 => Cmd::Update,
-            _ => Cmd::Usage("usage: dvlpr update".into()),
-        },
+        Some("update") => {
+            use dvlpr::update::RestartPref;
+            let rest = &args[1..];
+            let force = rest.iter().any(|a| a == "--restart");
+            let skip = rest.iter().any(|a| a == "--no-restart");
+            let unknown = rest.iter().any(|a| a != "--restart" && a != "--no-restart");
+            if unknown {
+                Cmd::Usage("usage: dvlpr update [--restart|--no-restart]".into())
+            } else if force && skip {
+                Cmd::Usage("dvlpr update: --restart and --no-restart are mutually exclusive".into())
+            } else if force {
+                Cmd::Update {
+                    restart: RestartPref::Force,
+                }
+            } else if skip {
+                Cmd::Update {
+                    restart: RestartPref::Skip,
+                }
+            } else {
+                Cmd::Update {
+                    restart: RestartPref::Prompt,
+                }
+            }
+        }
         // `version` is not a subcommand — use `-V` or `--version`.
         Some("version") => {
             Cmd::Usage("use `dvlpr --version` or `dvlpr -V` (no subcommand alias)".into())
@@ -581,7 +605,13 @@ mod tests {
 
     #[test]
     fn parse_args_update_routes_to_update_cmd() {
-        assert_eq!(parse_args(&v(&["update"])), Cmd::Update);
+        use dvlpr::update::RestartPref;
+        assert_eq!(
+            parse_args(&v(&["update"])),
+            Cmd::Update {
+                restart: RestartPref::Prompt
+            }
+        );
         // Extra positional after `update` is a usage error.
         assert!(matches!(
             parse_args(&v(&["update", "extra"])),
@@ -589,6 +619,34 @@ mod tests {
         ));
         // `-h` after `update` still routes to Help (Help check runs first).
         assert_eq!(parse_args(&v(&["update", "-h"])), Cmd::Help);
+    }
+
+    #[test]
+    fn update_parses_restart_prefs() {
+        use dvlpr::update::RestartPref;
+        assert_eq!(
+            parse_args(&v(&["update"])),
+            Cmd::Update {
+                restart: RestartPref::Prompt
+            }
+        );
+        assert_eq!(
+            parse_args(&v(&["update", "--restart"])),
+            Cmd::Update {
+                restart: RestartPref::Force
+            }
+        );
+        assert_eq!(
+            parse_args(&v(&["update", "--no-restart"])),
+            Cmd::Update {
+                restart: RestartPref::Skip
+            }
+        );
+        assert!(matches!(
+            parse_args(&v(&["update", "--restart", "--no-restart"])),
+            Cmd::Usage(_)
+        ));
+        assert!(matches!(parse_args(&v(&["update", "wat"])), Cmd::Usage(_)));
     }
 
     #[test]
