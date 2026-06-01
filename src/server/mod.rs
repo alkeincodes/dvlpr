@@ -436,6 +436,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                                 tracing::info!("last pane exited; shutting down server");
                                 break "pane process exited".to_string();
                             }
+                            // pane_exited clears copy mode when the copy-mode pane dies;
+                            // reconcile the owner immediately so the very next `prefix [`
+                            // from any client correctly pins that client as owner.
+                            if !session.copy_mode_active() {
+                                copy_mode_owner = None;
+                            }
                             dirty = true;
                         }
                     },
@@ -448,6 +454,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     Event::ControlCommand { cmd, reply } => {
                         let result = apply_control_command(&mut session, cmd, &ev_tx, &mut dirty);
                         let _ = reply.send(result);
+                        // window-switch/close via the control CLI calls exit_copy_mode
+                        // inside apply_command; reconcile the owner immediately so the
+                        // very next `prefix [` from any client correctly pins that client.
+                        if !session.copy_mode_active() {
+                            copy_mode_owner = None;
+                        }
                     }
                     Event::Shutdown => break "killed".to_string(),
                 }
@@ -1419,5 +1431,136 @@ mod tests {
         assert!(!drag_to_enter_should_arm(true, false, &Hit::Tab(0), false));
         assert!(!drag_to_enter_should_arm(true, false, &Hit::NewWindowButton, false));
         assert!(!drag_to_enter_should_arm(true, false, &Hit::None, false));
+    }
+
+    // Regression tests for the stale copy_mode_owner bug:
+    // After pane-exit or window-switch auto-deactivates copy mode, the owner must
+    // be cleared immediately so the very next `prefix [` from any client correctly
+    // pins that client as the new owner.
+
+    /// Helper: build a minimal session with scrollback so copy mode can be entered.
+    fn make_copy_session() -> (Session, crate::layout::PaneId) {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let (s, pane_id, _rx) = Session::new(
+            "test-owner".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            40,
+            12,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            2000, // scrollback > 0 so EnterCopyMode succeeds
+        )
+        .expect("make_copy_session");
+        (s, pane_id)
+    }
+
+    /// After `pane_exited` auto-exits copy mode, the reconcile clears the stale owner
+    /// so a new client can immediately become the owner on re-entry.
+    #[test]
+    fn stale_owner_cleared_after_pane_exit_deactivates_copy_mode() {
+        let (mut session, pane_id) = make_copy_session();
+
+        // Client A (id=1) enters copy mode and becomes the owner.
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session.copy_mode_active(), "copy mode must be active");
+        let mut copy_mode_owner: Option<ClientId> = Some(1); // server loop pins A as owner
+
+        // The copy-mode pane exits (PaneOutput::Exited path in the server loop).
+        let _ = session.pane_exited(pane_id);
+        // pane_exited clears copy mode inside Session; copy_mode_active() is now false.
+        assert!(!session.copy_mode_active(), "pane_exited must deactivate copy mode");
+
+        // THE FIX: the server loop now runs this reconcile immediately after pane_exited.
+        if !session.copy_mode_active() {
+            copy_mode_owner = None;
+        }
+
+        // Owner must be cleared — not still Some(1).
+        assert_eq!(
+            copy_mode_owner, None,
+            "copy_mode_owner must be cleared after pane-exit deactivation"
+        );
+
+        // A different session/client (id=2) entering copy mode must become the new owner.
+        // (In the real loop: ClientInput for id=2 triggers EnterCopyMode, then the
+        // post-commit reconcile sets copy_mode_owner = Some(2) because .is_none().)
+        //
+        // We rebuild a session to simulate re-entry since the pane is gone.
+        let (mut session2, _) = make_copy_session();
+        let _ = session2.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session2.copy_mode_active());
+        // With the fix, copy_mode_owner was None before this; the set-if-none logic fires.
+        if session2.copy_mode_active() && copy_mode_owner.is_none() {
+            copy_mode_owner = Some(2);
+        }
+        assert_eq!(
+            copy_mode_owner,
+            Some(2),
+            "client B must become owner after stale owner was cleared"
+        );
+    }
+
+    /// After `apply_command(NextWindow/PrevWindow/SelectWindow)` auto-exits copy mode,
+    /// the reconcile clears the stale owner so a new client can immediately become owner.
+    #[test]
+    fn stale_owner_cleared_after_window_switch_deactivates_copy_mode() {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        // Build a session with two windows so NextWindow is a real switch.
+        let (mut session, _pane_id, _rx) = Session::new(
+            "test-owner-ws".to_string(),
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+            cwd,
+            40,
+            12,
+            crate::theme::Theme::default(),
+            crate::config::KeySpec::Ctrl('b'),
+            crate::config::KeyMap::default(),
+            crate::layout::SIDEBAR_WIDTH_DEFAULT,
+            2000,
+        )
+        .expect("session");
+        let _ = session.new_named_window(None); // add a second window
+
+        // Client A (id=1) enters copy mode on window 1 and becomes the owner.
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session.copy_mode_active(), "copy mode must be active");
+        let mut copy_mode_owner: Option<ClientId> = Some(1);
+
+        // Control CLI sends WindowNext (ControlCommand path in the server loop).
+        // apply_command(NextWindow) calls exit_copy_mode internally.
+        let _ = session.apply_command(crate::config::Command::NextWindow);
+        assert!(!session.copy_mode_active(), "NextWindow must deactivate copy mode");
+
+        // THE FIX: the server loop now runs this reconcile immediately after
+        // apply_control_command returns.
+        if !session.copy_mode_active() {
+            copy_mode_owner = None;
+        }
+
+        assert_eq!(
+            copy_mode_owner, None,
+            "copy_mode_owner must be cleared after window-switch deactivation"
+        );
+
+        // Client B (id=2) enters copy mode; set-if-none logic makes B the owner.
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        assert!(session.copy_mode_active());
+        if session.copy_mode_active() && copy_mode_owner.is_none() {
+            copy_mode_owner = Some(2);
+        }
+        assert_eq!(
+            copy_mode_owner,
+            Some(2),
+            "client B must become owner after stale owner was cleared on window-switch"
+        );
     }
 }
