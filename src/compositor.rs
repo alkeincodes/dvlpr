@@ -1404,7 +1404,11 @@ fn draw_copy_mode(buf: &mut [StyledCell], cols: u16, cm: &CopyModeOverlay<'_>) {
         let ec = ec.min(pr_cols.saturating_sub(1));
         for row in sr..=er {
             let x_start = if row == sr { sc } else { 0 };
-            let x_end = if row == er { ec } else { pr_cols.saturating_sub(1) };
+            let x_end = if row == er {
+                ec
+            } else {
+                pr_cols.saturating_sub(1)
+            };
             for col in x_start..=x_end {
                 let gx = pr.x + col;
                 let gy = pr.y + row;
@@ -1431,7 +1435,10 @@ fn draw_copy_mode(buf: &mut [StyledCell], cols: u16, cm: &CopyModeOverlay<'_>) {
     for ch in cm.status.chars().take(max_chars) {
         let idx = status_y as usize * cols as usize + col as usize;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch, style: status_style };
+            buf[idx] = StyledCell {
+                ch,
+                style: status_style,
+            };
         }
         col += 1;
         if col >= pr.x + pr.w {
@@ -1443,7 +1450,10 @@ fn draw_copy_mode(buf: &mut [StyledCell], cols: u16, cm: &CopyModeOverlay<'_>) {
     while col < pr.x + pr.w {
         let idx = status_y as usize * cols as usize + col as usize;
         if idx < buf.len() {
-            buf[idx] = StyledCell { ch: ' ', style: status_style };
+            buf[idx] = StyledCell {
+                ch: ' ',
+                style: status_style,
+            };
         }
         col += 1;
     }
@@ -3336,7 +3346,12 @@ mod tests {
     ) -> Grid {
         let cols = overlay.pane_rect.x + overlay.pane_rect.w;
         let rows = overlay.pane_rect.y + overlay.pane_rect.h + 1; // +1 for tab bar
-        let vp = Rect { x: 0, y: 0, w: cols.max(5), h: rows.max(3) };
+        let vp = Rect {
+            x: 0,
+            y: 0,
+            w: cols.max(5),
+            h: rows.max(3),
+        };
         let root = crate::layout::Node::Leaf(panes_arg.first().map(|(id, _)| *id).unwrap_or(1));
         Compositor::new().compose(
             vp,
@@ -3366,7 +3381,12 @@ mod tests {
         let pane = stub("abcde");
         let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
         let overlay = CopyModeOverlay {
-            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            pane_rect: Rect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 2,
+            },
             cursor: (0, 0),
             selection: Some(((0, 0), (2, 0))),
             status: "[copy] 0/100",
@@ -3388,7 +3408,12 @@ mod tests {
         let pane = StubScreen::new(20, 2, &["abcdefghijklmnopqrst", ""], (0, 0));
         let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane as &dyn PaneCells)];
         let overlay = CopyModeOverlay {
-            pane_rect: Rect { x: 0, y: 0, w: 20, h: 2 },
+            pane_rect: Rect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 2,
+            },
             cursor: (0, 0),
             selection: None,
             status: "[copy] 5/2000",
@@ -3418,7 +3443,12 @@ mod tests {
         let pane = stub("abcde");
         let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
         let overlay = CopyModeOverlay {
-            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            pane_rect: Rect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 2,
+            },
             cursor: (2, 0),
             selection: None,
             status: "[copy] 0/0",
@@ -3439,7 +3469,12 @@ mod tests {
         let pane = stub("abcde");
         let panes: Vec<(u64, &dyn PaneCells)> = vec![(1u64, &pane)];
         let overlay = CopyModeOverlay {
-            pane_rect: Rect { x: 0, y: 0, w: 5, h: 2 },
+            pane_rect: Rect {
+                x: 0,
+                y: 0,
+                w: 5,
+                h: 2,
+            },
             cursor: (3, 1),
             selection: None,
             status: "[copy] 0/0",
@@ -3454,7 +3489,12 @@ mod tests {
         // A 1-col pane should not panic even with a long status string.
         let mut buf = vec![StyledCell::default(); 3];
         let overlay = CopyModeOverlay {
-            pane_rect: Rect { x: 0, y: 0, w: 1, h: 3 },
+            pane_rect: Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 3,
+            },
             cursor: (0, 0),
             selection: None,
             status: "[copy] 1234567890/9999999",

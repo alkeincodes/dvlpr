@@ -91,9 +91,9 @@ pub fn resolve_copy_key(k: &CopyKey) -> CopyAction {
         K::Char(b'b') => CopyAction::Move(Motion::WordBack),
         K::Char(b'g') => CopyAction::Move(Motion::Top),
         K::Char(b'G') => CopyAction::Move(Motion::Bottom),
-        K::Ctrl(0x15) => CopyAction::Move(Motion::HalfPageUp),   // C-u
+        K::Ctrl(0x15) => CopyAction::Move(Motion::HalfPageUp), // C-u
         K::Ctrl(0x04) => CopyAction::Move(Motion::HalfPageDown), // C-d
-        K::Ctrl(0x02) | K::PageUp => CopyAction::Move(Motion::PageUp),   // C-b / PageUp
+        K::Ctrl(0x02) | K::PageUp => CopyAction::Move(Motion::PageUp), // C-b / PageUp
         K::Ctrl(0x06) | K::PageDown => CopyAction::Move(Motion::PageDown), // C-f / PageDown
         K::Home => CopyAction::Move(Motion::LineStart),
         K::End => CopyAction::Move(Motion::LineEnd),
@@ -130,7 +130,10 @@ impl CopyModeState {
     pub fn toggle_select(&mut self, here: AbsPoint) {
         self.selection = match self.selection {
             Some(_) => None,
-            None => Some(Selection { anchor: here, head: here }),
+            None => Some(Selection {
+                anchor: here,
+                head: here,
+            }),
         };
     }
 
@@ -143,7 +146,10 @@ impl CopyModeState {
 
     /// Begin a fresh mouse-drag selection anchored at `here`.
     pub fn begin_drag(&mut self, here: AbsPoint) {
-        self.selection = Some(Selection { anchor: here, head: here });
+        self.selection = Some(Selection {
+            anchor: here,
+            head: here,
+        });
         self.dragging = true;
     }
 
@@ -199,7 +205,10 @@ pub fn unproject(
 ) -> AbsPoint {
     let vp = viewport_rows as usize;
     let top = total_rows.saturating_sub(vp).saturating_sub(scroll_offset);
-    AbsPoint { x: col, y: top + row as usize }
+    AbsPoint {
+        x: col,
+        y: top + row as usize,
+    }
 }
 
 /// Clip a selection to the visible viewport and project it to viewport-relative
@@ -240,14 +249,35 @@ mod tests {
 
     #[test]
     fn vi_keys_resolve_to_expected_actions() {
-        assert_eq!(resolve_copy_key(&CopyKey::Char(b'j')), CopyAction::Move(Motion::Down));
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Char(b'j')),
+            CopyAction::Move(Motion::Down)
+        );
         assert_eq!(resolve_copy_key(&CopyKey::Up), CopyAction::Move(Motion::Up));
-        assert_eq!(resolve_copy_key(&CopyKey::Char(b'$')), CopyAction::Move(Motion::LineEnd));
-        assert_eq!(resolve_copy_key(&CopyKey::Char(b'G')), CopyAction::Move(Motion::Bottom));
-        assert_eq!(resolve_copy_key(&CopyKey::Ctrl(0x02)), CopyAction::Move(Motion::PageUp)); // C-b
-        assert_eq!(resolve_copy_key(&CopyKey::Ctrl(0x15)), CopyAction::Move(Motion::HalfPageUp)); // C-u
-        assert_eq!(resolve_copy_key(&CopyKey::PageDown), CopyAction::Move(Motion::PageDown));
-        assert_eq!(resolve_copy_key(&CopyKey::Char(b'v')), CopyAction::ToggleSelect);
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Char(b'$')),
+            CopyAction::Move(Motion::LineEnd)
+        );
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Char(b'G')),
+            CopyAction::Move(Motion::Bottom)
+        );
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Ctrl(0x02)),
+            CopyAction::Move(Motion::PageUp)
+        ); // C-b
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Ctrl(0x15)),
+            CopyAction::Move(Motion::HalfPageUp)
+        ); // C-u
+        assert_eq!(
+            resolve_copy_key(&CopyKey::PageDown),
+            CopyAction::Move(Motion::PageDown)
+        );
+        assert_eq!(
+            resolve_copy_key(&CopyKey::Char(b'v')),
+            CopyAction::ToggleSelect
+        );
         assert_eq!(resolve_copy_key(&CopyKey::Char(b'y')), CopyAction::Yank);
         assert_eq!(resolve_copy_key(&CopyKey::Char(b'\r')), CopyAction::Yank);
         assert_eq!(resolve_copy_key(&CopyKey::Char(b'q')), CopyAction::Exit);
@@ -260,14 +290,23 @@ mod tests {
         let mut s = CopyModeState::enter(1, (0, 0));
         assert!(s.selection.is_none());
         s.toggle_select(AbsPoint { x: 2, y: 5 });
-        assert_eq!(s.selection, Some(Selection { anchor: AbsPoint { x: 2, y: 5 }, head: AbsPoint { x: 2, y: 5 } }));
+        assert_eq!(
+            s.selection,
+            Some(Selection {
+                anchor: AbsPoint { x: 2, y: 5 },
+                head: AbsPoint { x: 2, y: 5 }
+            })
+        );
         s.toggle_select(AbsPoint { x: 9, y: 9 });
         assert!(s.selection.is_none());
     }
 
     #[test]
     fn normalized_orders_endpoints() {
-        let sel = Selection { anchor: AbsPoint { x: 4, y: 7 }, head: AbsPoint { x: 1, y: 3 } };
+        let sel = Selection {
+            anchor: AbsPoint { x: 4, y: 7 },
+            head: AbsPoint { x: 1, y: 3 },
+        };
         let (a, b) = sel.normalized();
         assert_eq!(a, AbsPoint { x: 1, y: 3 });
         assert_eq!(b, AbsPoint { x: 4, y: 7 });
@@ -308,7 +347,10 @@ mod tests {
         };
         // start clamps to top-left (0,0); end clamps to last visible cell
         // (viewport_cols-1, viewport_rows-1) = (19, 9).
-        assert_eq!(clip_selection(&sel, 0, 10, 20, 100), Some(((0, 0), (19, 9))));
+        assert_eq!(
+            clip_selection(&sel, 0, 10, 20, 100),
+            Some(((0, 0), (19, 9)))
+        );
     }
 
     #[test]

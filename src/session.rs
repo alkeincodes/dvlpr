@@ -1728,10 +1728,7 @@ impl Session {
                 // own (no `y`, and no reliance on the host's Cmd+C, which can't see
                 // dvlpr's selection). A bare click (head == anchor, no drag motion)
                 // just ends the drag and stays in copy mode.
-                let real_drag = cm
-                    .selection
-                    .as_ref()
-                    .is_some_and(|s| s.head != s.anchor);
+                let real_drag = cm.selection.as_ref().is_some_and(|s| s.head != s.anchor);
                 if real_drag {
                     let emit = clipped_selection_osc52(&cm, &pane.screen);
                     pane.screen.scroll_viewport_bottom();

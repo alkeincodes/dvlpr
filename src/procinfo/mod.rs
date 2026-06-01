@@ -733,7 +733,9 @@ mod tests {
                 > birth("11111111-1111-1111-1111-111111111111")
         );
         // Unknown cwd → no project dir → empty.
-        assert!(agent_transcripts_in(home.path(), "/nope", crate::detect::Agent::Claude).is_empty());
+        assert!(
+            agent_transcripts_in(home.path(), "/nope", crate::detect::Agent::Claude).is_empty()
+        );
     }
 
     #[test]
