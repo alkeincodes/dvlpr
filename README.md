@@ -469,7 +469,7 @@ yank it to the clipboard.
 |-----|--------|
 | `v` | Toggle character-wise selection (anchors at the current cursor) |
 | `y` or `Enter` | Yank the selection to the clipboard via OSC 52; exits copy mode |
-| Mouse drag | Draw a selection; release keeps it live (yank with `y`) |
+| Mouse drag | Draw a selection; releasing the button copies it and exits copy mode |
 
 The bottom row of the pane shows `[copy] <offset>/<scrollback>` while copy
 mode is active.
@@ -477,10 +477,18 @@ mode is active.
 ### Drag to copy
 
 A left-click-drag inside a pane auto-enters copy mode and begins the
-selection — no `prefix [` needed (tmux-style). This is suppressed when the
-pane's foreground app is itself using the mouse (e.g. vim, htop), so those
-apps keep their mouse. A plain click (press + release without dragging) does
-not enter copy mode.
+selection — no `prefix [` needed (tmux-style). **Releasing the button copies
+the highlighted text (OSC 52) and exits copy mode**, so a single drag-and-release
+gesture selects and copies with no `y` keypress. (Cmd+C can't be used here: it's
+your host terminal's copy of its *own* native selection, but dvlpr owns the mouse
+drag, so the host has no selection to copy — the highlight lives inside dvlpr.)
+Drag-to-enter is suppressed when the pane's foreground app is itself using the
+mouse (e.g. vim, htop), so those apps keep their mouse. A plain click (press +
+release without dragging) does not enter copy mode or copy anything.
+
+The copy lands in your system clipboard only if your terminal honors OSC 52
+clipboard writes (see *OSC 52 clipboard support* below) — that's the same
+requirement as the `y` yank.
 
 Disable drag-to-enter entirely with:
 

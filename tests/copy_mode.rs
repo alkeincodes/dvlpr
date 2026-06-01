@@ -692,6 +692,39 @@ async fn left_drag_auto_enters_copy_mode_and_yanks() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: mouse-up after a drag copies on its own (tmux-style) — no `y` keypress
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn left_drag_release_copies_without_y_keypress() {
+    let sock = temp_socket("drag-release-copy");
+    spawn_daemon(sock.clone());
+    wait_for_socket(&sock).await;
+
+    let (mut r, mut w) = handshake(&sock, 40, 12).await;
+    assert!(
+        until_frame(&mut r, 10, |f| f.contains("line50")).await,
+        "shell must finish output before we drag"
+    );
+    let _ = collect_bytes(&mut r, 1).await;
+
+    // Press → drag (auto-enters copy mode + selects) → RELEASE (mouse-up).
+    send_input(&mut w, b"\x1b[<0;3;2M").await; // press   (button 0, M)
+    send_input(&mut w, b"\x1b[<32;12;2M").await; // drag  (button 0 + motion bit 32, M)
+    send_input(&mut w, b"\x1b[<0;12;2m").await; // release (button 0, lowercase m)
+
+    // The mouse-up ALONE must emit OSC 52 — no `y` was sent. This is the reported
+    // gesture: drag highlights, mouse-up copies (and exits copy mode; exit is pinned
+    // by the session unit tests `copy_mode_mouse_release_after_drag_yanks_and_exits`).
+    let osc52: &[u8] = &[0x1b, b']', b'5', b'2', b';', b'c', b';'];
+    let (found, _accum) = collect_bytes_until(&mut r, 5, osc52).await;
+    assert!(
+        found,
+        "mouse-up after a drag must emit OSC 52 with no `y` keypress"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test: a left click (Press + Release, no Drag) does NOT enter copy mode
 // ---------------------------------------------------------------------------
 

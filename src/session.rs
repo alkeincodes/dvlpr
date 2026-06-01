@@ -1500,31 +1500,10 @@ impl Session {
                 return CopyEffect::default();
             }
             CopyAction::Yank => {
-                // Copy exactly the highlighted cells: clip the selection to the
-                // visible viewport (the same helper compose() paints from), map
-                // the clipped viewport endpoints back to SCREEN coords, and run
-                // selection_text on those. A selection scrolled entirely off-screen
-                // clips to None → no emit (consistent with "copy what you see").
-                let emit = cm.selection.and_then(|sel| {
-                    let (clip_start, clip_end) =
-                        crate::copymode::clip_selection(&sel, cm.scroll_offset, rows, cols, total)?;
-                    let a = crate::copymode::unproject(
-                        clip_start.0,
-                        clip_start.1,
-                        cm.scroll_offset,
-                        rows,
-                        total,
-                    );
-                    let b = crate::copymode::unproject(
-                        clip_end.0,
-                        clip_end.1,
-                        cm.scroll_offset,
-                        rows,
-                        total,
-                    );
-                    let text = pane.screen.selection_text(a.x, a.y, b.x, b.y);
-                    Some(osc52(&text))
-                });
+                // Copy exactly the highlighted cells via the shared clip+extract
+                // helper (the same path the mouse-release auto-yank uses, so the two
+                // yank paths cannot diverge). A fully off-screen selection → no emit.
+                let emit = clipped_selection_osc52(&cm, &pane.screen);
                 pane.screen.scroll_viewport_bottom();
                 // exited
                 return CopyEffect { emit };
@@ -1743,6 +1722,22 @@ impl Session {
                 cm.set_head(here);
             }
             MouseKind::Release => {
+                // tmux-style mouse-up: if this release ends a real drag selection
+                // (head moved away from the anchor), copy the highlighted cells via
+                // OSC 52 and exit copy mode — so a drag→release gesture copies on its
+                // own (no `y`, and no reliance on the host's Cmd+C, which can't see
+                // dvlpr's selection). A bare click (head == anchor, no drag motion)
+                // just ends the drag and stays in copy mode.
+                let real_drag = cm
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| s.head != s.anchor);
+                if real_drag {
+                    let emit = clipped_selection_osc52(&cm, &pane.screen);
+                    pane.screen.scroll_viewport_bottom();
+                    // cm dropped (not put back) → copy mode exits.
+                    return CopyEffect { emit };
+                }
                 cm.dragging = false;
             }
             MouseKind::ScrollUp => {
@@ -2917,6 +2912,28 @@ fn apply_motion(
     }
 }
 
+/// OSC 52 clipboard bytes for the currently-selected, viewport-clipped cells of
+/// `cm` on `screen` — `None` if there is no selection or it is entirely off-screen.
+///
+/// Shared by the keyboard `y` yank and the mouse-release auto-yank so the two copy
+/// paths cannot diverge: both clip the selection to the visible viewport, map the
+/// clipped endpoints back to SCREEN coords, and extract via the formatter (copy ==
+/// exactly the highlighted cells, WYSIWYG).
+fn clipped_selection_osc52(
+    cm: &crate::copymode::CopyModeState,
+    screen: &GhosttyScreen,
+) -> Option<Vec<u8>> {
+    let rows = screen.rows();
+    let cols = screen.cols();
+    let total = screen.total_rows();
+    let sel = cm.selection.as_ref()?;
+    let (clip_start, clip_end) =
+        crate::copymode::clip_selection(sel, cm.scroll_offset, rows, cols, total)?;
+    let a = crate::copymode::unproject(clip_start.0, clip_start.1, cm.scroll_offset, rows, total);
+    let b = crate::copymode::unproject(clip_end.0, clip_end.1, cm.scroll_offset, rows, total);
+    Some(osc52(&screen.selection_text(a.x, a.y, b.x, b.y)))
+}
+
 /// Build an OSC 52 clipboard-write sequence for `text`: ESC ] 52 ; c ; <b64> ESC \.
 fn osc52(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() * 2 + 16);
@@ -3299,10 +3316,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_mode_mouse_release_ends_drag_keeps_selection() {
+    async fn copy_mode_mouse_release_after_drag_yanks_and_exits() {
+        // tmux-style: a mouse drag selects, and the mouse-up copies the highlighted
+        // text (OSC 52) and exits copy mode — no `y` / Cmd+C needed.
         let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
-        // Press + drag.
+        // Press + drag (head != anchor → a real drag selection).
         let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
             button: 0,
             col: 2,
@@ -3315,25 +3334,50 @@ mod tests {
             row: 2,
             kind: crate::input::MouseKind::Drag,
         });
-        // Release.
+        // Capture the highlighted (clipped) text while copy mode is still active.
+        let highlighted = session
+            .copy_mode_highlighted_text_for_test()
+            .expect("a drag selection should be present");
+        // Release after a drag must yank exactly the highlighted cells AND exit.
         let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
             button: 0,
             col: 6,
             row: 2,
             kind: crate::input::MouseKind::Release,
         });
-        assert!(eff.emit.is_none(), "release must not yank in v1");
-        assert!(
-            session.copy_mode_has_selection_for_test(),
-            "selection must stay live after release"
+        assert_eq!(
+            eff.emit,
+            Some(osc52(&highlighted)),
+            "mouse-up after a drag must yank exactly the highlighted cells via OSC 52"
         );
         assert!(
-            !session.copy_mode.as_ref().unwrap().dragging,
-            "dragging must be false after release"
+            !session.copy_mode_active(),
+            "mouse-up after a drag must exit copy mode (tmux-style)"
         );
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_click_without_drag_does_not_yank_or_exit() {
+        // A bare click (Press then Release on the same cell, no Drag) must NOT yank
+        // and must NOT exit copy mode — only a real drag triggers the auto-copy.
+        let (mut session, _pane, _rx) = test_session_feeding(20, 5, 2000, b"hello world").await;
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        let _ = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 3,
+            row: 2,
+            kind: crate::input::MouseKind::Press,
+        });
+        let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
+            button: 0,
+            col: 3,
+            row: 2,
+            kind: crate::input::MouseKind::Release,
+        });
+        assert!(eff.emit.is_none(), "a click (no drag) must not yank");
         assert!(
             session.copy_mode_active(),
-            "copy mode must stay active after release"
+            "a click (no drag) must not exit copy mode"
         );
     }
 
@@ -3454,16 +3498,22 @@ mod tests {
             row: 2,
             kind: crate::input::MouseKind::Drag,
         });
-        // Release keeps selection live, no yank.
+        // Release after a real drag (head moved from anchor) copies the selection
+        // (OSC 52) and exits copy mode — tmux-style mouse-up.
         let eff = session.handle_copy_mode_mouse(crate::input::MouseEvent {
             button: 0,
             col: 6,
             row: 2,
             kind: crate::input::MouseKind::Release,
         });
-        assert!(eff.emit.is_none(), "release must not yank in v1");
-        assert!(session.copy_mode_has_selection_for_test());
-        assert!(session.copy_mode_active());
+        assert!(
+            eff.emit.is_some(),
+            "release after a drag must yank the selection via OSC 52"
+        );
+        assert!(
+            !session.copy_mode_active(),
+            "release after a drag must exit copy mode"
+        );
     }
 
     // --- Issue 1: WYSIWYG yank (copy == highlight) ---
