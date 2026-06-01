@@ -487,7 +487,9 @@ place — no `prefix [` and no foreground promotion, so you can skim a backgroun
 pane's history while another pane stays focused. The view holds its position
 while new output keeps streaming in; scroll back down to the bottom to return
 to live. In copy mode the wheel moves the copy offset instead, and entering
-copy mode adopts whatever offset you had wheeled to.
+copy mode adopts whatever offset you had wheeled to. When the foreground app
+has mouse tracking enabled (e.g. a full-screen TUI), the wheel is forwarded to
+the app as SGR mouse events rather than scrolling scrollback.
 
 ### Selecting and yanking
 
