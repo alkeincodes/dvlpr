@@ -1604,6 +1604,13 @@ impl Session {
         a.y < top || b.y > bottom
     }
 
+    #[cfg(test)]
+    pub fn pane_viewport_offset_for_test(&self, pane: crate::layout::PaneId) -> usize {
+        self.panes
+            .get(&pane)
+            .map(|p| p.screen.viewport_offset())
+            .unwrap_or(0)
+
     /// Handle a mouse event while copy mode is active.
     ///
     /// Translates 1-based wire `(col, row)` to 0-based viewport-relative coords
@@ -2025,6 +2032,34 @@ impl Session {
             }
             MouseKind::Release => *drag = None,
             MouseKind::ScrollUp | MouseKind::ScrollDown => {}
+        }
+        CommandEffect::default()
+    }
+
+    /// Rows scrolled per mouse-wheel notch.
+    const WHEEL_STEP: isize = 3;
+
+    /// Scroll the pane under the cursor in response to a mouse-wheel event.
+    /// Modeless: drives the engine viewport directly (the engine clamps at both
+    /// ends and re-attaches to live output when scrolled back to the bottom).
+    /// No-op over non-pane regions or while an overlay is open. Never changes
+    /// focus. The compositor already renders the VIEWPORT tag, so the scrolled
+    /// view appears with no extra render work.
+    pub fn wheel(&mut self, ev: crate::input::MouseEvent) -> CommandEffect {
+        use crate::input::MouseKind;
+        // Overlays own the screen; never scroll a pane behind one.
+        if self.menu.is_some() || self.help.is_some() || self.dialog.is_some() {
+            return CommandEffect::default();
+        }
+        let layout::Hit::Pane(id) = self.hit(ev.col, ev.row) else {
+            return CommandEffect::default();
+        };
+        if let Some(pane) = self.panes.get_mut(&id) {
+            match ev.kind {
+                MouseKind::ScrollUp => pane.screen.scroll_viewport_delta(-Self::WHEEL_STEP),
+                MouseKind::ScrollDown => pane.screen.scroll_viewport_delta(Self::WHEEL_STEP),
+                _ => {}
+            }
         }
         CommandEffect::default()
     }
@@ -6918,6 +6953,70 @@ mod tests {
         assert!(
             row1_has_inverse,
             "row 1 (at selection start) must be inverse"
+        );
+    }
+
+    // --- Task 3: Session::wheel ---
+
+    #[tokio::test]
+    async fn wheel_scrolls_pane_and_returns_to_live() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let at = |kind| MouseEvent { button: 0, col: 5, row: 5, kind };
+        session.wheel(at(MouseKind::ScrollUp));
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 3);
+        session.wheel(at(MouseKind::ScrollUp));
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 6);
+        for _ in 0..3 {
+            session.wheel(at(MouseKind::ScrollDown));
+        }
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 0);
+    }
+
+    #[tokio::test]
+    async fn wheel_is_noop_over_non_pane_and_with_overlay() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        // Over the tab/status row (bottom bar) — no pane hit.
+        session.wheel(MouseEvent { button: 0, col: 5, row: 12, kind: MouseKind::ScrollUp });
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 0, "non-pane wheel is a no-op");
+        // With an overlay open, wheel is a no-op even over the pane.
+        session.set_help_for_test(Some(crate::help::HelpState::default()));
+        session.wheel(MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp });
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 0, "overlay blocks wheel");
+    }
+
+    #[tokio::test]
+    async fn wheel_scroll_holds_while_output_streams() {
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let up = MouseEvent { button: 0, col: 5, row: 5, kind: MouseKind::ScrollUp };
+        session.wheel(up);
+        session.wheel(up); // up 6 rows from the live bottom
+        assert_eq!(session.pane_viewport_offset_for_test(pane), 6);
+        // Stream 10 MORE lines while scrolled up.
+        let mut more = Vec::new();
+        for i in 51..=60 {
+            more.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        session.feed(pane, &more);
+        let off = session.pane_viewport_offset_for_test(pane);
+        assert!(
+            off > 6,
+            "pinned viewport must hold and the gap grow as output streams (got {off}, \
+             0 would mean it snapped to live)"
         );
     }
 
