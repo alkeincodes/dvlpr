@@ -1705,6 +1705,7 @@ impl Session {
             MouseKind::Release => {
                 cm.dragging = false;
             }
+            MouseKind::ScrollUp | MouseKind::ScrollDown => {}
         }
 
         cm.clamp_to_screen(total, cols);
@@ -2023,6 +2024,7 @@ impl Session {
                 }
             }
             MouseKind::Release => *drag = None,
+            MouseKind::ScrollUp | MouseKind::ScrollDown => {}
         }
         CommandEffect::default()
     }

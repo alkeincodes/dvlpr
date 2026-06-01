@@ -33,6 +33,8 @@ pub enum MouseKind {
     Press,
     Drag,
     Release,
+    ScrollUp,
+    ScrollDown,
 }
 
 /// A decoded SGR mouse event. `col`/`row` are 1-based (the wire encoding), matching
@@ -410,10 +412,16 @@ fn parse_sgr(buf: &[u8]) -> Option<MouseEvent> {
     if it.next().is_some() {
         return None;
     }
-    // Ignore wheel/scroll events (Pb bit 6): out of scope this phase. Decoding them
-    // as button-0/1 presses would inject spurious clicks into focus/resize handling.
+    // Wheel/scroll events: bit 64 set. The low bit selects direction (64 = up,
+    // 65 = down). Emit a position-carrying event (no button press) so the session
+    // can scroll the pane under the pointer. Modifier bits are ignored in v1.
     if b & 64 != 0 {
-        return None;
+        let kind = if b & 1 == 0 {
+            MouseKind::ScrollUp
+        } else {
+            MouseKind::ScrollDown
+        };
+        return Some(MouseEvent { button: 0, col: x, row: y, kind });
     }
     let kind = if b & 32 != 0 {
         MouseKind::Drag
@@ -705,9 +713,31 @@ mod tests {
     }
 
     #[test]
-    fn scroll_wheel_is_ignored() {
-        // ESC [ < 64 ; 5 ; 7 M (scroll up) produces no event this phase.
-        assert_eq!(parse_all(b"\x1b[<64;5;7M"), vec![]);
+    fn scroll_wheel_decodes() {
+        let cfg = Config::default();
+        let mut p = InputParser::new();
+        // Wheel up: ESC [ < 64 ; 10 ; 5 M
+        let evs = p.feed(&cfg, b"\x1b[<64;10;5M", false);
+        assert_eq!(
+            evs,
+            vec![InputEvent::Mouse(MouseEvent {
+                button: 0,
+                col: 10,
+                row: 5,
+                kind: MouseKind::ScrollUp
+            })]
+        );
+        // Wheel down: ESC [ < 65 ; 10 ; 5 M
+        let evs = p.feed(&cfg, b"\x1b[<65;10;5M", false);
+        assert_eq!(
+            evs,
+            vec![InputEvent::Mouse(MouseEvent {
+                button: 0,
+                col: 10,
+                row: 5,
+                kind: MouseKind::ScrollDown
+            })]
+        );
     }
 
     #[test]
