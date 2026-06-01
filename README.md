@@ -166,6 +166,31 @@ run `dvlpr`, as long as the target session's daemon is alive.
 
 > **Note:** Closing the last pane or the last window is refused (it would end the session) — use `dvlpr kill -t <name>` to stop a session.
 
+**Examples**
+
+```sh
+# From inside a pane — no flag needed, acts on the session you're in ($DVLPR):
+dvlpr pane split right
+dvlpr window new --name build
+dvlpr sidebar toggle
+
+# From any shell — target a session by name:
+dvlpr @work window select 2          # @name prefix
+dvlpr pane zoom --session api        # --session flag
+dvlpr @work window rename deploy
+
+# Scripting: spin up a layout, then drive it
+dvlpr server-name pane split down
+dvlpr server-name pane split right
+dvlpr server-name window new --name logs
+```
+
+**Agent scripting** — because `$DVLPR` is set in every pane, an agent running
+inside a dvlpr session (Claude, Codex, …) can reshape its own workspace with
+zero configuration: `dvlpr window new --name tests` or `dvlpr pane split down`
+just work, targeting the agent's session automatically. The non-zero exit codes
+(below) make these safe to branch on in a script.
+
 **Session targeting** — a leading `@name` or a trailing `--session NAME` selects
 the target session. Without either, dvlpr uses `$DVLPR` (the session you're
 currently inside), falling back to `default`.
