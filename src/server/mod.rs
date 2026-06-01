@@ -1286,7 +1286,7 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     let _ = write_msg(&mut write_half, &info).await;
                 }
             }
-            Intent::Kill => {
+            Intent::Kill { keep_snapshot: _ } => {
                 let _ = ev_tx.send(Event::Shutdown);
             }
             Intent::Command => {

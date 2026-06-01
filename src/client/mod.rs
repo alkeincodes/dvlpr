@@ -168,14 +168,16 @@ pub async fn query_status(socket_path: &Path) -> io::Result<StatusInfo> {
 }
 
 /// Connect to a session socket and ask the daemon to shut down (best-effort).
-pub async fn send_kill(socket_path: &Path) -> io::Result<()> {
+/// `keep_snapshot=false` is the graceful stop (deletes the snapshot);
+/// `keep_snapshot=true` preserves it for a restart-and-restore.
+pub async fn send_kill(socket_path: &Path, keep_snapshot: bool) -> io::Result<()> {
     let stream = UnixStream::connect(socket_path).await?;
     let (_read_half, mut write_half) = stream.into_split();
     write_msg(
         &mut write_half,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            intent: Intent::Kill,
+            intent: Intent::Kill { keep_snapshot },
         },
     )
     .await

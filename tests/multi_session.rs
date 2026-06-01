@@ -138,7 +138,9 @@ async fn kill_shuts_the_session_down() {
         &mut w,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            intent: Intent::Kill,
+            intent: Intent::Kill {
+                keep_snapshot: false,
+            },
         },
     )
     .await
@@ -169,7 +171,9 @@ async fn killing_one_session_leaves_another_running() {
         &mut w,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            intent: Intent::Kill,
+            intent: Intent::Kill {
+                keep_snapshot: false,
+            },
         },
     )
     .await

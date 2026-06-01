@@ -339,7 +339,7 @@ async fn stop_session(session: &str) -> std::io::Result<()> {
             format!("no session named '{session}'"),
         ));
     }
-    client::send_kill(&path).await
+    client::send_kill(&path, false).await
 }
 
 /// list live sessions with window counts. Skips (never unlinks) non-live `.sock` files.

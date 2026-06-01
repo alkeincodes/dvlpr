@@ -124,7 +124,9 @@ async fn graceful_kill(path: &std::path::Path) {
         &mut kw,
         &ClientHello {
             protocol_version: PROTOCOL_VERSION,
-            intent: Intent::Kill,
+            intent: Intent::Kill {
+                keep_snapshot: false,
+            },
         },
     )
     .await

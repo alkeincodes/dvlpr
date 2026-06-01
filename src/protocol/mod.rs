@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -25,7 +25,11 @@ pub enum Intent {
     /// One-shot query: the server replies with `StatusInfo` and closes. No attach.
     Status,
     /// Ask the daemon to shut down. The server tears down and exits.
-    Kill,
+    /// `keep_snapshot`: when true, the daemon flushes a final layout snapshot
+    /// and tears down WITHOUT deleting it (used by `dvlpr update`'s restart
+    /// orchestration so the session can be restored by the respawned daemon).
+    /// `dvlpr stop` sends `false` (graceful stop still deletes the snapshot).
+    Kill { keep_snapshot: bool },
     /// One-shot control command: the server applies it, replies `CommandReply`,
     /// and closes. No attach. (Appended last to keep discriminants stable.)
     Command,
@@ -173,13 +177,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_five() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn protocol_version_is_six() {
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     #[test]
-    fn protocol_version_unchanged_by_copy_mode() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+    fn kill_intent_round_trips_with_keep_snapshot() {
+        for keep in [false, true] {
+            let msg = ClientHello {
+                protocol_version: PROTOCOL_VERSION,
+                intent: Intent::Kill {
+                    keep_snapshot: keep,
+                },
+            };
+            let bytes = encode(&msg).unwrap();
+            let back: ClientHello = decode(&bytes).unwrap();
+            assert_eq!(msg, back);
+        }
     }
 
     #[test]
