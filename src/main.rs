@@ -24,7 +24,7 @@ async fn main() {
         Cmd::Run { session } => run_or_attach(&session).await,
         Cmd::Attach { session } => attach_existing(&session).await,
         Cmd::Ls => list_sessions().await,
-        Cmd::Kill { session } => kill_session(&session).await,
+        Cmd::Stop { session } => stop_session(&session).await,
         Cmd::Ssh {
             destination,
             session,
@@ -77,8 +77,8 @@ enum Cmd {
     Attach { session: String },
     /// `dvlpr ls`
     Ls,
-    /// `dvlpr kill -t <name>`
-    Kill { session: String },
+    /// `dvlpr stop -t <name>`
+    Stop { session: String },
     /// `dvlpr server [name]` — internal daemon entrypoint
     Server { session: String },
     /// `dvlpr ssh <destination> [session]` — exec `ssh -t <dest> dvlpr [session]`
@@ -113,7 +113,7 @@ fn parse_args(args: &[String]) -> Cmd {
     // `help::COMMAND_ROWS` (src/help/mod.rs). When you add/rename/remove a
     // subcommand here, update that table (and its coverage test) to match.
     const USAGE: &str =
-        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | kill -t <name> | update | --version";
+        "usage: dvlpr [<name>] | new -s <name> | attach -t <name> | ssh <dest> [name] | ls | stop -t <name> | update | --version";
     // `-h`/`--help` anywhere, or a bare `help` subcommand, prints the command
     // list. Checked before routing so `dvlpr ls --help` shows help, not an error.
     if args.iter().any(|a| a == "-h" || a == "--help")
@@ -160,9 +160,9 @@ fn parse_args(args: &[String]) -> Cmd {
             Some(name) => Cmd::Attach { session: name },
             None => Cmd::Usage("usage: dvlpr attach -t <name>".into()),
         },
-        Some("kill") => match flag(&args[1..], "-t") {
-            Some(name) => Cmd::Kill { session: name },
-            None => Cmd::Usage("usage: dvlpr kill -t <name>".into()),
+        Some("stop") => match flag(&args[1..], "-t") {
+            Some(name) => Cmd::Stop { session: name },
+            None => Cmd::Usage("usage: dvlpr stop -t <name>".into()),
         },
         Some("ssh") => match &args[1..] {
             [dest] if !dest.starts_with('-') => Cmd::Ssh {
@@ -199,7 +199,7 @@ fn parse_args(args: &[String]) -> Cmd {
 
 /// Returns an error message if `cmd` must not run inside an existing dvlpr
 /// session. `dvlpr_env` is the value of `$DVLPR` (`None` when not nested).
-/// Only the interactive create/attach commands are refused; `ls`/`kill`/`ssh`/
+/// Only the interactive create/attach commands are refused; `ls`/`stop`/`ssh`/
 /// `server` are safe to run from inside a session.
 fn nested_block(cmd: &Cmd, dvlpr_env: Option<&str>) -> Option<String> {
     let parent = dvlpr_env?; // not nested -> always allow
@@ -330,8 +330,8 @@ async fn attach_existing(session: &str) -> std::io::Result<()> {
     client::attach(&path).await
 }
 
-/// kill a session by name.
-async fn kill_session(session: &str) -> std::io::Result<()> {
+/// stop a session by name.
+async fn stop_session(session: &str) -> std::io::Result<()> {
     let path = session_socket(session)?;
     if !socket::is_live(&path).await {
         return Err(std::io::Error::new(
@@ -397,7 +397,7 @@ mod tests {
             session: "x".into(),
         };
         let ls = Cmd::Ls;
-        let kill = Cmd::Kill {
+        let stop = Cmd::Stop {
             session: "x".into(),
         };
         let server = Cmd::Server {
@@ -409,7 +409,7 @@ mod tests {
         };
 
         // Not nested ($DVLPR unset): everything is allowed.
-        for c in [&run, &attach, &ls, &kill, &server, &ssh] {
+        for c in [&run, &attach, &ls, &stop, &server, &ssh] {
             assert_eq!(nested_block(c, None), None);
         }
 
@@ -417,7 +417,7 @@ mod tests {
         assert!(nested_block(&run, Some("parent")).is_some());
         assert!(nested_block(&attach, Some("parent")).is_some());
         assert_eq!(nested_block(&ls, Some("parent")), None);
-        assert_eq!(nested_block(&kill, Some("parent")), None);
+        assert_eq!(nested_block(&stop, Some("parent")), None);
         assert_eq!(nested_block(&server, Some("parent")), None);
 
         // The message names the parent session.
@@ -463,8 +463,8 @@ mod tests {
         );
         assert_eq!(parse_args(&v(&["ls"])), Cmd::Ls);
         assert_eq!(
-            parse_args(&v(&["kill", "-t", "work"])),
-            Cmd::Kill {
+            parse_args(&v(&["stop", "-t", "work"])),
+            Cmd::Stop {
                 session: "work".into()
             }
         );
@@ -498,7 +498,7 @@ mod tests {
         assert!(matches!(parse_args(&v(&["new", "-s"])), Cmd::Usage(_)));
         assert!(matches!(parse_args(&v(&["attach"])), Cmd::Usage(_)));
         assert!(matches!(parse_args(&v(&["attach", "-t"])), Cmd::Usage(_)));
-        assert!(matches!(parse_args(&v(&["kill"])), Cmd::Usage(_)));
+        assert!(matches!(parse_args(&v(&["stop"])), Cmd::Usage(_)));
     }
 
     #[test]

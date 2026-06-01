@@ -201,7 +201,7 @@ pub async fn send_command(socket_path: &Path, cmd: ControlCommand) -> io::Result
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "session predates the control CLI; restart it (dvlpr kill -t <name>, then reattach)",
+                "session predates the control CLI; restart it (dvlpr stop -t <name>, then reattach)",
             )
         })
 }

@@ -113,9 +113,9 @@ atomically replaces the binary in place. Exit codes:
 | `1`  | Failure — network error, SHA-256 mismatch, no asset for this host |
 | `2`  | Install directory not writable — `rerun as: sudo dvlpr update` |
 
-**Running sessions keep the old binary in memory until you `dvlpr kill -t <name>`
+**Running sessions keep the old binary in memory until you `dvlpr stop -t <name>`
 and reattach** (Linux/macOS hold the executable's inode open). To pick up
-the new binary, kill the session or close its last pane, then start fresh.
+the new binary, stop the session or close its last pane, then start fresh.
 
 ### Symlinks
 
@@ -139,7 +139,7 @@ aren't officially tested.
 | `dvlpr new -s <name>` | Explicit "create or attach" form |
 | `dvlpr attach -t <name>` (or `dvlpr a -t <name>`) | Attach to an existing session; error if missing |
 | `dvlpr ls` | List live sessions with window counts |
-| `dvlpr kill -t <name>` | Kill a session's daemon; error if missing |
+| `dvlpr stop -t <name>` | Stop a session's daemon; error if missing |
 | `dvlpr ssh <dest> [name]` | SSH to `<dest>` and run dvlpr there (see below) |
 | `dvlpr update` | Fetch the latest release and replace this binary |
 | `dvlpr --version` / `-V` | Print the version and build target triple |
@@ -164,7 +164,7 @@ run `dvlpr`, as long as the target session's daemon is alive.
 | `dvlpr pane zoom` | Toggle zoom on the focused pane |
 | `dvlpr sidebar toggle` | Show/hide the agent sidebar |
 
-> **Note:** Closing the last pane or the last window is refused (it would end the session) — use `dvlpr kill -t <name>` to stop a session.
+> **Note:** Closing the last pane or the last window is refused (it would end the session) — use `dvlpr stop -t <name>` to stop a session.
 
 **Examples**
 
@@ -317,9 +317,9 @@ scrollback = 2000
 [theme]
 flavor = "one-dark"
 
-# Agent-awareness sidebar width in columns (default 26; clamped 18–36).
+# Agent-awareness sidebar width in columns (default 33; clamped 18–36).
 [sidebar]
-width = 26
+width = 33
 
 # Optional sound played when an agent transitions into Blocked state
 # (waiting for input). Set enabled = false to silence; or point
@@ -350,7 +350,7 @@ prefix = "C-a"
 ```
 
 **A running daemon caches its config at startup.** After editing the file,
-shut existing sessions down (`dvlpr kill -t <name>` or close the last pane)
+shut existing sessions down (`dvlpr stop -t <name>` or close the last pane)
 so the next `dvlpr <name>` spawns a daemon that re-reads the file.
 
 ---
@@ -597,7 +597,7 @@ dvlpr is a daemon + thin client over a per-session Unix socket.
 The protocol is bincode over a Unix socket. The first message is
 `ClientHello { protocol_version, intent }`, where `intent` is one of
 `Attach { cols, rows }`, `Status` (used by `dvlpr ls`), or `Kill` (used by
-`dvlpr kill`). `Status` and `Kill` are answered without spawning a session
+`dvlpr stop`). `Status` and `Kill` are answered without spawning a session
 (no geometry / foreground side effects). `PROTOCOL_VERSION` is currently
 `4`.
 

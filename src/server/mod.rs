@@ -748,7 +748,7 @@ fn apply_control_command(
         C::PaneClose => {
             if session.window_count() == 1 && session.active_pane_count() == 1 {
                 return err(
-                    "cannot close the last pane via control; use 'dvlpr kill' to stop the session"
+                    "cannot close the last pane via control; use 'dvlpr stop' to stop the session"
                         .into(),
                 );
             }
@@ -796,7 +796,7 @@ fn apply_control_command(
             if session.window_count() == 0 {
                 err("no active window to close".into())
             } else if session.window_count() == 1 {
-                err("cannot close the last window via control; use 'dvlpr kill' to stop the session".into())
+                err("cannot close the last window via control; use 'dvlpr stop' to stop the session".into())
             } else {
                 eff.closed = session.close_active_window();
                 ok()

@@ -113,8 +113,8 @@ pub const COMMAND_ROWS: &[(&str, &str)] = &[
     ),
     ("dvlpr ls", "List live sessions with window counts"),
     (
-        "dvlpr kill -t <name>",
-        "Kill a session's daemon; error if missing",
+        "dvlpr stop -t <name>",
+        "Stop a session's daemon; error if missing",
     ),
     (
         "dvlpr ssh <dest> [name]",
@@ -368,7 +368,7 @@ mod tests {
             "attach -t",
             " a)",
             "dvlpr ls",
-            "kill -t",
+            "stop -t",
             "ssh",
             "server",
         ] {

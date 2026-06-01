@@ -367,7 +367,7 @@ pub fn run_with<F: Fetch>(
         "Updated dvlpr {}.{}.{} → {}.{}.{}.",
         current.0, current.1, current.2, remote.0, remote.1, remote.2
     );
-    println!("Running sessions keep the old binary until you `dvlpr kill -t <name>` and reattach.");
+    println!("Running sessions keep the old binary until you `dvlpr stop -t <name>` and reattach.");
     Ok(())
 }
 
