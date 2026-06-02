@@ -59,11 +59,29 @@ fn classify_claude(tail: &str) -> AgentState {
         return AgentState::Idle;
     }
 
-    // Compute once — both detectors need it.
+    // Compute once — every detector needs it.
     let input_box = active_input_box(tail);
 
-    // Blocked is checked BEFORE working: a permission prompt with
-    // spinner overflow still correctly classifies as needing attention.
+    // A live token-throughput footer (`· ↓ <N> tokens`) is the one Working
+    // signal that OUTRANKS Blocked. It is painted only on the active spinner
+    // and is swapped for a past-tense completion footer (`Brewed for Ns`, no
+    // `· ↓` tail) the instant the turn ends, so its presence means "streaming
+    // right now" with no stale-frame risk. Because the classifier samples the
+    // WHOLE screen, a blocked-looking marker ("do you want", a leftover
+    // `❯ N.` menu, an answered AskUserQuestion's "Chat about this") routinely
+    // lingers in scrollback ABOVE a still-streaming spinner — checking
+    // throughput first stops that stale text from masking a working agent as
+    // Blocked. The remaining Working signals stay BELOW Blocked: "esc to
+    // interrupt" and spinner verbs can legitimately sit above a live
+    // permission prompt, so they must not override it (see
+    // `classify_claude_blocked_takes_precedence_over_working`).
+    if has_live_token_throughput(tail, input_box.as_ref()) {
+        return AgentState::Working;
+    }
+
+    // Blocked is checked BEFORE the remaining working signals: a permission
+    // prompt with spinner overflow still correctly classifies as needing
+    // attention.
     if is_claude_blocked(tail, &lower, input_box.as_ref()) {
         return AgentState::Blocked;
     }
@@ -73,6 +91,23 @@ fn classify_claude(tail: &str) -> AgentState {
     }
 
     AgentState::Idle
+}
+
+/// Scan for a live token-throughput footer (`· ↓ <N>...tokens`) anywhere on
+/// screen EXCEPT inside the user's input box. Shares `is_claude_working`'s
+/// input-box gating so a user typing the footer literally into their prompt
+/// doesn't trip it. Pulled ahead of the Blocked check because, unlike the
+/// other working signals, throughput is a stale-proof live-spinner marker —
+/// see `classify_claude`.
+fn has_live_token_throughput(tail: &str, input_box: Option<&InputBox>) -> bool {
+    tail.lines().enumerate().any(|(i, line)| {
+        if let Some(b) = input_box {
+            if i >= b.content_start_line && i < b.content_end_line {
+                return false; // line is inside the input box — ignore
+            }
+        }
+        has_token_throughput(line)
+    })
 }
 
 fn is_claude_blocked(tail: &str, lower: &str, input_box: Option<&InputBox>) -> bool {
@@ -138,13 +173,16 @@ fn has_selection_prompt(tail: &str) -> bool {
 /// Match Claude's working hint anywhere on screen EXCEPT inside the user's
 /// own input box.
 ///
-/// Three signals trip the Working state:
+/// Two signals trip the Working state here:
 /// - the interrupt hint (`esc to interrupt` / `ctrl+c to interrupt`) — the
 ///   pre-2.x spinner footer
-/// - the Claude Code 2.x spinner footer `· ↓ <N>...tokens` (throughput
-///   counter that replaced `esc to interrupt`) — see `has_token_throughput`
 /// - a spinner verb framed with an ellipsis (`Combobulating…`, `Working…`,
 ///   `Pondering...`), drawn from Claude Code's own verb pool
+///
+/// The Claude Code 2.x token-throughput footer (`· ↓ <N>...tokens`) is also a
+/// Working signal, but it OUTRANKS Blocked and so is handled earlier by
+/// `has_live_token_throughput`/`classify_claude` — by the time we reach here
+/// it is guaranteed absent, which is why it isn't re-checked below.
 ///
 /// Real layout: the input box sits ABOVE the spinner, so the working hint
 /// lives BELOW the box's bottom border. We can't anchor "above the first
@@ -160,9 +198,6 @@ fn is_claude_working(tail: &str, input_box: Option<&InputBox>) -> bool {
         }
         let lower = line.to_ascii_lowercase();
         if lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt") {
-            return true;
-        }
-        if has_token_throughput(line) {
             return true;
         }
         has_spinner_verb_line(line)
@@ -381,6 +416,27 @@ mod tests {
         // false-positive Working.
         let tail = "────────\n❯ (6m 12s · ↓ 20.6k tokens)\n────────\n";
         assert_eq!(classify(Agent::Claude, tail), AgentState::Idle);
+    }
+
+    #[test]
+    fn classify_claude_token_throughput_overrides_stale_blocked_marker() {
+        // Live bug: the classifier samples the WHOLE screen, so an
+        // already-answered AskUserQuestion leaves its question text
+        // ("How do you want…") and "Chat about this" footer in scrollback
+        // while the agent streams the next turn. Both match Blocked markers,
+        // but they are STALE — the live `· ↓ Nk tokens` spinner footer at the
+        // bottom proves the agent is actively working right now. Token
+        // throughput is the one Working signal that must outrank Blocked
+        // (unlike `esc to interrupt`, it is painted only on the live spinner
+        // and never lingers as a stale frame).
+        let tail = "User answered Claude's questions:\n\
+                    How do you want me to proceed? → main + Phase 1 only\n\
+                    Chat about this · ↑↓ to navigate · enter to select\n\
+                    ─────────────────────────\n\
+                    ❯\u{a0}\n\
+                    ─────────────────────────\n\
+                    ✻ Bootstrapping project layout… (5m 42s · ↓ 17.3k tokens)\n";
+        assert_eq!(classify(Agent::Claude, tail), AgentState::Working);
     }
 
     #[test]
