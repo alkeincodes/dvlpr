@@ -1503,9 +1503,12 @@ impl Session {
                 // Copy exactly the highlighted cells via the shared clip+extract
                 // helper (the same path the mouse-release auto-yank uses, so the two
                 // yank paths cannot diverge). A fully off-screen selection → no emit.
+                // NB: do NOT snap the viewport to the live bottom — leave the pane
+                // where the copy happened (the modeless wheel-scroll render state) so
+                // copying a line from history keeps that line in view. Returning to
+                // live is the wheel-down / re-entry gesture, not a side effect of copy.
                 let emit = clipped_selection_osc52(&cm, &pane.screen);
-                pane.screen.scroll_viewport_bottom();
-                // exited
+                // cm dropped (not put back) → exited; engine viewport left in place.
                 return CopyEffect { emit };
             }
             CopyAction::ToggleSelect => {
@@ -1740,8 +1743,9 @@ impl Session {
                 let real_drag = cm.selection.as_ref().is_some_and(|s| s.head != s.anchor);
                 if real_drag {
                     let emit = clipped_selection_osc52(&cm, &pane.screen);
-                    pane.screen.scroll_viewport_bottom();
-                    // cm dropped (not put back) → copy mode exits.
+                    // cm dropped → copy mode exits; the engine viewport is left at
+                    // the copy position (no snap to live bottom — see the keyboard
+                    // Yank arm). Copying from history keeps that text in view.
                     return CopyEffect { emit };
                 }
                 if cm.mouse_origin {
@@ -3318,6 +3322,80 @@ mod tests {
         );
         assert!(bytes.ends_with(b"\x1b\\"), "ST terminator");
         let _ = pane;
+    }
+
+    #[tokio::test]
+    async fn copy_mode_keyboard_yank_preserves_scroll_position() {
+        // Copying a line from up in the scrollback must NOT snap the pane back to
+        // the live bottom — the user wants to keep viewing where they copied from.
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        // Scroll up into history before entering copy mode.
+        let _ = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        let offset_before = session.pane_viewport_offset_for_test(pane);
+        assert!(offset_before > 0, "precondition: scrolled up into history");
+        let _ = session.apply_command(crate::config::Command::EnterCopyMode);
+        // Select a span (v + l) and yank (y) — neither moves the viewport.
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'v'));
+        let _ = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'l'));
+        let eff = session.handle_copy_mode_key(crate::copymode::CopyKey::Char(b'y'));
+        assert!(eff.emit.is_some(), "yank must produce OSC 52 bytes");
+        assert!(!session.copy_mode_active(), "y exits copy mode");
+        assert_eq!(
+            session.pane_viewport_offset_for_test(pane),
+            offset_before,
+            "yank must NOT snap the pane back to the live bottom"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_mode_mouse_yank_preserves_scroll_position() {
+        // Same as the keyboard case but via the mouse drag-release auto-yank: the
+        // release that copies must not jump the pane to the bottom either.
+        use crate::input::{MouseEvent, MouseKind};
+        let mut feed = Vec::new();
+        for i in 1..=50 {
+            feed.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (mut session, pane, _rx) = test_session_feeding(40, 12, 2000, &feed).await;
+        let _ = session.wheel(MouseEvent {
+            button: 0,
+            col: 5,
+            row: 5,
+            kind: MouseKind::ScrollUp,
+        });
+        let offset_before = session.pane_viewport_offset_for_test(pane);
+        assert!(offset_before > 0, "precondition: scrolled up into history");
+        // Drag-to-enter + select a span on a mid-pane row (no edge auto-scroll).
+        session.begin_drag_select(pane, (2, 3), (10, 3));
+        assert!(session.copy_mode_active(), "drag entered copy mode");
+        assert_eq!(
+            session.pane_viewport_offset_for_test(pane),
+            offset_before,
+            "entering+dragging must not move the viewport here"
+        );
+        let eff = session.handle_copy_mode_mouse(MouseEvent {
+            button: 0,
+            col: 10,
+            row: 3,
+            kind: MouseKind::Release,
+        });
+        assert!(eff.emit.is_some(), "drag-release must yank");
+        assert!(!session.copy_mode_active(), "release exits copy mode");
+        assert_eq!(
+            session.pane_viewport_offset_for_test(pane),
+            offset_before,
+            "mouse yank must NOT snap the pane back to the live bottom"
+        );
     }
 
     #[tokio::test]

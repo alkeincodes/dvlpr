@@ -502,6 +502,11 @@ the app as SGR mouse events rather than scrolling scrollback.
 The bottom row of the pane shows `[copy] <offset>/<scrollback>` while copy
 mode is active.
 
+Yanking leaves the pane where you copied from — copying a line out of the
+scrollback does **not** jump the view back to the live bottom, so you can keep
+reading or copy more. Scroll back down (or `G`) to return to live. Cancelling
+instead (`q` / `Esc`) does return to the live bottom.
+
 ### Drag to copy
 
 A left-click-drag inside a pane auto-enters copy mode and begins the
