@@ -504,6 +504,21 @@ pub fn resize(
     return .success;
 }
 
+pub fn set_max_scrollback(
+    terminal_: Terminal,
+    max_scrollback: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t = wrapper.terminal;
+    // Update the PRIMARY screen's scrollback byte budget. The alternate
+    // screen is intentionally kept at 0 and re-inherits the primary's value
+    // when the app switches back (see Terminal.switchScreen), so updating
+    // the primary screen is sufficient and correct across alt-screen flips.
+    const primary = t.screens.get(.primary) orelse return .invalid_value;
+    primary.pages.setMaxSize(max_scrollback);
+    return .success;
+}
+
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     const t: *ZigTerminal = (terminal_ orelse return).terminal;
     t.fullReset();

@@ -1573,6 +1573,15 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    pub fn focused_scrollback_rows_for_test(&self) -> usize {
+        let id = self.focused_pane();
+        self.panes
+            .get(&id)
+            .map(|p| p.screen.scrollback_rows())
+            .unwrap_or(0)
+    }
+
     /// The text of the currently-highlighted (clipped) selection, computed via the
     /// same clip+unproject+selection_text path as the Yank arm. `None` when copy
     /// mode is inactive, there is no selection, or the selection is fully off-screen.
@@ -3218,6 +3227,26 @@ mod tests {
         let (mut session, _pane, _rx) = copy_test_session(40, 12, 0).await;
         let _ = session.apply_command(crate::config::Command::EnterCopyMode);
         assert!(!session.copy_mode_active());
+    }
+
+    #[tokio::test]
+    async fn session_scrollback_retains_configured_rows_end_to_end() {
+        // End-to-end daemon path: Session::new threads the config scrollback (rows)
+        // into spawn_pane -> GhosttyScreen::new -> the rows->bytes conversion.
+        // Mirrors `scrollback = 10000` in ~/.dvlpr/config.toml. Feeding far more
+        // lines than configured must retain ~the configured depth, NOT libghostty's
+        // min_max floor (the rows-as-bytes bug pegged this at a few hundred/thousand).
+        let (mut session, _pane, _rx) = copy_test_session(80, 24, 10_000).await;
+        let mut buf = Vec::with_capacity(20_000 * 3);
+        for _ in 0..20_000 {
+            buf.extend_from_slice(b"x\r\n");
+        }
+        session.feed_focused_for_test(&buf);
+        let sb = session.focused_scrollback_rows_for_test();
+        assert!(
+            sb >= 10_000,
+            "configured scrollback=10000 rows but pane retained only {sb}"
+        );
     }
 
     #[tokio::test]

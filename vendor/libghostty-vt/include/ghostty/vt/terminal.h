@@ -938,6 +938,27 @@ GHOSTTY_API GhosttyResult ghostty_terminal_resize(GhosttyTerminal terminal,
                                       uint32_t cell_height_px);
 
 /**
+ * Set the maximum scrollback retained by the primary screen, in bytes.
+ *
+ * Updates the primary screen's scrollback byte budget after creation. The
+ * alternate screen always keeps zero scrollback and re-inherits the primary
+ * value when the application switches back to the primary screen, so only the
+ * primary budget needs updating. Takes effect on the next scroll/grow.
+ *
+ * Because the byte cost of a retained row scales with the column count,
+ * callers that think in rows should recompute the byte budget and call this
+ * whenever the terminal is resized to a new width.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param max_scrollback New scrollback budget in bytes (0 disables scrollback)
+ * @return GHOSTTY_SUCCESS on success, or an error code on failure
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_set_max_scrollback(GhosttyTerminal terminal,
+                                      size_t max_scrollback);
+
+/**
  * Set an option on the terminal.
  *
  * Configures terminal callbacks and associated state such as the

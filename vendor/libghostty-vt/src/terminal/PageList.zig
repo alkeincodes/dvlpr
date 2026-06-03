@@ -3094,6 +3094,16 @@ pub fn maxSize(self: *const PageList) usize {
     return @max(self.explicit_max_size, self.min_max_size);
 }
 
+/// Update the explicit scrollback byte budget. Takes effect on the next
+/// `grow()`: a larger budget lets history extend further; a smaller one is
+/// honored when the next prune runs. The effective limit is still
+/// `maxSize()` (clamped up to `min_max_size`), so the active area is never
+/// at risk. Callers that express scrollback in rows recompute and re-apply
+/// this across resizes, since the byte cost per row depends on column count.
+pub fn setMaxSize(self: *PageList, max: usize) void {
+    self.explicit_max_size = max;
+}
+
 /// Grow the active area by exactly one row.
 ///
 /// This may allocate, but also may not if our current page has more

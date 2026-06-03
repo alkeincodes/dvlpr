@@ -27,6 +27,11 @@ pub struct GhosttyScreen {
     term: sys::GhosttyTerminal,
     cols: u16,
     rows: u16,
+    /// Configured scrollback depth in ROWS. Retained so `resize` can recompute
+    /// libghostty's byte budget for the new width — the per-row byte cost scales
+    /// with column count, so a budget fixed at creation would shrink (in rows)
+    /// whenever the pane widened.
+    scrollback_rows: usize,
     // Heap-stable buffer the write_pty callback appends to. Boxed so its address is
     // stable across moves of GhosttyScreen — the terminal holds a raw userdata
     // pointer to it for the terminal's whole lifetime.
@@ -57,15 +62,48 @@ unsafe extern "C" fn write_pty_trampoline(
     buf.borrow_mut().extend_from_slice(slice);
 }
 
+/// Convert a desired scrollback depth in ROWS into the BYTE budget libghostty
+/// actually wants for `GhosttyTerminalOptions.max_scrollback`.
+///
+/// The C header documents `max_scrollback` as a line count, but the engine
+/// treats it as bytes (`Screen.zig`: "the amount of scrollback to keep in
+/// bytes"). dvlpr expresses scrollback in rows — tmux `history-limit`
+/// semantics — so the conversion has to happen here, at the FFI seam. Passing
+/// the row count straight through made the engine fall back to its
+/// `min_max_size` floor (~a few hundred rows) regardless of config.
+///
+/// The model is calibrated against the pinned vendored lib (measured with a
+/// byte-budget sweep — see git history of `scrollback_retains_at_least_*`):
+/// per-retained-row cost is ~13·cols bytes (the packed cell array dominates a
+/// fixed-size page), plus a fixed floor of one std page that dominates small
+/// budgets. We deliberately pick an UPPER bound so the engine always retains
+/// AT LEAST `scrollback_rows` (erring toward more history is the safe
+/// direction; pages are allocated lazily, so a high ceiling costs no memory
+/// until rows are actually written). `0` disables scrollback entirely.
+fn scrollback_byte_budget(cols: u16, rows: u16, scrollback_rows: usize) -> usize {
+    if scrollback_rows == 0 {
+        return 0;
+    }
+    // Fixed offset covering libghostty's min_max_size (≈ active area + one
+    // std page); 1 MiB sits comfortably above the observed ~0.66–0.85 MiB.
+    const FLOOR_BYTES: usize = 1 << 20;
+    // Upper bound on per-row bytes; ~13·cols asymptote + slack for overhead.
+    let per_row = 13 * cols as usize + 16;
+    let total_rows = rows as usize + scrollback_rows;
+    FLOOR_BYTES + total_rows.saturating_mul(per_row)
+}
+
 impl GhosttyScreen {
-    pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
+    /// `scrollback_rows` is a history depth in ROWS (0 disables scrollback);
+    /// it is converted to libghostty's byte budget via `scrollback_byte_budget`.
+    pub fn new(cols: u16, rows: u16, scrollback_rows: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
         let mut term: sys::GhosttyTerminal = ptr::null_mut();
         let opts = sys::GhosttyTerminalOptions {
             cols,
             rows,
-            max_scrollback,
+            max_scrollback: scrollback_byte_budget(cols, rows, scrollback_rows),
         };
         // SAFETY: `term` is a valid out-pointer; `opts` is a plain POD struct;
         // a null allocator means "use the default allocator".
@@ -101,6 +139,7 @@ impl GhosttyScreen {
             term,
             cols,
             rows,
+            scrollback_rows,
             pty_writes,
         }
     }
@@ -592,6 +631,18 @@ impl GhosttyScreen {
         debug_assert!(rc == 0, "ghostty_terminal_resize failed (rc={rc})");
         self.cols = cols;
         self.rows = rows;
+        // Re-apply the scrollback budget for the new width. libghostty's
+        // `max_scrollback` is a BYTE budget and the per-row cost scales with
+        // columns, so a budget fixed at creation would hold fewer rows once the
+        // pane widens (panes are created narrow under a sidebar/split, then
+        // widened). Recompute from the configured ROW depth every resize.
+        let budget = scrollback_byte_budget(cols, rows, self.scrollback_rows);
+        // SAFETY: `term` is valid; the setter takes a plain size_t byte budget.
+        let rc = unsafe { sys::ghostty_terminal_set_max_scrollback(self.term, budget) };
+        debug_assert!(
+            rc == 0,
+            "ghostty_terminal_set_max_scrollback failed (rc={rc})"
+        );
     }
 
     pub fn render_ansi(&self) -> Vec<u8> {
@@ -703,6 +754,51 @@ mod tests {
     fn styled_cell_out_of_bounds_is_default() {
         let s = GhosttyScreen::new(5, 2, 0);
         assert_eq!(s.styled_cell(99, 99), (' ', CellStyle::default()));
+    }
+
+    /// Feed `n` newline-terminated rows so the terminal scrolls that many
+    /// lines into history.
+    fn feed_n_lines(s: &mut GhosttyScreen, n: usize) {
+        let mut buf = Vec::with_capacity(n * 3);
+        for _ in 0..n {
+            buf.extend_from_slice(b"x\r\n");
+        }
+        s.feed(&buf);
+    }
+
+    #[test]
+    fn scrollback_retains_at_least_configured_rows() {
+        // Regression for the rows-as-bytes bug: `scrollback` is a ROW count, but
+        // libghostty's `max_scrollback` is a BYTE budget. Passing the row count
+        // straight through pegged retention at libghostty's min_max floor (a few
+        // hundred rows) regardless of config. Feeding far more lines than the
+        // configured depth must retain AT LEAST that depth, across widths.
+        for &(cols, sb) in &[
+            (80u16, 2_000usize),
+            (80, 10_000),
+            (120, 5_000),
+            (200, 2_000),
+            (215, 10_000),
+        ] {
+            let mut s = GhosttyScreen::new(cols, 24, sb);
+            feed_n_lines(&mut s, 60_000);
+            assert!(
+                s.scrollback_rows() >= sb,
+                "cols={cols}: configured scrollback={sb} rows but engine retained only {}",
+                s.scrollback_rows()
+            );
+        }
+    }
+
+    #[test]
+    fn scrollback_zero_disables_history() {
+        let mut s = GhosttyScreen::new(80, 24, 0);
+        feed_n_lines(&mut s, 5_000);
+        assert_eq!(
+            s.scrollback_rows(),
+            0,
+            "scrollback=0 must keep no history (copy mode disabled)"
+        );
     }
 
     #[test]

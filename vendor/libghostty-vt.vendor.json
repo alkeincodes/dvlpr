@@ -4,5 +4,8 @@
   "version": "1.3.2-main-+063ac3ecc",
   "upstream": "https://github.com/ghostty-org/ghostty",
   "build": "zig build -Demit-lib-vt (requires zig 0.15.2)",
-  "note": "Vendored upstream MIT source. Build outputs (zig-out, .zig-cache) are gitignored."
+  "note": "Vendored upstream MIT source. Build outputs (zig-out, .zig-cache) are gitignored.",
+  "local_patches": [
+    "scrollback-set-max: adds ghostty_terminal_set_max_scrollback C API (+ PageList.setMaxSize) so dvlpr can recompute the scrollback BYTE budget from a configured ROW depth on every resize. Touches src/terminal/PageList.zig, src/terminal/c/terminal.zig, src/terminal/c/main.zig, src/lib_vt.zig, include/ghostty/vt/terminal.h. RE-APPLY after any re-vendor of this library."
+  ]
 }
