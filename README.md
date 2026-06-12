@@ -246,6 +246,20 @@ own socket. Tunneling the dvlpr wire protocol over SSH would require an
 extra transport layer and complicate teardown semantics; the exec-wrapper
 approach reuses SSH's TTY handling and stays simple.
 
+### Remote bridge (`dvlpr bridge`)
+
+`dvlpr bridge` exposes the host's agent sessions as newline-delimited JSON on
+stdin/stdout — list agents and their states, stream transcripts, type into
+panes, and manage windows, all scriptable. It is designed to be driven over
+SSH (`ssh host dvlpr bridge`) by external tools, but works identically when
+run locally:
+
+    printf '' | dvlpr bridge        # emits a hello line and exits on EOF
+
+Protocol details: one JSON object per line; commands carry an `id` echoed in
+the matching `reply`. Targeted commands carry the `epoch` from the latest
+roster snapshot; a daemon restarted since then answers `stale_target`.
+
 ### Nested-session guard
 
 dvlpr sets `DVLPR=<session_name>` in each pane's environment. A nested
@@ -596,7 +610,7 @@ dvlpr is a daemon + thin client over a per-session Unix socket.
 │ • sends keystrokes / mouse events            │
 │ • renders the diffed frames it receives      │
 └──────────────────────────────────────────────┘
-                      │  protocol v4 over
+                      │  protocol v7 over
                       │  /tmp/dvlpr-<user>/<name>.sock
                       ▼
 ┌──────────────────────────────────────────────┐
@@ -634,10 +648,11 @@ dvlpr is a daemon + thin client over a per-session Unix socket.
 
 The protocol is bincode over a Unix socket. The first message is
 `ClientHello { protocol_version, intent }`, where `intent` is one of
-`Attach { cols, rows }`, `Status` (used by `dvlpr ls`), or `Kill` (used by
-`dvlpr stop`). `Status` and `Kill` are answered without spawning a session
-(no geometry / foreground side effects). `PROTOCOL_VERSION` is currently
-`5`.
+`Attach { cols, rows }`, `Status` (used by `dvlpr ls`), `Kill` (used by
+`dvlpr stop`), `Command` (one-shot control commands), or `Subscribe`
+(the long-lived agent-roster push channel used by `dvlpr bridge`).
+`Status` and `Kill` are answered without spawning a session (no geometry /
+foreground side effects). `PROTOCOL_VERSION` is currently `7`.
 
 ### libghostty-vt FFI
 
