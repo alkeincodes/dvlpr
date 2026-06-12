@@ -161,6 +161,12 @@ enum Event {
         rows: u16,
     },
     ClientGone(ClientId),
+    /// A Subscribe client connected; the central loop registers a roster
+    /// writer task for it.
+    SubscribeConnected {
+        id: ClientId,
+        write_half: tokio::net::unix::OwnedWriteHalf,
+    },
     PaneOutput {
         pane_id: PaneId,
         output: PaneOutput,
@@ -320,6 +326,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // This daemon incarnation's epoch: validated against command envelopes so
     // pane-id-targeted commands can never land on a restarted daemon's panes.
     let server_epoch = make_epoch();
+    // Subscribe push channel: per-subscriber writer tasks fed by a single
+    // latest-wins watch of the agent roster (slow subscribers skip snapshots).
+    let mut subscribers: HashMap<ClientId, JoinHandle<()>> = HashMap::new();
+    let (roster_tx, _) =
+        watch::channel::<Arc<Vec<crate::protocol::AgentInfo>>>(Arc::new(session.agent_infos()));
     let reason: String = loop {
         tokio::select! {
             maybe_event = ev_rx.recv() => {
@@ -422,7 +433,42 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             dirty = true;
                         }
                     }
+                    Event::SubscribeConnected { id, write_half } => {
+                        let mut rx = roster_tx.subscribe();
+                        let epoch = server_epoch.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut w = write_half;
+                            if write_msg(
+                                &mut w,
+                                &crate::protocol::ServerHello::Ok {
+                                    protocol_version: crate::protocol::PROTOCOL_VERSION,
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                            loop {
+                                let agents: Vec<crate::protocol::AgentInfo> =
+                                    (*rx.borrow_and_update().clone()).clone();
+                                if write_msg(&mut w, &ServerMsg::Agents { epoch: epoch.clone(), agents })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                if rx.changed().await.is_err() {
+                                    return; // sender dropped: server teardown
+                                }
+                            }
+                        });
+                        subscribers.insert(id, handle);
+                    }
                     Event::ClientGone(id) => {
+                        if let Some(handle) = subscribers.remove(&id) {
+                            handle.abort();
+                        }
                         remove_client(&mut clients, &mut foreground, &mut session, &mut dirty, id);
                         // If the departing client owned copy mode, clear the owner
                         // and exit copy mode so the session is not permanently
@@ -590,6 +636,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 {
                     crate::sound::play_blocked(&keymap.sound);
                 }
+                let infos = session.agent_infos();
+                if **roster_tx.borrow() != infos {
+                    let _ = roster_tx.send(Arc::new(infos));
+                }
             }
         }
     };
@@ -598,6 +648,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // drop the watch senders (by dropping the client entries), then await the writer
     // handles under one aggregate timeout so `Closed` is actually flushed. The biased
     // writer select guarantees `Closed` is written before the watch-closed exit.
+    for (_, handle) in subscribers.drain() {
+        handle.abort();
+    }
     let writers = close_all(&mut clients, &reason);
     let _ = timeout(TEARDOWN_TIMEOUT, async {
         for w in writers {
@@ -1388,8 +1441,16 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                 // empty/garbage/non-command frame: close without replying
             }
             Intent::Subscribe => {
-                // Push channel: implemented by a later task; close without replying
-                // for now (subscribers see EOF and can retry).
+                if ev_tx
+                    .send(Event::SubscribeConnected { id, write_half })
+                    .is_err()
+                {
+                    return;
+                }
+                // Reader half: a Subscribe client sends nothing; wait for EOF so we
+                // can signal cleanup (any messages received are ignored).
+                while let Ok(Some(_)) = read_msg::<_, ClientMsg>(&mut read_half).await {}
+                let _ = ev_tx.send(Event::ClientGone(id));
             }
             Intent::Attach { cols, rows } => {
                 if write_msg(
