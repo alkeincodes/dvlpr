@@ -121,6 +121,10 @@ pub const COMMAND_ROWS: &[(&str, &str)] = &[
         "SSH to <dest> and run dvlpr there",
     ),
     (
+        "dvlpr bridge [@session]",
+        "agent bridge (NDJSON over stdio) for remote consumers",
+    ),
+    (
         "dvlpr server [name]",
         "Internal daemon entrypoint (spawned for you)",
     ),
@@ -370,6 +374,7 @@ mod tests {
             "dvlpr ls",
             "stop -t",
             "ssh",
+            "bridge",
             "server",
         ] {
             assert!(

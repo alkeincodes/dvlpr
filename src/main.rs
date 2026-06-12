@@ -48,6 +48,7 @@ async fn main() {
             }
             std::process::exit(dvlpr::update::error_to_exit(outcome));
         }
+        Cmd::Bridge { session } => run_bridge(session).await,
         Cmd::Control(args) => {
             std::process::exit(dvlpr::control::run(&args).await);
         }
@@ -89,6 +90,9 @@ enum Cmd {
         destination: String,
         session: Option<String>,
     },
+    /// `dvlpr bridge [@name|name]` — NDJSON agent bridge over stdio (driven by
+    /// remote consumers via `ssh host dvlpr bridge`; works identically locally).
+    Bridge { session: Option<String> },
     /// `dvlpr -h` / `dvlpr --help` / `dvlpr help` — print command list (exit 0)
     Help,
     /// `dvlpr --version` / `-V` — prints `dvlpr <CARGO_PKG_VERSION> (<DVLPR_TARGET>)`.
@@ -179,6 +183,13 @@ fn parse_args(args: &[String]) -> Cmd {
             },
             _ => Cmd::Usage("usage: dvlpr ssh <destination> [session]".into()),
         },
+        Some("bridge") => match &args[1..] {
+            [] => Cmd::Bridge { session: None },
+            [s] => Cmd::Bridge {
+                session: Some(s.strip_prefix('@').unwrap_or(s).to_string()),
+            },
+            _ => Cmd::Usage("usage: dvlpr bridge [@session]".into()),
+        },
         Some("update") => {
             use dvlpr::update::RestartPref;
             let rest = &args[1..];
@@ -262,6 +273,18 @@ fn run_ssh(destination: &str, session: Option<&str>) -> std::io::Result<()> {
     // `exec` returns only on failure; surface ssh-not-found etc. as an error so
     // main()'s `Err` path prints it and exits non-zero.
     Err(std::io::Error::other(format!("failed to exec ssh: {err}")))
+}
+
+/// `dvlpr bridge [@session]` — NDJSON agent bridge over stdio. Validates the
+/// optional session filter (mirrors the ssh wrapper's validation), then runs
+/// the bridge loop until stdin EOF.
+async fn run_bridge(session: Option<String>) -> std::io::Result<()> {
+    if let Some(s) = &session {
+        socket::validate_session_name(s)?;
+    }
+    let dir = socket::runtime_dir();
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    dvlpr::bridge::run(dir, stdin, tokio::io::stdout(), session).await
 }
 
 /// Foreground daemon (the process spawned by `spawn_detached_server`).
@@ -678,5 +701,32 @@ mod tests {
     fn control_is_allowed_inside_a_session() {
         let c = Cmd::Control(v(&["pane", "zoom"]));
         assert_eq!(nested_block(&c, Some("parent")), None);
+    }
+
+    #[test]
+    fn parses_bridge_command() {
+        assert_eq!(parse_args(&v(&["bridge"])), Cmd::Bridge { session: None });
+        assert_eq!(
+            parse_args(&v(&["bridge", "@work"])),
+            Cmd::Bridge {
+                session: Some("work".into())
+            }
+        );
+        assert_eq!(
+            parse_args(&v(&["bridge", "work"])),
+            Cmd::Bridge {
+                session: Some("work".into())
+            }
+        );
+        assert!(matches!(
+            parse_args(&v(&["bridge", "a", "b"])),
+            Cmd::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn bridge_is_allowed_inside_a_session() {
+        let b = Cmd::Bridge { session: None };
+        assert_eq!(nested_block(&b, Some("parent")), None);
     }
 }
