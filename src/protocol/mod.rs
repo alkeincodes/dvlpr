@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Bumped whenever the wire format changes. Client and server must match exactly.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Reject oversized frames to bound memory.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -31,8 +31,12 @@ pub enum Intent {
     /// `dvlpr stop` sends `false` (graceful stop still deletes the snapshot).
     Kill { keep_snapshot: bool },
     /// One-shot control command: the server applies it, replies `CommandReply`,
-    /// and closes. No attach. (Appended last to keep discriminants stable.)
+    /// and closes. No attach.
     Command,
+    /// Long-lived push channel: the server replies `ServerHello::Ok`, then
+    /// streams `ServerMsg::Agents` roster snapshots (on connect + on change).
+    /// (Appended last to keep discriminants stable.)
+    Subscribe,
 }
 
 /// Reply to an `Intent::Status` request.
@@ -75,8 +79,41 @@ pub enum ClientMsg {
         cols: u16,
         rows: u16,
     },
-    /// A one-shot control command (see `Intent::Command`).
-    Command(ControlCommand),
+    /// One-shot control command envelope. `epoch`: when Some, the server
+    /// validates it against its own startup epoch BEFORE applying — closing
+    /// the daemon-restart race for pane-id targeting. None (the local control
+    /// CLI's path) skips the check: a human is acting on live state.
+    Command {
+        cmd: ControlCommand,
+        epoch: Option<String>,
+    },
+}
+
+/// Named keys for `PaneKey` — answering approval prompts in agent TUIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NamedKey {
+    Enter,
+    Esc,
+    Up,
+    Down,
+    Tab,
+    Digit(u8),
+    Char(char),
+}
+
+impl NamedKey {
+    /// The raw byte sequence a terminal would send for this key.
+    pub fn bytes(self) -> Vec<u8> {
+        match self {
+            NamedKey::Enter => b"\r".to_vec(),
+            NamedKey::Esc => b"\x1b".to_vec(),
+            NamedKey::Up => b"\x1b[A".to_vec(),
+            NamedKey::Down => b"\x1b[B".to_vec(),
+            NamedKey::Tab => b"\t".to_vec(),
+            NamedKey::Digit(d) => vec![b'0' + (d % 10)],
+            NamedKey::Char(c) => c.to_string().into_bytes(),
+        }
+    }
 }
 
 /// Direction for a pane split, mirroring the in-session keybindings:
@@ -96,17 +133,38 @@ pub enum ControlCommand {
     WindowNew {
         name: Option<String>,
     },
-    WindowRename(String),
-    WindowClose,
+    /// `window`: 0-based target; None = active window (CLI path).
+    WindowRename {
+        window: Option<usize>,
+        name: String,
+    },
+    WindowClose {
+        window: Option<usize>,
+    },
     WindowNext,
     WindowPrev,
-    /// 1-based, wire-compact. The server range-validates then casts to `usize`
-    /// for `config::Command::SelectWindow(usize)`.
+    /// 1-based, wire-compact (pre-existing; the bridge converts 0-based JSON).
+    /// The server range-validates then casts to `usize` for
+    /// `config::Command::SelectWindow(usize)`.
     WindowSelect(u8),
-    PaneSplit(SplitDir),
+    PaneSplit {
+        window: Option<usize>,
+        dir: SplitDir,
+    },
     PaneClose,
     PaneZoom,
     SidebarToggle,
+    /// Targeted by pane id (stable within one daemon lifetime; epoch guards
+    /// cross-restart staleness). Writes bracketed-pasted text to the PTY.
+    PaneSend {
+        pane: u64,
+        text: String,
+        submit: bool,
+    },
+    PaneKey {
+        pane: u64,
+        key: NamedKey,
+    },
 }
 
 /// Reply to an `Intent::Command` request: sent once, then the connection closes.
@@ -128,6 +186,12 @@ pub enum ServerMsg {
     Detach,
     Closed {
         reason: String,
+    },
+    /// Roster snapshot for Subscribe clients (appended last for discriminant
+    /// stability). `epoch` identifies this daemon incarnation.
+    Agents {
+        epoch: String,
+        agents: Vec<AgentInfo>,
     },
 }
 
@@ -197,8 +261,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_version_is_six() {
-        assert_eq!(PROTOCOL_VERSION, 6);
+    fn protocol_version_is_seven() {
+        assert_eq!(PROTOCOL_VERSION, 7);
+    }
+
+    #[test]
+    fn v7_messages_round_trip_through_bincode() {
+        let cases = vec![
+            ClientMsg::Command {
+                cmd: ControlCommand::PaneSend {
+                    pane: 3,
+                    text: "fix the failing test".into(),
+                    submit: true,
+                },
+                epoch: Some("123-456".into()),
+            },
+            ClientMsg::Command {
+                cmd: ControlCommand::PaneKey {
+                    pane: 3,
+                    key: NamedKey::Digit(1),
+                },
+                epoch: None,
+            },
+            ClientMsg::Command {
+                cmd: ControlCommand::WindowRename {
+                    window: Some(2),
+                    name: "api".into(),
+                },
+                epoch: None,
+            },
+            ClientMsg::Command {
+                cmd: ControlCommand::WindowClose { window: None },
+                epoch: None,
+            },
+            ClientMsg::Command {
+                cmd: ControlCommand::PaneSplit {
+                    window: Some(0),
+                    dir: SplitDir::Right,
+                },
+                epoch: None,
+            },
+        ];
+        for c in cases {
+            let bytes = encode(&c).unwrap();
+            assert_eq!(c, decode::<ClientMsg>(&bytes).unwrap());
+        }
+        let hello = ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            intent: Intent::Subscribe,
+        };
+        assert_eq!(
+            hello,
+            decode::<ClientHello>(&encode(&hello).unwrap()).unwrap()
+        );
+        let agents = ServerMsg::Agents {
+            epoch: "e1".into(),
+            agents: vec![],
+        };
+        assert_eq!(
+            agents,
+            decode::<ServerMsg>(&encode(&agents).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn named_key_maps_to_terminal_bytes() {
+        assert_eq!(NamedKey::Enter.bytes(), b"\r".to_vec());
+        assert_eq!(NamedKey::Esc.bytes(), b"\x1b".to_vec());
+        assert_eq!(NamedKey::Up.bytes(), b"\x1b[A".to_vec());
+        assert_eq!(NamedKey::Down.bytes(), b"\x1b[B".to_vec());
+        assert_eq!(NamedKey::Tab.bytes(), b"\t".to_vec());
+        assert_eq!(NamedKey::Digit(2).bytes(), b"2".to_vec());
+        assert_eq!(NamedKey::Char('y').bytes(), b"y".to_vec());
     }
 
     #[test]
@@ -303,20 +437,30 @@ mod tests {
 
     #[test]
     fn control_command_roundtrips_through_frame_codec() {
+        let env = |cmd: ControlCommand| ClientMsg::Command { cmd, epoch: None };
         let cmds = vec![
-            ClientMsg::Command(ControlCommand::WindowNew {
+            env(ControlCommand::WindowNew {
                 name: Some("api".into()),
             }),
-            ClientMsg::Command(ControlCommand::WindowRename("db".into())),
-            ClientMsg::Command(ControlCommand::WindowClose),
-            ClientMsg::Command(ControlCommand::WindowNext),
-            ClientMsg::Command(ControlCommand::WindowPrev),
-            ClientMsg::Command(ControlCommand::WindowSelect(3)),
-            ClientMsg::Command(ControlCommand::PaneSplit(SplitDir::Right)),
-            ClientMsg::Command(ControlCommand::PaneSplit(SplitDir::Down)),
-            ClientMsg::Command(ControlCommand::PaneClose),
-            ClientMsg::Command(ControlCommand::PaneZoom),
-            ClientMsg::Command(ControlCommand::SidebarToggle),
+            env(ControlCommand::WindowRename {
+                window: None,
+                name: "db".into(),
+            }),
+            env(ControlCommand::WindowClose { window: None }),
+            env(ControlCommand::WindowNext),
+            env(ControlCommand::WindowPrev),
+            env(ControlCommand::WindowSelect(3)),
+            env(ControlCommand::PaneSplit {
+                window: None,
+                dir: SplitDir::Right,
+            }),
+            env(ControlCommand::PaneSplit {
+                window: None,
+                dir: SplitDir::Down,
+            }),
+            env(ControlCommand::PaneClose),
+            env(ControlCommand::PaneZoom),
+            env(ControlCommand::SidebarToggle),
         ];
         for c in cmds {
             let bytes = encode(&c).unwrap();

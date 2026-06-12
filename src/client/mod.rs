@@ -186,7 +186,13 @@ pub async fn send_kill(socket_path: &Path, keep_snapshot: bool) -> io::Result<()
 /// Send a single control command to a running session and return its reply.
 /// Connection failure (no daemon) surfaces as the underlying `io::Error`; a
 /// clean EOF before a reply means the daemon predates the control protocol.
-pub async fn send_command(socket_path: &Path, cmd: ControlCommand) -> io::Result<CommandReply> {
+/// `epoch`: forwarded in the envelope; None skips daemon-side staleness
+/// validation (interactive CLI path).
+pub async fn send_command(
+    socket_path: &Path,
+    cmd: ControlCommand,
+    epoch: Option<String>,
+) -> io::Result<CommandReply> {
     let stream = UnixStream::connect(socket_path).await?;
     let (mut read_half, mut write_half) = stream.into_split();
     write_msg(
@@ -197,7 +203,7 @@ pub async fn send_command(socket_path: &Path, cmd: ControlCommand) -> io::Result
         },
     )
     .await?;
-    write_msg(&mut write_half, &ClientMsg::Command(cmd)).await?;
+    write_msg(&mut write_half, &ClientMsg::Command { cmd, epoch }).await?;
     read_msg::<_, CommandReply>(&mut read_half)
         .await?
         .ok_or_else(|| {
@@ -227,6 +233,9 @@ async fn run_loop(
                     }
                     let _ = stdout.flush().await;
                 }
+                // Agents is a Subscribe-channel message; on an attach stream it is
+                // unexpected — ignore it rather than tearing down the client.
+                Ok(Some(ServerMsg::Agents { .. })) => {}
                 Ok(Some(ServerMsg::Detach)) | Ok(Some(ServerMsg::Closed { .. })) | Ok(None) => {
                     break
                 }

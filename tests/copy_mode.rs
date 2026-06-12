@@ -117,6 +117,7 @@ async fn collect_bytes(r: &mut Reader, secs: u64) -> Vec<u8> {
     {
         match msg {
             ServerMsg::Frame { data, .. } => out.extend_from_slice(&data),
+            ServerMsg::Agents { .. } => {}
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
         }
     }
@@ -139,6 +140,7 @@ async fn collect_bytes_until(r: &mut Reader, secs: u64, needle: &[u8]) -> (bool,
                     return (true, out);
                 }
             }
+            ServerMsg::Agents { .. } => {}
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
         }
     }

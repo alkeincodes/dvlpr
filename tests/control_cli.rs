@@ -87,6 +87,7 @@ async fn window_new_increases_window_count() {
         ControlCommand::WindowNew {
             name: Some("api".into()),
         },
+        None,
     )
     .await
     .unwrap();
@@ -128,17 +129,23 @@ async fn pane_split_then_close_is_accepted() {
 
     // A fresh daemon starts with 1 pane. PaneSplit → 2 panes; PaneClose → 1 pane.
     // We never drop to 0, so the daemon stays alive throughout.
-    let split_reply =
-        dvlpr::client::send_command(&path, ControlCommand::PaneSplit(SplitDir::Right))
-            .await
-            .unwrap();
+    let split_reply = dvlpr::client::send_command(
+        &path,
+        ControlCommand::PaneSplit {
+            window: None,
+            dir: SplitDir::Right,
+        },
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         split_reply.ok,
         "PaneSplit(Right) should reply ok=true; message={:?}",
         split_reply.message
     );
 
-    let close_reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose)
+    let close_reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose, None)
         .await
         .unwrap();
     assert!(
@@ -162,7 +169,7 @@ async fn closing_last_pane_via_control_is_refused() {
 
     // The daemon starts with exactly 1 pane. Attempting to close it should be
     // refused (ok=false) — the session must never be emptied via a control command.
-    let reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose)
+    let reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose, None)
         .await
         .expect("reply must arrive");
     assert!(
@@ -191,9 +198,10 @@ async fn closing_last_window_via_control_is_refused() {
     let path = spawn_session(dir, "solo-win");
     wait_for_socket(&path).await;
 
-    let reply = dvlpr::client::send_command(&path, ControlCommand::WindowClose)
-        .await
-        .expect("reply must arrive");
+    let reply =
+        dvlpr::client::send_command(&path, ControlCommand::WindowClose { window: None }, None)
+            .await
+            .expect("reply must arrive");
     assert!(
         !reply.ok,
         "closing the last window via control should be refused (ok=false), got {reply:?}"
@@ -218,7 +226,7 @@ async fn command_to_missing_session_errors_cleanly() {
     let bogus_path = socket::socket_path_in(tmp.path(), "nope");
     // No daemon is listening on bogus_path.
 
-    let err = dvlpr::client::send_command(&bogus_path, ControlCommand::PaneZoom)
+    let err = dvlpr::client::send_command(&bogus_path, ControlCommand::PaneZoom, None)
         .await
         .unwrap_err();
 
@@ -245,17 +253,23 @@ async fn closing_non_last_pane_via_control_succeeds() {
     wait_for_socket(&path).await;
 
     // Split to get 2 panes, then close one — should be accepted.
-    let split_reply =
-        dvlpr::client::send_command(&path, ControlCommand::PaneSplit(SplitDir::Right))
-            .await
-            .unwrap();
+    let split_reply = dvlpr::client::send_command(
+        &path,
+        ControlCommand::PaneSplit {
+            window: None,
+            dir: SplitDir::Right,
+        },
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         split_reply.ok,
         "PaneSplit(Right) should reply ok=true; message={:?}",
         split_reply.message
     );
 
-    let close_reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose)
+    let close_reply = dvlpr::client::send_command(&path, ControlCommand::PaneClose, None)
         .await
         .unwrap();
     assert!(
@@ -291,6 +305,7 @@ async fn closing_non_last_window_via_control_succeeds() {
         ControlCommand::WindowNew {
             name: Some("extra".into()),
         },
+        None,
     )
     .await
     .unwrap();
@@ -308,9 +323,10 @@ async fn closing_non_last_window_via_control_succeeds() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let close_reply = dvlpr::client::send_command(&path, ControlCommand::WindowClose)
-        .await
-        .unwrap();
+    let close_reply =
+        dvlpr::client::send_command(&path, ControlCommand::WindowClose { window: None }, None)
+            .await
+            .unwrap();
     assert!(
         close_reply.ok,
         "WindowClose (non-last) should reply ok=true; message={:?}",

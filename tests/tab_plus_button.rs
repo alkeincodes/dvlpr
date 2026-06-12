@@ -75,6 +75,7 @@ async fn collect_frames(r: &mut Reader, secs: u64) -> Vec<Vec<u8>> {
     {
         match msg {
             ServerMsg::Frame { data, .. } => out.push(data),
+            ServerMsg::Agents { .. } => {}
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
         }
     }
@@ -98,6 +99,7 @@ async fn until_frame_contains(r: &mut Reader, secs: u64, needle: &[u8]) -> bool 
                     return true;
                 }
             }
+            ServerMsg::Agents { .. } => {}
             ServerMsg::Detach | ServerMsg::Closed { .. } => break,
         }
     }

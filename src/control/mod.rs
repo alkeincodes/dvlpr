@@ -67,18 +67,25 @@ fn parse_command(args: &[String]) -> Parsed {
             }),
             _ => usage("usage: dvlpr window new [--name NAME]"),
         },
-        ["window", "rename", name] => {
-            Parsed::Cmd(ControlCommand::WindowRename((*name).to_string()))
-        }
-        ["window", "close"] => Parsed::Cmd(ControlCommand::WindowClose),
+        ["window", "rename", name] => Parsed::Cmd(ControlCommand::WindowRename {
+            window: None,
+            name: (*name).to_string(),
+        }),
+        ["window", "close"] => Parsed::Cmd(ControlCommand::WindowClose { window: None }),
         ["window", "next"] => Parsed::Cmd(ControlCommand::WindowNext),
         ["window", "prev"] => Parsed::Cmd(ControlCommand::WindowPrev),
         ["window", "select", n] => match n.parse::<u8>() {
             Ok(v) if v >= 1 => Parsed::Cmd(ControlCommand::WindowSelect(v)),
             _ => usage("window select expects a positive number (1-based)"),
         },
-        ["pane", "split", "right"] => Parsed::Cmd(ControlCommand::PaneSplit(SplitDir::Right)),
-        ["pane", "split", "down"] => Parsed::Cmd(ControlCommand::PaneSplit(SplitDir::Down)),
+        ["pane", "split", "right"] => Parsed::Cmd(ControlCommand::PaneSplit {
+            window: None,
+            dir: SplitDir::Right,
+        }),
+        ["pane", "split", "down"] => Parsed::Cmd(ControlCommand::PaneSplit {
+            window: None,
+            dir: SplitDir::Down,
+        }),
         ["pane", "close"] => Parsed::Cmd(ControlCommand::PaneClose),
         ["pane", "zoom"] => Parsed::Cmd(ControlCommand::PaneZoom),
         ["sidebar", "toggle"] => Parsed::Cmd(ControlCommand::SidebarToggle),
@@ -108,7 +115,7 @@ pub async fn run(args: &[String]) -> i32 {
     let dir = crate::server::socket::runtime_dir();
     let socket_path = crate::server::socket::socket_path_in(&dir, &session);
 
-    match crate::client::send_command(&socket_path, cmd).await {
+    match crate::client::send_command(&socket_path, cmd, None).await {
         Ok(reply) if reply.ok => 0,
         Ok(reply) => {
             eprintln!(
@@ -156,11 +163,14 @@ mod tests {
         );
         assert_eq!(
             parse(&["window", "rename", "db"]),
-            Parsed::Cmd(ControlCommand::WindowRename("db".into()))
+            Parsed::Cmd(ControlCommand::WindowRename {
+                window: None,
+                name: "db".into()
+            })
         );
         assert_eq!(
             parse(&["window", "close"]),
-            Parsed::Cmd(ControlCommand::WindowClose)
+            Parsed::Cmd(ControlCommand::WindowClose { window: None })
         );
         assert_eq!(
             parse(&["window", "next"]),
@@ -176,11 +186,17 @@ mod tests {
         );
         assert_eq!(
             parse(&["pane", "split", "right"]),
-            Parsed::Cmd(ControlCommand::PaneSplit(SplitDir::Right))
+            Parsed::Cmd(ControlCommand::PaneSplit {
+                window: None,
+                dir: SplitDir::Right
+            })
         );
         assert_eq!(
             parse(&["pane", "split", "down"]),
-            Parsed::Cmd(ControlCommand::PaneSplit(SplitDir::Down))
+            Parsed::Cmd(ControlCommand::PaneSplit {
+                window: None,
+                dir: SplitDir::Down
+            })
         );
         assert_eq!(
             parse(&["pane", "close"]),

@@ -168,8 +168,11 @@ enum Event {
     /// A management client asked for session status (answered without attaching).
     StatusRequest(oneshot::Sender<StatusInfo>),
     /// A control client asked to apply a `ControlCommand` (answered without attaching).
+    /// `epoch`: optional staleness token from the envelope; validated against the
+    /// daemon's startup epoch BEFORE the command is applied (None always passes).
     ControlCommand {
         cmd: crate::protocol::ControlCommand,
+        epoch: Option<String>,
         reply: oneshot::Sender<crate::protocol::CommandReply>,
     },
     /// A management client (or `kill`) asked the daemon to shut down.
@@ -314,6 +317,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let sound_debouncer = crate::sound::SoundDebouncer::new();
 
     let mut keep_snapshot_on_exit = false;
+    // This daemon incarnation's epoch: validated against command envelopes so
+    // pane-id-targeted commands can never land on a restarted daemon's panes.
+    let server_epoch = make_epoch();
     let reason: String = loop {
         tokio::select! {
             maybe_event = ev_rx.recv() => {
@@ -456,8 +462,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                             clients: clients.len() as u32,
                         });
                     }
-                    Event::ControlCommand { cmd, reply } => {
-                        let result = apply_control_command(&mut session, cmd, &ev_tx, &mut dirty);
+                    Event::ControlCommand { cmd, epoch, reply } => {
+                        let result = if epoch_ok(&server_epoch, epoch.as_deref()) {
+                            apply_control_command(&mut session, cmd, &ev_tx, &mut dirty)
+                        } else {
+                            crate::protocol::CommandReply {
+                                ok: false,
+                                message: Some("stale_target".into()),
+                            }
+                        };
                         let _ = reply.send(result);
                         // window-switch/close via the control CLI calls exit_copy_mode
                         // inside apply_command; reconcile the owner immediately so the
@@ -601,6 +614,21 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         crate::persist::delete(&crate::persist::snapshot_path(&config.session));
     }
     Ok(())
+}
+
+/// Per-daemon-run incarnation token (spec §1.1). pid + boot nanos — no uuid dep.
+fn make_epoch() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+/// Authoritative staleness check, run in the central loop BEFORE applying any
+/// command. None (local CLI) always passes.
+fn epoch_ok(server_epoch: &str, supplied: Option<&str>) -> bool {
+    supplied.is_none_or(|e| e == server_epoch)
 }
 
 /// Promote `id` to foreground: bump its activity stamp and point `foreground` at it.
@@ -759,12 +787,32 @@ fn apply_control_command(
     let mut eff = crate::session::CommandEffect::default();
 
     let reply = match cmd {
-        C::PaneSplit(SplitDir::Right) => {
+        C::PaneSplit {
+            window: None,
+            dir: SplitDir::Right,
+        } => {
             eff = session.apply_command(Command::SplitVertical);
             ok()
         }
-        C::PaneSplit(SplitDir::Down) => {
+        C::PaneSplit {
+            window: None,
+            dir: SplitDir::Down,
+        } => {
             eff = session.apply_command(Command::SplitHorizontal);
+            ok()
+        }
+        C::PaneSplit {
+            window: Some(w),
+            dir,
+        } => {
+            if w >= session.window_count() {
+                return err(format!("window {w} out of range"));
+            }
+            let ldir = match dir {
+                SplitDir::Right => crate::layout::SplitDir::Vertical,
+                SplitDir::Down => crate::layout::SplitDir::Horizontal,
+            };
+            session.split_in_window(w, ldir, &mut eff);
             ok()
         }
         C::PaneClose => {
@@ -806,22 +854,29 @@ fn apply_control_command(
             eff = session.new_named_window(name);
             ok()
         }
-        C::WindowRename(name) => {
-            if session.window_count() == 0 {
-                err("no active window to rename".into())
-            } else {
-                session.rename_active_window(name);
+        C::WindowRename { window, name } => match session.rename_window_at(window, name) {
+            Ok(()) => ok(),
+            Err(m) => return err(m),
+        },
+        C::WindowClose { window } => match session.close_window_at(window) {
+            Ok(closed) => {
+                eff.closed = closed;
                 ok()
             }
-        }
-        C::WindowClose => {
-            if session.window_count() == 0 {
-                err("no active window to close".into())
-            } else if session.window_count() == 1 {
-                err("cannot close the last window via control; use 'dvlpr stop' to stop the session".into())
-            } else {
-                eff.closed = session.close_active_window();
+            Err(m) => return err(m),
+        },
+        C::PaneSend { pane, text, submit } => {
+            if session.send_text_to_pane(pane, &text, submit) {
                 ok()
+            } else {
+                return err(format!("no pane {pane}"));
+            }
+        }
+        C::PaneKey { pane, key } => {
+            if session.write_to_pane(pane, &key.bytes()) {
+                ok()
+            } else {
+                return err(format!("no pane {pane}"));
             }
         }
     };
@@ -1312,12 +1367,16 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                 let _ = ev_tx.send(Event::Shutdown { keep_snapshot });
             }
             Intent::Command => {
-                if let Ok(Some(ClientMsg::Command(cmd))) =
+                if let Ok(Some(ClientMsg::Command { cmd, epoch })) =
                     read_msg::<_, ClientMsg>(&mut read_half).await
                 {
                     let (tx, rx) = oneshot::channel();
                     if ev_tx
-                        .send(Event::ControlCommand { cmd, reply: tx })
+                        .send(Event::ControlCommand {
+                            cmd,
+                            epoch,
+                            reply: tx,
+                        })
                         .is_err()
                     {
                         return;
@@ -1327,6 +1386,10 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                     }
                 }
                 // empty/garbage/non-command frame: close without replying
+            }
+            Intent::Subscribe => {
+                // Push channel: implemented by a later task; close without replying
+                // for now (subscribers see EOF and can retry).
             }
             Intent::Attach { cols, rows } => {
                 if write_msg(
@@ -1361,7 +1424,7 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
                         Ok(Some(ClientMsg::Resize { cols, rows })) => {
                             let _ = ev_tx.send(Event::ClientResize { id, cols, rows });
                         }
-                        Ok(Some(ClientMsg::Command(_))) => {
+                        Ok(Some(ClientMsg::Command { .. })) => {
                             // A control command on an attach stream is unexpected — the
                             // control CLI uses a dedicated `Intent::Command` connection.
                             // Ignore it.
@@ -1378,6 +1441,14 @@ fn spawn_client(id: ClientId, stream: UnixStream, ev_tx: mpsc::UnboundedSender<E
 #[cfg(test)]
 mod control_tests {
     use super::*;
+
+    #[test]
+    fn epoch_ok_accepts_none_and_exact_match_only() {
+        assert!(epoch_ok("a-1", None));
+        assert!(epoch_ok("a-1", Some("a-1")));
+        assert!(!epoch_ok("a-1", Some("b-2")));
+        assert!(!epoch_ok("a-1", Some("")));
+    }
 
     #[test]
     fn emit_variant_carries_raw_bytes() {
