@@ -846,6 +846,11 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub fn window_name_for_test(&self, idx: usize) -> String {
+        self.windows[idx].name.clone()
+    }
+
+    #[cfg(test)]
     pub fn dialog_insert_for_test(&mut self, c: char) {
         if let Some(d) = self.dialog.as_mut() {
             d.insert_char(c);
@@ -951,6 +956,41 @@ impl Session {
     /// Rename the active window (set + pin). Empty name reverts to the auto-namer.
     pub fn rename_active_window(&mut self, name: String) {
         self.set_window_name(self.active_window, name);
+    }
+
+    /// Rename window `idx` (None = active). Delegates to `set_window_name`, so
+    /// the pin semantics (empty name = un-pin + auto-name refresh) are identical
+    /// to the rename dialog and active-window rename.
+    pub fn rename_window_at(&mut self, idx: Option<usize>, name: String) -> Result<(), String> {
+        let i = idx.unwrap_or(self.active_window);
+        if i >= self.windows.len() {
+            return Err(format!(
+                "window {i} out of range (0..{})",
+                self.windows.len()
+            ));
+        }
+        self.set_window_name(i, name);
+        Ok(())
+    }
+
+    /// Close window `idx` (None = active) WITHOUT selecting it first. Delegates
+    /// to the same `close_window` the tab menu uses (which already handles
+    /// active-index adjustment). Refuses to close the last window.
+    pub fn close_window_at(&mut self, idx: Option<usize>) -> Result<Vec<PaneRuntime>, String> {
+        let i = idx.unwrap_or(self.active_window);
+        if i >= self.windows.len() {
+            return Err(format!(
+                "window {i} out of range (0..{})",
+                self.windows.len()
+            ));
+        }
+        if self.windows.len() == 1 {
+            return Err(
+                "cannot close the last window via control; use 'dvlpr stop' to stop the session"
+                    .into(),
+            );
+        }
+        Ok(self.close_window(i))
     }
 
     /// Close the active window, returning the removed `PaneRuntime`s for the caller
@@ -1852,7 +1892,19 @@ impl Session {
     }
 
     fn split_focused(&mut self, dir: SplitDir, eff: &mut CommandEffect) {
-        let wi = self.active_window;
+        self.split_in_window(self.active_window, dir, eff);
+    }
+
+    /// Split the focused pane of window `window` (not necessarily the active
+    /// window). Out-of-range `window` is a silent no-op (`eff` stays empty);
+    /// callers report the error before calling.
+    pub(crate) fn split_in_window(
+        &mut self,
+        window: usize,
+        dir: SplitDir,
+        eff: &mut CommandEffect,
+    ) {
+        let wi = window;
         let Some(win) = self.windows.get(wi) else {
             return;
         };
@@ -1892,7 +1944,7 @@ impl Session {
         let split_ok = layout::split_pane(&mut self.windows[wi].root, focused, dir, new_id);
         debug_assert!(
             split_ok,
-            "split_focused: focused leaf {focused} vanished between lookup and split"
+            "split_in_window: focused leaf {focused} vanished between lookup and split"
         );
         self.windows[wi].focused = new_id;
         self.relayout_all();
@@ -7712,5 +7764,60 @@ mod tests {
             kind: MouseKind::ScrollDown,
         });
         assert_eq!(session.copy_mode_scroll_offset_for_test(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn rename_window_at_targets_index_and_pins_name() {
+        let (mut session, _pane_id, _rx) = build_session_with_one_pane().await;
+        let _ = session.new_named_window(Some("w2".into())); // active is now 1
+        session
+            .rename_window_at(Some(0), "api".to_string())
+            .unwrap();
+        assert_eq!(session.window_name_for_test(0), "api");
+        assert_eq!(session.active_window_index(), 1, "active window unchanged");
+        assert!(session.rename_window_at(Some(5), "x".into()).is_err());
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_window_at_removes_nonactive_window_and_keeps_active() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        let _ = session.new_named_window(Some("w2".into()));
+        let _ = session.new_named_window(Some("w3".into())); // active = 2
+        let closed = session.close_window_at(Some(0)).unwrap();
+        assert_eq!(closed.len(), 1, "one pane runtime returned for teardown");
+        for rt in closed {
+            rt.close();
+        }
+        assert_eq!(session.window_count(), 2);
+        assert_eq!(
+            session.active_window_index(),
+            1,
+            "active index shifts down when a lower window closes"
+        );
+        // Last-window guard unchanged.
+        let _ = session.close_window_at(Some(0)).unwrap();
+        assert!(session.close_window_at(Some(0)).is_err());
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn split_in_window_splits_target_without_changing_active() {
+        let (mut session, _p, _rx) = build_session_with_one_pane().await;
+        let _ = session.new_named_window(Some("w2".into())); // active = 1
+        let mut eff = CommandEffect::default();
+        session.split_in_window(0, SplitDir::Vertical, &mut eff);
+        assert_eq!(eff.spawned.len(), 1, "one new pane spawned in window 0");
+        assert_eq!(session.active_window_index(), 1, "active window unchanged");
+        for (_, rx) in eff.spawned {
+            drop(rx);
+        }
+        for rt in session.shutdown() {
+            rt.close();
+        }
     }
 }
