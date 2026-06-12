@@ -1,4 +1,5 @@
 pub mod agent_meta;
+pub mod bridge;
 pub mod client;
 pub mod compositor;
 pub mod config;
