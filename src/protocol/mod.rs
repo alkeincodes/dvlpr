@@ -42,6 +42,26 @@ pub struct StatusInfo {
     pub clients: u32,
 }
 
+/// One agent pane's full roster entry, pushed to Subscribe clients. String
+/// `agent`/`state` (not the `detect` enums) keep this wire type serde-friendly
+/// for both bincode (socket) and JSON (bridge NDJSON) without touching
+/// `detect`. camelCase renames affect only JSON; bincode ignores field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInfo {
+    pub session: String,
+    pub window_index: usize, // 0-based
+    pub window_name: String,
+    pub pane_id: u64,
+    pub agent: String, // "claude" | "codex"
+    pub state: String, // "idle" | "working" | "blocked" | "done"
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    pub session_label: Option<String>,
+    pub agent_session_id: Option<String>, // from the pane's cached AgentResume
+    pub transcript: Option<String>,       // from the pane's cached AgentResume
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerHello {
     Ok { protocol_version: u32 },

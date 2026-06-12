@@ -2914,6 +2914,54 @@ impl Session {
         out
     }
 
+    /// Full roster for Subscribe clients: `agent_entries` plus window name, cwd,
+    /// and the cached `AgentResume` identity (NO new discovery — the cache is
+    /// maintained by `refresh_restore_meta` on the snapshot tick).
+    pub fn agent_infos(&self) -> Vec<crate::protocol::AgentInfo> {
+        let mut out = Vec::new();
+        for (wi, win) in self.windows.iter().enumerate() {
+            for pane_id in layout::all_panes(&win.root) {
+                let Some(pane) = self.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(agent) = pane.agent else { continue };
+                let (agent_session_id, transcript) = match &pane.agent_resume {
+                    crate::persist::AgentResume::None => (None, None),
+                    crate::persist::AgentResume::Claude {
+                        session_id,
+                        transcript,
+                    }
+                    | crate::persist::AgentResume::Codex {
+                        session_id,
+                        transcript,
+                    } => (Some(session_id.clone()), Some(transcript.clone())),
+                };
+                out.push(crate::protocol::AgentInfo {
+                    session: self.session_name.clone(),
+                    window_index: wi,
+                    window_name: win.name.clone(),
+                    pane_id,
+                    agent: match agent {
+                        detect::Agent::Claude => "claude".to_string(),
+                        detect::Agent::Codex => "codex".to_string(),
+                    },
+                    state: match pane.agent_state {
+                        detect::AgentState::Idle => "idle".to_string(),
+                        detect::AgentState::Working => "working".to_string(),
+                        detect::AgentState::Blocked => "blocked".to_string(),
+                        detect::AgentState::Done => "done".to_string(),
+                    },
+                    cwd: pane.cwd.clone(),
+                    branch: pane.branch.clone(),
+                    session_label: pane.session_label.clone(),
+                    agent_session_id,
+                    transcript,
+                });
+            }
+        }
+        out
+    }
+
     /// Recompute the dragged split's ratio from the pointer position and relayout.
     /// Operates on the explicit `window` the drag started in (not necessarily the
     /// active one). If that window is gone or the path no longer leads to a split,
@@ -4051,6 +4099,35 @@ mod tests {
         let outcome = session.refresh_agent_states(|_pid| Some("claude".to_string()));
         assert!(!outcome.changed);
         let _ = pane_id;
+    }
+
+    #[tokio::test]
+    async fn agent_infos_carries_full_metadata_from_pane_caches() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        session.feed(pane_id, b"esc to interrupt\n");
+        session.refresh_agent_states(|_pid| Some("claude".to_string()));
+        session.set_pane_agent_resume_for_test(
+            pane_id,
+            crate::persist::AgentResume::Claude {
+                session_id: "abc-123".into(),
+                transcript: "/tmp/t.jsonl".into(),
+            },
+        );
+
+        let infos = session.agent_infos();
+        assert_eq!(infos.len(), 1);
+        let i = &infos[0];
+        assert_eq!(i.session, "test");
+        assert_eq!(i.window_index, 0);
+        assert_eq!(i.pane_id, pane_id);
+        assert_eq!(i.agent, "claude");
+        assert_eq!(i.state, "working");
+        assert!(!i.window_name.is_empty());
+        assert_eq!(i.agent_session_id.as_deref(), Some("abc-123"));
+        assert_eq!(i.transcript.as_deref(), Some("/tmp/t.jsonl"));
+        for rt in session.shutdown() {
+            rt.close();
+        }
     }
 
     #[tokio::test]
