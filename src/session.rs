@@ -178,6 +178,20 @@ fn initial_window_name(command: &[String]) -> String {
     }
 }
 
+/// Wrap `text` in a bracketed paste (ESC[200~ … ESC[201~) so multi-line text
+/// is not interpreted as submissions by the receiving TUI; append CR if
+/// `submit`. Used by the targeted `PaneSend` control command.
+pub(crate) fn bracketed_paste(text: &str, submit: bool) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(text.len() + 16);
+    buf.extend_from_slice(b"\x1b[200~");
+    buf.extend_from_slice(text.as_bytes());
+    buf.extend_from_slice(b"\x1b[201~");
+    if submit {
+        buf.push(b'\r');
+    }
+    buf
+}
+
 /// Build the per-pane spawn argv for a resume. `None` → empty (default shell).
 /// The shell path is passed as argv[0] AND the trailing `$0` positional, and the
 /// `-c` string re-execs it via `exec "$0"` — no shell-path interpolation, no
@@ -1279,6 +1293,24 @@ impl Session {
                 pane.runtime.write_input(bytes);
             }
         }
+    }
+
+    /// Write raw bytes to ANY live pane's PTY by id — visible or not. Never
+    /// changes focus, window selection, or copy-mode state (those are per-client
+    /// view concerns). Returns false if the pane id is unknown.
+    pub fn write_to_pane(&self, pane: PaneId, bytes: &[u8]) -> bool {
+        match self.panes.get(&pane) {
+            Some(p) => {
+                p.runtime.write_input(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Bracketed-paste `text` into a pane's PTY, optionally submitting with CR.
+    pub fn send_text_to_pane(&self, pane: PaneId, text: &str, submit: bool) -> bool {
+        self.write_to_pane(pane, &bracketed_paste(text, submit))
     }
 
     /// Resize the viewport: recompute every pane's rect (across all windows) and
@@ -4746,6 +4778,47 @@ mod tests {
         session.refresh_agent_states(|_pid| Some("claude".to_string()));
         let entries = session.agent_entries();
         assert_eq!(entries[0].session_name, "test");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_text_and_appends_cr_when_submitting() {
+        assert_eq!(
+            bracketed_paste("hi", false),
+            b"\x1b[200~hi\x1b[201~".to_vec()
+        );
+        assert_eq!(
+            bracketed_paste("multi\nline", true),
+            b"\x1b[200~multi\nline\x1b[201~\r".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_to_pane_returns_false_for_unknown_pane() {
+        let (session, _pane_id, _rx) = build_session_with_one_pane().await;
+        assert!(!session.write_to_pane(9999, b"x"));
+        for rt in session.shutdown() {
+            rt.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn send_text_to_pane_targets_any_live_pane_without_focus() {
+        let (mut session, pane_id, _rx) = build_session_with_one_pane().await;
+        // Create a second window so `pane_id` is no longer in the ACTIVE window.
+        let eff = session.new_named_window(Some("other".into()));
+        for (id, rx) in eff.spawned {
+            drop((id, rx)); // forwarders are a server concern; unit test ignores output
+        }
+        assert_ne!(
+            session.focused_pane(),
+            pane_id,
+            "first pane must be unfocused"
+        );
+        // Targeted write succeeds even though the pane is not focused/visible.
+        assert!(session.send_text_to_pane(pane_id, "echo hi", true));
+        for rt in session.shutdown() {
+            rt.close();
+        }
     }
 
     #[tokio::test]
