@@ -341,3 +341,54 @@ async fn closing_non_last_window_via_control_succeeds() {
         s.windows
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 8: A stale epoch in the command envelope is rejected in the central
+// loop BEFORE the command is applied; epoch None (local CLI path) still works.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stale_epoch_is_rejected_before_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = spawn_session(tmp.path().to_path_buf(), "epoch");
+    wait_for_socket(&path).await;
+
+    let before = status(&path).await.windows;
+
+    // Pane-targeted command with a bogus epoch: rejected as stale.
+    let reply = dvlpr::client::send_command(
+        &path,
+        ControlCommand::PaneSend {
+            pane: 1,
+            text: "x".into(),
+            submit: false,
+        },
+        Some("bogus-epoch".into()),
+    )
+    .await
+    .unwrap();
+    assert!(!reply.ok);
+    assert_eq!(reply.message.as_deref(), Some("stale_target"));
+
+    // Window op with a bogus epoch: also rejected, and NOT applied.
+    let reply = dvlpr::client::send_command(
+        &path,
+        ControlCommand::WindowNew { name: None },
+        Some("bogus-epoch".into()),
+    )
+    .await
+    .unwrap();
+    assert!(!reply.ok);
+    assert_eq!(
+        status(&path).await.windows,
+        before,
+        "command must not apply"
+    );
+
+    // epoch None (local CLI path) is applied.
+    let reply = dvlpr::client::send_command(&path, ControlCommand::WindowNew { name: None }, None)
+        .await
+        .unwrap();
+    assert!(reply.ok);
+    assert_eq!(status(&path).await.windows, before + 1);
+}
