@@ -3314,6 +3314,161 @@ mod tests {
         s
     }
 
+    // DIAGNOSTIC: measure compose() + feed() cost at realistic terminal sizes.
+    // Run with: cargo test --release perf_compose_cost -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn perf_compose_cost() {
+        use std::time::Instant;
+
+        // Build a screenful of styled output: per row, position cursor, set a
+        // truecolor fg, then fill the row with text. Mimics a TUI redraw.
+        fn screenful(cols: u16, rows: u16) -> Vec<u8> {
+            let mut s = String::new();
+            for y in 0..rows {
+                s.push_str(&format!("\x1b[{};1H", y + 1));
+                let r = (y.wrapping_mul(7) % 200) as u8 + 30;
+                s.push_str(&format!("\x1b[38;2;{};{};{}m", r, 180, 220));
+                for x in 0..cols {
+                    let c = char::from(b'a' + ((x as u8).wrapping_add(y as u8) % 26));
+                    s.push(c);
+                }
+            }
+            s.push_str("\x1b[0m");
+            s.into_bytes()
+        }
+
+        // One line of plain text + a newline (grows scrollback by 1 row).
+        fn convo_line(cols: u16, i: usize) -> Vec<u8> {
+            let mut s = String::new();
+            let w = (cols as usize).saturating_sub(8).max(1);
+            s.push_str(&format!("\x1b[38;2;120;200;160m{i:>5}: "));
+            for x in 0..w {
+                s.push(char::from(b'a' + ((x + i) % 26) as u8));
+            }
+            s.push_str("\x1b[0m\r\n");
+            s.into_bytes()
+        }
+
+        // Test at a realistic large pane across increasing scrollback depth, to
+        // see whether per-cell grid-ref cost scales with conversation length.
+        let (cols, rows) = (200u16, 50u16);
+        for scrollback in [0usize, 2000, 10000, 50000] {
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let (mut session, pane_id, _rx) = Session::new(
+                "perf".to_string(),
+                vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                cwd,
+                cols,
+                rows,
+                crate::theme::Theme::default(),
+                crate::config::KeySpec::Ctrl('b'),
+                crate::config::KeyMap::default(),
+                crate::layout::SIDEBAR_WIDTH_DEFAULT,
+                scrollback,
+            )
+            .expect("session");
+            session.sidebar_visible = false;
+            session.relayout_all();
+
+            // Fill the scrollback as a long conversation would: emit `scrollback`
+            // lines so the page list is deep, then a final screenful.
+            let fill = scrollback.max(rows as usize) + rows as usize;
+            for i in 0..fill {
+                session.feed(pane_id, &convo_line(cols, i));
+            }
+            let frame = screenful(cols, rows);
+            session.feed(pane_id, &frame);
+
+            // Warm up.
+            for _ in 0..20 {
+                let _ = session.compose();
+            }
+
+            // Time compose() alone (the per-tick, loop-blocking cost).
+            let iters = 200;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let g = session.compose();
+                std::hint::black_box(&g);
+            }
+            let compose_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // Time feed() of a typical streaming chunk (re-paint one frame).
+            let t1 = Instant::now();
+            for _ in 0..iters {
+                session.feed(pane_id, &frame);
+            }
+            let feed_us = t1.elapsed().as_micros() as f64 / iters as f64;
+
+            eprintln!(
+                "[PERF] {cols}x{rows} scrollback={scrollback:>6}: compose={compose_us:>8.1}us  feed-1frame={feed_us:>7.1}us"
+            );
+        }
+
+        // ---- Frame-size / serialize cost pushed to the REAL terminal ----
+        // Simulate a Claude full-screen redraw: every row differs frame-to-frame.
+        // This is what the client must write()+flush() to the real terminal,
+        // potentially at up to 60fps.
+        {
+            use crate::compositor::{diff_rows, fit, serialize_full};
+            let cwd = std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let (mut session, pane_id, _rx) = Session::new(
+                "perf".to_string(),
+                vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                cwd,
+                cols,
+                rows,
+                crate::theme::Theme::default(),
+                crate::config::KeySpec::Ctrl('b'),
+                crate::config::KeyMap::default(),
+                crate::layout::SIDEBAR_WIDTH_DEFAULT,
+                2000,
+            )
+            .expect("session");
+            session.sidebar_visible = false;
+            session.relayout_all();
+
+            // Frame A.
+            session.feed(pane_id, &screenful(cols, rows));
+            let grid_a = fit(&session.compose(), cols, rows);
+            // Frame B: shift every row's content by one char so EVERY row differs
+            // (worst case, like a streaming redraw / scroll).
+            let mut shifted = String::new();
+            for y in 0..rows {
+                shifted.push_str(&format!("\x1b[{};1H", y + 1));
+                shifted.push_str("\x1b[38;2;200;120;160m");
+                for x in 0..cols {
+                    shifted.push(char::from(b'A' + ((x as u8).wrapping_add(y as u8) % 26)));
+                }
+            }
+            shifted.push_str("\x1b[0m");
+            session.feed(pane_id, shifted.as_bytes());
+            let grid_b = fit(&session.compose(), cols, rows);
+
+            let diff = diff_rows(&grid_a, &grid_b);
+            let full = serialize_full(&grid_b);
+
+            let iters = 500;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(diff_rows(&grid_a, &grid_b));
+            }
+            let diff_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            eprintln!(
+                "[PERF] frame bytes @ {cols}x{rows}: diff(all-rows-changed)={} bytes  full={} bytes  diff_rows()={diff_us:.1}us  -> at 60fps diff pushes {:.1} MB/s to the real terminal",
+                diff.len(), full.len(), diff.len() as f64 * 60.0 / 1_000_000.0
+            );
+        }
+    }
+
     /// Build a session with the given dimensions and scrollback for copy-mode tests.
     async fn copy_test_session(
         cols: u16,

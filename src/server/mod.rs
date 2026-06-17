@@ -320,6 +320,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut snapshot_tick = tokio::time::interval(Duration::from_secs(1));
     snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let snapshot_file = crate::persist::snapshot_path(&config.session);
+    // In-flight periodic snapshot write (offloaded to a blocking thread so its
+    // fsyncs never stall the central loop). At most one runs at a time.
+    let mut snapshot_writer: Option<tokio::task::JoinHandle<()>> = None;
     let sound_debouncer = crate::sound::SoundDebouncer::new();
 
     let mut keep_snapshot_on_exit = false;
@@ -331,10 +334,44 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut subscribers: HashMap<ClientId, JoinHandle<()>> = HashMap::new();
     let (roster_tx, _) =
         watch::channel::<Arc<Vec<crate::protocol::AgentInfo>>>(Arc::new(session.agent_infos()));
+    // DIAGNOSTIC: set DVLPR_PERF_MS=<n> to log any central-loop arm that blocks
+    // the loop longer than n ms (which arm + duration), to /tmp/dvlpr-perf.log.
+    // Off (zero cost) when unset. The central loop is single-threaded, so any arm
+    // exceeding ~5ms directly stalls keystroke handling and frame production.
+    let perf_ms: Option<u128> = std::env::var("DVLPR_PERF_MS")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let perf_log = |label: &str, start: Instant| {
+        if let Some(thresh) = perf_ms {
+            let ms = start.elapsed().as_millis();
+            if ms >= thresh {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/dvlpr-perf.log")
+                {
+                    let _ = writeln!(f, "{label} blocked loop {ms}ms");
+                }
+            }
+        }
+    };
     let reason: String = loop {
         tokio::select! {
             maybe_event = ev_rx.recv() => {
                 let Some(event) = maybe_event else { break "server stopped".to_string() };
+                let perf_start = Instant::now();
+                let perf_label = match &event {
+                    Event::ClientConnected { .. } => "ev:ClientConnected",
+                    Event::ClientInput { .. } => "ev:ClientInput",
+                    Event::ClientResize { .. } => "ev:ClientResize",
+                    Event::ClientGone(_) => "ev:ClientGone",
+                    Event::PaneOutput { .. } => "ev:PaneOutput",
+                    Event::StatusRequest(_) => "ev:StatusRequest",
+                    Event::ControlCommand { .. } => "ev:ControlCommand",
+                    Event::Shutdown { .. } => "ev:Shutdown",
+                    Event::SubscribeConnected { .. } => "ev:SubscribeConnected",
+                };
                 match event {
                     Event::ClientConnected { id, write_half, cols, rows } => {
                         let (cols, rows) = (cols.max(1), rows.max(1));
@@ -532,6 +569,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                                 crate::procinfo::agent_transcripts,
                                 crate::procinfo::proc_start_time,
                             );
+                            // Drain any in-flight background write first: it shares
+                            // this process's temp-file path, so letting it finish
+                            // before the synchronous final write avoids a torn
+                            // snapshot from two threads racing the same temp file.
+                            if let Some(h) = snapshot_writer.take() {
+                                let _ = h.await;
+                            }
                             if let Err(e) =
                                 crate::persist::write_atomic(&snapshot_file, &session.snapshot())
                             {
@@ -542,8 +586,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         break "killed".to_string();
                     }
                 }
+                perf_log(perf_label, perf_start);
             }
             _ = tick.tick() => {
+                let perf_start = Instant::now();
                 // Flush any client whose lone-ESC timer has elapsed.
                 let now = Instant::now();
                 let expired: Vec<ClientId> = clients
@@ -605,26 +651,48 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     }
                     dirty = false;
                 }
+                perf_log("tick:compose", perf_start);
             }
             _ = autoname_tick.tick() => {
+                let perf_start = Instant::now();
                 if session.refresh_window_names(crate::procinfo::process_name) {
                     dirty = true;
                 }
+                perf_log("autoname_tick", perf_start);
             }
             _ = snapshot_tick.tick() => {
+                let perf_start = Instant::now();
                 let volatile_changed = session.refresh_restore_meta(
                     crate::procinfo::pid_cwd,
                     crate::procinfo::agent_transcripts,
                     crate::procinfo::proc_start_time,
                 );
                 if session.take_snapshot_dirty() || volatile_changed {
-                    if let Err(e) = crate::persist::write_atomic(&snapshot_file, &session.snapshot()) {
-                        tracing::warn!("snapshot write failed: {e}");
-                        session.request_snapshot(); // retry on the next tick
+                    // write_atomic fsyncs the temp file AND the parent dir; on the
+                    // single-threaded central loop that blocks keystroke handling and
+                    // frame rendering for fsync latency (5-10ms+, worse under disk
+                    // contention) every second. Serialize the (tiny, layout-only)
+                    // snapshot here, then offload the fsync+rename to a blocking
+                    // thread so the loop never waits on the disk.
+                    let busy = snapshot_writer.as_ref().is_some_and(|h| !h.is_finished());
+                    if busy {
+                        // A previous write is still flushing; retry next tick rather
+                        // than piling up overlapping writers.
+                        session.request_snapshot();
+                    } else {
+                        let snap = session.snapshot();
+                        let path = snapshot_file.clone();
+                        snapshot_writer = Some(tokio::task::spawn_blocking(move || {
+                            if let Err(e) = crate::persist::write_atomic(&path, &snap) {
+                                tracing::warn!("snapshot write failed: {e}");
+                            }
+                        }));
                     }
                 }
+                perf_log("snapshot_tick", perf_start);
             }
             _ = agent_tick.tick() => {
+                let perf_start = Instant::now();
                 let outcome = session.refresh_agent_states(crate::procinfo::process_name);
                 let meta_changed = session.refresh_agent_meta(crate::procinfo::pid_cwd);
                 if outcome.changed || meta_changed {
@@ -640,6 +708,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 if **roster_tx.borrow() != infos {
                     let _ = roster_tx.send(Arc::new(infos));
                 }
+                perf_log("agent_tick", perf_start);
             }
         }
     };
