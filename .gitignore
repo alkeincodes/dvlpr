@@ -16,3 +16,6 @@ docs/
 # Operator-local leak-guard patterns for /pre-release-audit (never committed —
 # keeps internal-only product names out of the public tree).
 .release-denylist
+
+# Local AI-tool config (opencode) — operator-local, not part of the product.
+/opencode.json
